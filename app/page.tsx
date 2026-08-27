@@ -54,7 +54,6 @@ type LovableConnection = {
   connectedAt: string | null;
   error?: string;
 };
-type LovableProject = { id: string; name: string; editorUrl: string; previewUrl: string; messageId: string };
 type ActivityEntry = {
   id: string; siteId: string; siteName: string; type: string; state: string; message: string; createdAt: string;
 };
@@ -474,68 +473,25 @@ function WordPressLaunchModal({ clients, busy, onBack, onClose, onSubmit }: { cl
 function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onOpenSettings: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   const [connection, setConnection] = useState<LovableConnection>({ connected: false, account: null, workspaces: [], connectedAt: null });
   const [connectionLoading, setConnectionLoading] = useState(true);
-  const [workspaceId, setWorkspaceId] = useState('');
-  const [project, setProject] = useState<LovableProject | null>(null);
-  const [projectBusy, setProjectBusy] = useState(false);
-  const [projectError, setProjectError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     void fetch('/api/lovable', { cache: 'no-store' }).then(async (response) => {
       const result = await response.json() as LovableConnection & { error?: string };
       if (!response.ok) throw new Error(result.error || 'Lovable connection status is unavailable.');
-      if (active) {
-        setConnection(result);
-        setWorkspaceId(result.workspaces[0]?.id || '');
-      }
-    }).catch((failure) => { if (active) setProjectError(messageFrom(failure, 'Lovable connection status is unavailable.')); })
+      if (active) setConnection(result);
+    }).catch((failure) => { if (active) setConnectionError(messageFrom(failure, 'Lovable connection status is unavailable.')); })
       .finally(() => { if (active) setConnectionLoading(false); });
     return () => { active = false; };
   }, []);
 
-  async function createProject(form: HTMLFormElement) {
-    const prompt = form.elements.namedItem('lovablePrompt') as HTMLTextAreaElement | null;
-    if (!prompt?.reportValidity()) return;
-    const popup = window.open('about:blank', 'geekheros_lovable_project');
-    if (!popup) { setProjectError('Allow pop-ups for GeekHeros, then try again.'); return; }
-    popup.opener = null;
-    popup.document.title = 'Creating Lovable project';
-    popup.document.body.textContent = 'Creating your project in Lovable…';
-    const data = new FormData(form);
-    setProjectBusy(true); setProjectError(null);
-    try {
-      const response = await fetch('/api/lovable/projects', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          workspaceId,
-          initialMessage: lovableInitialMessage(
-            String(data.get('lovablePrompt') || ''),
-            splitReferenceUrls(String(data.get('imageUrls') || '')),
-            splitReferenceUrls(String(data.get('htmlUrls') || '')),
-          ),
-        }),
-      });
-      const result = await response.json() as { project?: LovableProject; error?: string };
-      if (!response.ok || !result.project) throw new Error(result.error || 'Lovable could not create the project.');
-      const projectUrl = result.project.editorUrl || result.project.previewUrl;
-      if (!projectUrl) throw new Error('Lovable created the project but did not return an editor URL.');
-      setProject(result.project);
-      popup.location.replace(projectUrl);
-    } catch (failure) {
-      popup.close();
-      setProjectError(messageFrom(failure, 'Lovable could not create the project.'));
-    } finally { setProjectBusy(false); }
-  }
-
-  const locked = busy || projectBusy;
+  const locked = busy;
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !locked) onClose(); }}>
     <section className="modal lovable-launch-modal" role="dialog" aria-modal="true" aria-labelledby="lovable-launch-title">
       <div className="modal-head"><div><p className="eyebrow">LOVABLE WORKLOAD</p><h2 id="lovable-launch-title">Build with Lovable</h2><p>Create the project through your linked Lovable account, sync it to Git, then let GeekHeros build and host it in Docker.</p></div><button onClick={onClose} disabled={locked} aria-label="Close"><X aria-hidden="true" /></button></div>
       <form onSubmit={onSubmit}>
         <input type="hidden" name="kind" value="lovable" />
-        <input type="hidden" name="lovableProjectId" value={project?.id || ''} />
-        <input type="hidden" name="lovableProjectUrl" value={project?.editorUrl || project?.previewUrl || ''} />
         <div className="lovable-workflow"><span>1</span><p><strong>Generate</strong>Create the project through the linked Lovable account.</p><span>2</span><p><strong>Sync</strong>Connect that Lovable project to GitHub or GitLab.</p><span>3</span><p><strong>Host</strong>Paste the repository below and launch its container.</p></div>
         <div className="form-grid">
           <label>Site name<input name="name" required maxLength={80} placeholder="Client web application" autoFocus /></label>
@@ -546,12 +502,7 @@ function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, on
           <label className="full-field">Lovable prompt<textarea name="lovablePrompt" required maxLength={50000} rows={5} placeholder="Describe the application, pages, features and visual direction Lovable should build." /></label>
           <label>Reference image URLs<textarea name="imageUrls" rows={3} placeholder="https://example.com/logo.png" /><small>JPEG, PNG or WebP. One public URL per line.</small></label>
           <label>Reference page URLs<textarea name="htmlUrls" rows={3} placeholder="https://example.com/reference-page" /><small>Public pages only. Ten combined references maximum.</small></label>
-          {connection.connected && connection.workspaces.length > 1 && <label className="full-field">Lovable workspace<select value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)}>{connection.workspaces.map((workspace) => <option value={workspace.id} key={workspace.id}>{workspace.name}</option>)}</select><small>The project will be created in this workspace.</small></label>}
-          <div className="full-field lovable-builder-action">
-            {project ? <a className="secondary-button link-button" href={project.editorUrl || project.previewUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open Lovable project<ExternalLink aria-hidden="true" /></a> : connection.connected ? <button type="button" className="secondary-button" disabled={connectionLoading || projectBusy} onClick={(event) => { const form = event.currentTarget.form; if (form) void createProject(form); }}><Sparkles aria-hidden="true" />{projectBusy ? 'Creating in Lovable…' : 'Create project in Lovable'}<ExternalLink aria-hidden="true" /></button> : <button type="button" className="secondary-button" disabled={connectionLoading} onClick={onOpenSettings}><LogIn aria-hidden="true" />{connectionLoading ? 'Checking Lovable…' : 'Connect Lovable in Settings'}</button>}
-            <span>{project ? `${project.name} was created through the linked account. Finish the build and connect Git before continuing.` : connection.connected ? 'This creates a real Lovable project and uses your Lovable credits.' : 'GeekHeros needs an authorized Lovable connection before it can create a project.'}</span>
-            {projectError && <strong className="connector-error" role="alert">{projectError}</strong>}
-          </div>
+          {!connection.connected && <div className="full-field lovable-builder-action"><button type="button" className="secondary-button" disabled={connectionLoading} onClick={onOpenSettings}><LogIn aria-hidden="true" />{connectionLoading ? 'Checking Lovable…' : 'Connect Lovable in Settings'}</button><span>Connect Lovable from Settings before using the generated prompt.</span>{connectionError && <strong className="connector-error" role="alert">{connectionError}</strong>}</div>}
           <label className="full-field">Git repository URL<input name="repositoryUrl" type="url" required placeholder="https://github.com/your-account/lovable-project" /><small>Use the repository Lovable creates through Git sync.</small></label>
           <label>Branch<input name="repositoryBranch" defaultValue="main" required /></label>
           <label>Repository access token<input name="repositoryToken" type="password" autoComplete="off" placeholder="Optional for private repos" /><small>Stored only in the local GeekHeros agent state.</small></label>
@@ -570,13 +521,6 @@ function Status({ site }: { site: Site }) { const tone = site.status.toLowerCase
 function Empty({ title, copy }: { title: string; copy: string }) { return <div className="empty-state"><strong>{title}</strong><span>{copy}</span></div>; }
 function initials(value: string) { return value.split(/\s+/).filter(Boolean).map((word) => word[0]).join('').slice(0, 2).toUpperCase(); }
 function humanizeSlug(value: string) { return value.split(/[-_]/).filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join(' '); }
-function splitReferenceUrls(value: string) { return value.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean); }
-function lovableInitialMessage(prompt: string, imageUrls: string[], pageUrls: string[]) {
-  const sections = [prompt.trim()];
-  if (imageUrls.length) sections.push(`Reference images:\n${imageUrls.map((url) => `- ${url}`).join('\n')}`);
-  if (pageUrls.length) sections.push(`Reference pages:\n${pageUrls.map((url) => `- ${url}`).join('\n')}`);
-  return sections.filter(Boolean).join('\n\n');
-}
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000)); if (seconds < 60) return 'just now'; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`; return `${Math.floor(seconds / 86400)}d ago`; }
