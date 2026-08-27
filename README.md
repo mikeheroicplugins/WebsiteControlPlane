@@ -26,7 +26,7 @@ Open `http://localhost:3000`.
 
 ## Lovable launches
 
-Lovable's Build with URL API opens the prefilled generation flow in your signed-in Lovable account. Because the API does not return source artifacts, connect the finished Lovable project to GitHub or GitLab and paste that repository into GeekHeros.
+Connect Lovable from Settings using its OAuth-protected MCP service. The local GeekHeros agent stores the resulting token only in the ignored local state file, reads the authorized account and workspaces, and creates real Lovable projects from the launch flow. Connect each finished project to GitHub or GitLab and paste that repository into GeekHeros for self-hosting.
 
 GeekHeros then:
 
@@ -52,7 +52,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 - Open WP Admin using a 60-second, single-use login capability without exposing the administrator password.
 - Route domains to the correct container through Traefik.
 - Record completed and failed operations in the local activity log.
-- Open a prefilled Lovable build, deploy its Git-synced source, check for new commits and rebuild its container.
+- Create a project through a linked Lovable account, deploy its Git-synced source, check for new commits and rebuild its container.
 
 ## One-click WP Admin
 

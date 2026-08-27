@@ -6,6 +6,7 @@ import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,6 +25,9 @@ const cliImage = process.env.GEEKHEROS_WPCLI_IMAGE || 'wordpress:cli';
 const databaseImage = process.env.GEEKHEROS_DATABASE_IMAGE || 'mariadb:lts';
 const edgeImage = process.env.GEEKHEROS_EDGE_IMAGE || 'traefik:v3';
 const localPreviewConfigMarker = 'GeekHeros local port preview';
+const lovableMcpUrl = new URL('https://mcp.lovable.dev');
+const lovableOAuthCallbackUrl = `http://127.0.0.1:${port}/lovable/oauth/callback`;
+const lovableOAuthStateMaxAge = 10 * 60 * 1000;
 const localPreviewConfig = String.raw`/* ${localPreviewConfigMarker} */
 if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/', $_SERVER['HTTP_HOST'])) {
   define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
@@ -85,7 +89,7 @@ if (!authToken || authToken.length < 24) {
 let stateQueue = Promise.resolve();
 
 function emptyState() {
-  return { version: 3, sites: {}, clients: {}, activity: [] };
+  return { version: 4, sites: {}, clients: {}, activity: [], integrations: { lovable: {} } };
 }
 
 async function readState() {
@@ -98,7 +102,20 @@ async function readState() {
       clientId: site.clientId || null,
       tags: Array.isArray(site.tags) ? site.tags : [],
     }]));
-    return { ...emptyState(), ...parsed, version: 3, sites, clients: parsed.clients || {}, activity: parsed.activity || [] };
+    const base = emptyState();
+    return {
+      ...base,
+      ...parsed,
+      version: 4,
+      sites,
+      clients: parsed.clients || {},
+      activity: parsed.activity || [],
+      integrations: {
+        ...base.integrations,
+        ...(parsed.integrations || {}),
+        lovable: { ...(parsed.integrations?.lovable || {}) },
+      },
+    };
   } catch (error) {
     if (error?.code === 'ENOENT') return emptyState();
     throw error;
@@ -121,6 +138,256 @@ function updateState(mutator) {
   });
   stateQueue = task.catch(() => undefined);
   return task;
+}
+
+function lovableIntegration(state) {
+  state.integrations ||= {};
+  state.integrations.lovable ||= {};
+  return state.integrations.lovable;
+}
+
+function createLovableOAuthProvider(onAuthorizationUrl = () => undefined) {
+  return {
+    redirectUrl: lovableOAuthCallbackUrl,
+    clientMetadata: {
+      client_name: 'GeekHeros Control Plane',
+      redirect_uris: [lovableOAuthCallbackUrl],
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+      application_type: 'native',
+    },
+    state: async () => {
+      const pending = lovableIntegration(await readState()).pending;
+      if (!pending?.state) throw new Error('The Lovable authorization session has expired. Start the connection again.');
+      return pending.state;
+    },
+    clientInformation: async () => lovableIntegration(await readState()).clientInformation,
+    saveClientInformation: async (clientInformation) => updateState((state) => {
+      lovableIntegration(state).clientInformation = clientInformation;
+    }),
+    tokens: async () => lovableIntegration(await readState()).tokens,
+    saveTokens: async (tokens, context) => updateState((state) => {
+      const integration = lovableIntegration(state);
+      integration.tokens = { ...(integration.tokens || {}), ...tokens, issuer: context?.issuer || tokens.issuer };
+      integration.connectedAt ||= new Date().toISOString();
+    }),
+    redirectToAuthorization: async (authorizationUrl) => onAuthorizationUrl(authorizationUrl),
+    saveCodeVerifier: async (codeVerifier) => updateState((state) => {
+      const integration = lovableIntegration(state);
+      if (!integration.pending) throw new Error('The Lovable authorization session has expired. Start the connection again.');
+      integration.pending.codeVerifier = codeVerifier;
+    }),
+    codeVerifier: async () => {
+      const codeVerifier = lovableIntegration(await readState()).pending?.codeVerifier;
+      if (!codeVerifier) throw new Error('The Lovable authorization session has expired. Start the connection again.');
+      return codeVerifier;
+    },
+  };
+}
+
+function createLovableClient(provider = createLovableOAuthProvider()) {
+  const transport = new StreamableHTTPClientTransport(lovableMcpUrl, { authProvider: provider });
+  const client = new Client({ name: 'GeekHeros Control Plane', version: '0.1.0' });
+  return { client, transport };
+}
+
+function lovableToolPayload(result) {
+  const text = Array.isArray(result?.content)
+    ? result.content.filter((item) => item?.type === 'text').map((item) => item.text).join('\n').trim()
+    : '';
+  if (result?.isError) throw new Error(text || 'Lovable returned an error.');
+  if (result?.structuredContent && typeof result.structuredContent === 'object') return result.structuredContent;
+  if (text) {
+    try { return JSON.parse(text); } catch { return { text }; }
+  }
+  return {};
+}
+
+function deepValue(value, keys, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 6) return undefined;
+  for (const key of keys) {
+    if (Object.hasOwn(value, key) && value[key] !== undefined && value[key] !== null) return value[key];
+  }
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    const found = deepValue(child, keys, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function collectionFrom(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return [];
+  for (const key of ['workspaces', 'items', 'data', 'results']) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const child of Object.values(value)) {
+    const collection = collectionFrom(child);
+    if (collection.length) return collection;
+  }
+  return [];
+}
+
+function normalizeLovableIdentity(profilePayload, workspacePayload) {
+  const accountSource = deepValue(profilePayload, ['user', 'profile', 'account']) || profilePayload || {};
+  const rawWorkspaces = collectionFrom(workspacePayload).length
+    ? collectionFrom(workspacePayload)
+    : collectionFrom(deepValue(profilePayload, ['workspaces']));
+  const workspaces = rawWorkspaces.map((workspace) => ({
+    id: String(workspace?.id || workspace?.workspace_id || workspace?.workspaceId || ''),
+    name: String(workspace?.name || workspace?.title || 'Lovable workspace'),
+  })).filter((workspace) => workspace.id).slice(0, 100);
+  return {
+    account: {
+      id: String(deepValue(accountSource, ['id', 'user_id', 'userId']) || ''),
+      name: String(deepValue(accountSource, ['name', 'display_name', 'displayName']) || ''),
+      email: String(deepValue(accountSource, ['email', 'user_email', 'userEmail']) || ''),
+    },
+    workspaces,
+  };
+}
+
+async function readLovableIdentity(client) {
+  const profile = lovableToolPayload(await client.callTool({ name: 'get_me', arguments: {} }));
+  let workspacePayload = deepValue(profile, ['workspaces']) || {};
+  try {
+    workspacePayload = lovableToolPayload(await client.callTool({ name: 'list_workspaces', arguments: { limit: 100 } }));
+  } catch {}
+  return normalizeLovableIdentity(profile, workspacePayload);
+}
+
+async function withLovableClient(task, provider = createLovableOAuthProvider()) {
+  const { client, transport } = createLovableClient(provider);
+  try {
+    await client.connect(transport);
+    return await task(client);
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+function publicLovableConnection(integration) {
+  return {
+    connected: Boolean(integration?.tokens),
+    account: integration?.profile?.account || null,
+    workspaces: Array.isArray(integration?.profile?.workspaces) ? integration.profile.workspaces : [],
+    connectedAt: integration?.connectedAt || null,
+  };
+}
+
+async function getLovableConnection() {
+  const integration = lovableIntegration(await readState());
+  if (!integration.tokens) return publicLovableConnection(integration);
+  try {
+    const profile = await withLovableClient((client) => readLovableIdentity(client));
+    await updateState((state) => { lovableIntegration(state).profile = profile; });
+    return publicLovableConnection({ ...integration, profile });
+  } catch (error) {
+    return { ...publicLovableConnection(integration), connected: false, error: error.message || 'Lovable needs to be reconnected.' };
+  }
+}
+
+async function startLovableConnection() {
+  const pending = { state: randomBytes(32).toString('base64url'), startedAt: new Date().toISOString() };
+  await updateState((state) => {
+    const integration = lovableIntegration(state);
+    delete integration.tokens;
+    delete integration.profile;
+    delete integration.connectedAt;
+    integration.pending = pending;
+  });
+  let authorizationUrl = null;
+  const provider = createLovableOAuthProvider((url) => { authorizationUrl = url; });
+  try {
+    await withLovableClient(() => undefined, provider);
+  } catch (error) {
+    if (!authorizationUrl) throw error;
+  }
+  if (!authorizationUrl) throw new Error('Lovable did not return an authorization URL.');
+  return { authorizationUrl: authorizationUrl.toString() };
+}
+
+function safeTextMatch(left, right) {
+  const leftHash = createHash('sha256').update(String(left || '')).digest();
+  const rightHash = createHash('sha256').update(String(right || '')).digest();
+  return timingSafeEqual(leftHash, rightHash);
+}
+
+async function finishLovableConnection(parameters) {
+  const pending = lovableIntegration(await readState()).pending;
+  const startedAt = Date.parse(pending?.startedAt || '');
+  if (!pending?.state || !Number.isFinite(startedAt) || Date.now() - startedAt > lovableOAuthStateMaxAge) {
+    throw Object.assign(new Error('This Lovable connection request expired. Return to GeekHeros and try again.'), { status: 400 });
+  }
+  if (!safeTextMatch(parameters.get('state'), pending.state)) {
+    throw Object.assign(new Error('The Lovable connection could not be verified. Return to GeekHeros and try again.'), { status: 400 });
+  }
+  if (parameters.get('error')) {
+    throw Object.assign(new Error('Lovable did not authorize the connection.'), { status: 400 });
+  }
+  const provider = createLovableOAuthProvider();
+  const { client, transport } = createLovableClient(provider);
+  try {
+    await transport.finishAuth(parameters);
+    await client.connect(transport);
+    const profile = await readLovableIdentity(client);
+    await updateState((state) => {
+      const integration = lovableIntegration(state);
+      integration.profile = profile;
+      integration.connectedAt = new Date().toISOString();
+      delete integration.pending;
+    });
+    return profile;
+  } catch (error) {
+    await updateState((state) => { delete lovableIntegration(state).pending; });
+    throw error;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+async function disconnectLovable() {
+  const integration = lovableIntegration(await readState());
+  const token = integration.tokens?.refresh_token || integration.tokens?.access_token;
+  if (token) {
+    const body = new URLSearchParams({ token });
+    if (integration.clientInformation?.client_id) body.set('client_id', integration.clientInformation.client_id);
+    if (integration.tokens?.refresh_token) body.set('token_type_hint', 'refresh_token');
+    const response = await fetch('https://lovable.dev/oauth/revoke', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!response.ok) throw new Error('Lovable could not revoke the connection. Try again.');
+  }
+  await updateState((state) => { state.integrations.lovable = { clientInformation: integration.clientInformation }; });
+  return { connected: false, account: null, workspaces: [], connectedAt: null };
+}
+
+async function createLovableProject(input) {
+  const initialMessage = String(input.initialMessage || '').trim();
+  const workspaceId = String(input.workspaceId || '').trim();
+  if (!initialMessage || initialMessage.length > 100_000) throw Object.assign(new Error('Enter a Lovable prompt up to 100,000 characters.'), { status: 400 });
+  if (workspaceId.length > 200) throw Object.assign(new Error('Choose a valid Lovable workspace.'), { status: 400 });
+  const created = await withLovableClient(async (client) => {
+    const result = lovableToolPayload(await client.callTool({
+      name: 'create_project',
+      arguments: { initial_message: initialMessage, ...(workspaceId ? { workspace_id: workspaceId } : {}), wait: false },
+    }));
+    const projectId = String(deepValue(result, ['projectId', 'project_id']) || '');
+    if (!projectId) throw new Error('Lovable needs a workspace selection before it can create this project.');
+    let details = {};
+    try { details = lovableToolPayload(await client.callTool({ name: 'get_project', arguments: { project_id: projectId } })); } catch {}
+    return {
+      id: projectId,
+      name: String(deepValue(details, ['name', 'title']) || deepValue(result, ['name', 'title']) || 'Lovable project'),
+      editorUrl: String(deepValue(details, ['editor_url', 'editorUrl']) || deepValue(result, ['editor_url', 'editorUrl']) || ''),
+      previewUrl: String(deepValue(details, ['preview_url', 'previewUrl']) || deepValue(result, ['preview_url', 'previewUrl']) || ''),
+      messageId: String(deepValue(result, ['message_id', 'messageId']) || ''),
+    };
+  });
+  return created;
 }
 
 async function docker(args, options = {}) {
@@ -277,6 +544,16 @@ function buildLovableUrl(prompt, images, html) {
   return `https://lovable.dev/?autosubmit=true#${parameters.toString()}`;
 }
 
+function validateLovableProjectUrl(value) {
+  if (!value) return '';
+  let projectUrl;
+  try { projectUrl = new URL(String(value).trim()); } catch { throw new Error('The Lovable project URL is invalid.'); }
+  if (projectUrl.protocol !== 'https:' || !/(^|\.)lovable\.dev$/i.test(projectUrl.hostname)) {
+    throw new Error('Use a secure lovable.dev project URL.');
+  }
+  return projectUrl.toString();
+}
+
 function validateBuildEnvironment(value) {
   const entries = {};
   const lines = String(value || '').split(/\r?\n/);
@@ -315,9 +592,13 @@ function validateSiteInput(input) {
     if (!branch || branch.length > 200 || branch.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) throw new Error('Enter a valid Git branch name.');
     const repositoryToken = String(input.repositoryToken || '').trim();
     if (repositoryToken.length > 500) throw new Error('The repository access token is too long.');
+    const lovableProjectId = String(input.lovableProjectId || '').trim();
+    if (lovableProjectId.length > 200) throw new Error('The Lovable project ID is invalid.');
+    const lovableProjectUrl = validateLovableProjectUrl(input.lovableProjectUrl);
     return {
       name, domain, kind, pod, region: 'Local Docker', repositoryUrl, repositoryBranch: branch,
-      repositoryToken, lovablePrompt: prompt, lovableBuildUrl: buildLovableUrl(prompt, images, html),
+      repositoryToken, lovablePrompt: prompt, lovableProjectId,
+      lovableBuildUrl: lovableProjectUrl || buildLovableUrl(prompt, images, html),
       lovableReferences: { images, html }, buildEnvironment: validateBuildEnvironment(input.buildEnvironment),
     };
   }
@@ -1110,6 +1391,22 @@ function send(response, status, payload) {
   response.end(body);
 }
 
+function sendLovableCallback(response, status, success) {
+  const title = success ? 'Lovable connected' : 'Lovable connection failed';
+  const message = success
+    ? 'Your Lovable account is now linked to GeekHeros. You can close this window.'
+    : 'Return to GeekHeros Settings and start the Lovable connection again.';
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7f5;color:#29372f;font:16px system-ui,sans-serif}.card{width:min(440px,calc(100% - 40px));padding:32px;border:1px solid #dfe5e1;border-radius:16px;background:white;box-shadow:0 18px 55px rgba(8,18,12,.12)}h1{margin:0 0 10px;font:600 26px Georgia,serif}p{margin:0;color:#69766f;line-height:1.6}</style></head><body><main class="card"><h1>${title}</h1><p>${message}</p></main><script>if(${success ? 'true' : 'false'})setTimeout(()=>window.close(),1200)</script></body></html>`;
+  response.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+  });
+  response.end(body);
+}
+
 async function readJson(request) {
   let body = '';
   for await (const chunk of request) {
@@ -1121,12 +1418,25 @@ async function readJson(request) {
 }
 
 const server = createServer(async (request, response) => {
+  const url = new URL(request.url || '/', `http://${host}:${port}`);
+  if (request.method === 'GET' && url.pathname === '/lovable/oauth/callback') {
+    try {
+      await finishLovableConnection(url.searchParams);
+      return sendLovableCallback(response, 200, true);
+    } catch (error) {
+      console.error('Lovable OAuth callback failed:', error.message);
+      return sendLovableCallback(response, Number(error.status) || 400, false);
+    }
+  }
   const origin = request.headers.origin;
   if (origin && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return send(response, 403, { error: 'Origin not allowed.' });
   if (!tokenMatches(request.headers['x-geekheros-token'])) return send(response, 401, { error: 'Agent authentication failed.' });
   try {
-    const url = new URL(request.url || '/', `http://${host}:${port}`);
     if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo());
+    if (request.method === 'GET' && url.pathname === '/lovable') return send(response, 200, await getLovableConnection());
+    if (request.method === 'POST' && url.pathname === '/lovable/connect') return send(response, 200, await startLovableConnection());
+    if (request.method === 'DELETE' && url.pathname === '/lovable') return send(response, 200, await disconnectLovable());
+    if (request.method === 'POST' && url.pathname === '/lovable/projects') return send(response, 201, { project: await createLovableProject(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/sites') return send(response, 200, { sites: await listSites() });
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/clients') return send(response, 200, { clients: await listClients() });

@@ -46,6 +46,15 @@ type SystemInfo = {
   edge?: { installed: boolean; running: boolean; container: string; httpPort: number; httpsPort: number };
   agent?: { host: string; port: number }; error?: string;
 };
+type LovableWorkspace = { id: string; name: string };
+type LovableConnection = {
+  connected: boolean;
+  account: { id: string; name: string; email: string } | null;
+  workspaces: LovableWorkspace[];
+  connectedAt: string | null;
+  error?: string;
+};
+type LovableProject = { id: string; name: string; editorUrl: string; previewUrl: string; messageId: string };
 type ActivityEntry = {
   id: string; siteId: string; siteName: string; type: string; state: string; message: string; createdAt: string;
 };
@@ -227,12 +236,12 @@ export default function Home() {
         {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={() => setLaunchMode('choose')} onOpen={setSelectedId} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
         {view === 'Activity' && <ActivityView entries={activity} />}
-        {view === 'Settings' && <SettingsView system={system} />}
+        {view === 'Settings' && <SettingsView system={system} onToast={setToast} />}
       </div>}
     </section>
     {launchMode === 'choose' && <LaunchChoiceModal onClose={() => setLaunchMode(null)} onChoose={setLaunchMode} />}
     {launchMode === 'wordpress' && <WordPressLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onSubmit={createSite} />}
-    {launchMode === 'lovable' && <LovableLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onSubmit={createSite} />}
+    {launchMode === 'lovable' && <LovableLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onOpenSettings={() => { setLaunchMode(null); navigate('Settings'); }} onSubmit={createSite} />}
     {clientOpen && <ClientModal client={editingClient} busy={busy === 'client:save'} onClose={() => { setClientOpen(false); setEditingClient(null); }} onSubmit={createClient} />}
     {toast && <div className="toast" role="status"><span><Check aria-hidden="true" /></span>{toast}<button onClick={() => setToast(null)} aria-label="Dismiss notification"><X aria-hidden="true" /></button></div>}
   </main>;
@@ -339,7 +348,69 @@ function Operation({ icon: Icon, title, copy, disabled, onClick }: { icon: Lucid
 function ActivityView({ entries }: { entries: ActivityEntry[] }) { return <><PageHeading eyebrow="AUDIT LOG" title="Activity" description="Completed and failed operations reported by the local Docker agent." /><section className="content-card"><ActivityList entries={entries} /></section></>; }
 function ActivityList({ entries }: { entries: ActivityEntry[] }) { if (!entries.length) return <Empty title="No operations recorded" copy="Container launches and lifecycle actions will appear here." />; return <div className="timeline live-timeline">{entries.map((entry) => <div key={entry.id}><span className={`activity-dot ${entry.state === 'failed' ? 'red' : 'green'}`} /><span><strong>{entry.message}</strong><small>{entry.siteName} · {entry.type}</small></span><time>{relativeTime(entry.createdAt)}</time></div>)}</div>; }
 
-function SettingsView({ system }: { system: SystemInfo }) {
+function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (message: string) => void }) {
+  const [lovable, setLovable] = useState<LovableConnection>({ connected: false, account: null, workspaces: [], connectedAt: null });
+  const [lovableLoading, setLovableLoading] = useState(true);
+  const [lovableBusy, setLovableBusy] = useState(false);
+  const [lovableError, setLovableError] = useState<string | null>(null);
+
+  const refreshLovable = useCallback(async () => {
+    const response = await fetch('/api/lovable', { cache: 'no-store' });
+    const result = await response.json() as LovableConnection & { error?: string };
+    if (!response.ok) throw new Error(result.error || 'Lovable connection status is unavailable.');
+    setLovable(result);
+    return result;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const frame = window.requestAnimationFrame(() => {
+      void refreshLovable().catch((failure) => {
+        if (active) setLovableError(messageFrom(failure, 'Lovable connection status is unavailable.'));
+      }).finally(() => { if (active) setLovableLoading(false); });
+    });
+    return () => { active = false; window.cancelAnimationFrame(frame); };
+  }, [refreshLovable]);
+
+  async function connectLovable() {
+    const popup = window.open('about:blank', 'geekheros_lovable_oauth', 'popup,width=680,height=820');
+    if (!popup) { setLovableError('Allow pop-ups for GeekHeros, then try again.'); return; }
+    popup.opener = null;
+    popup.document.title = 'Connecting Lovable';
+    popup.document.body.textContent = 'Preparing a secure Lovable connection…';
+    setLovableBusy(true); setLovableError(null);
+    try {
+      const response = await fetch('/api/lovable', { method: 'POST' });
+      const result = await response.json() as { authorizationUrl?: string; error?: string };
+      if (!response.ok || !result.authorizationUrl) throw new Error(result.error || 'Lovable did not start the connection.');
+      popup.location.replace(result.authorizationUrl);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+        const connection = await refreshLovable();
+        if (connection.connected) {
+          popup.close();
+          onToast(`Lovable connected${connection.account?.email ? ` as ${connection.account.email}` : ''}.`);
+          return;
+        }
+      }
+      throw new Error('Lovable did not finish connecting. Close the authorization window and try again.');
+    } catch (failure) {
+      popup.close();
+      setLovableError(messageFrom(failure, 'Lovable could not be connected.'));
+    } finally { setLovableBusy(false); }
+  }
+
+  async function disconnectLovableAccount() {
+    setLovableBusy(true); setLovableError(null);
+    try {
+      const response = await fetch('/api/lovable', { method: 'DELETE' });
+      const result = await response.json() as LovableConnection & { error?: string };
+      if (!response.ok) throw new Error(result.error || 'Lovable could not be disconnected.');
+      setLovable(result); onToast('Lovable was disconnected from GeekHeros.');
+    } catch (failure) { setLovableError(messageFrom(failure, 'Lovable could not be disconnected.')); }
+    finally { setLovableBusy(false); }
+  }
+
   return <>
     <PageHeading eyebrow="LOCAL RUNTIME" title="Settings" description="The control plane is connected to Docker Desktop through a loopback-only agent." />
     <div className="settings-layout">
@@ -361,19 +432,27 @@ function SettingsView({ system }: { system: SystemInfo }) {
           </div>
         </div>
         <div className="settings-section">
-          <div><h2>Lovable account</h2><p>Sign in once in your browser before starting Lovable builds from GeekHeros.</p></div>
+          <div><h2>Lovable connection</h2><p>Authorize GeekHeros to create and manage projects through Lovable’s OAuth-protected MCP service.</p></div>
           <div className="connector-box lovable-connector">
             <span><Sparkles aria-hidden="true" /></span>
-            <div><strong>Lovable</strong><p>Your account, workspace and credentials stay with Lovable.</p><em>Browser session</em></div>
-            <a className="secondary-button link-button" href="https://lovable.dev/login" target="_blank" rel="noreferrer">
-              <LogIn aria-hidden="true" />Sign in to Lovable<ExternalLink aria-hidden="true" />
-            </a>
+            <div>
+              <strong>{lovable.connected ? lovable.account?.name || lovable.account?.email || 'Lovable connected' : 'Lovable'}</strong>
+              <p>{lovable.connected ? lovable.account?.email || 'GeekHeros is authorized for this Lovable account.' : 'Connect your account so GeekHeros can create real Lovable projects.'}</p>
+              <em>{lovableLoading ? 'Checking connection…' : lovable.connected ? `${lovable.workspaces.length} workspace${lovable.workspaces.length === 1 ? '' : 's'} available` : 'Not connected'}</em>
+            </div>
+            <div className="lovable-connector-actions">
+              {lovable.connected && <a className="secondary-button link-button" href="https://lovable.dev" target="_blank" rel="noreferrer">Open Lovable<ExternalLink aria-hidden="true" /></a>}
+              <button className={lovable.connected ? 'secondary-button' : 'primary-button'} disabled={lovableLoading || lovableBusy} onClick={() => void (lovable.connected ? disconnectLovableAccount() : connectLovable())}>
+                <LogIn aria-hidden="true" />{lovableBusy ? 'Please wait…' : lovable.connected ? 'Disconnect' : 'Connect Lovable'}
+              </button>
+            </div>
           </div>
-          <div className="setup-note lovable-setup-note"><span><Info aria-hidden="true" /></span><p>After signing in, launch a Lovable site and GeekHeros will open the prefilled builder in the same browser session.</p></div>
+          {lovableError && <p className="connector-error" role="alert">{lovableError}</p>}
+          <div className="setup-note lovable-setup-note"><span><Info aria-hidden="true" /></span><p>The authorization token stays in the ignored local GeekHeros state file and is never sent to the dashboard browser or stored in Docker labels.</p></div>
         </div>
         <div className="settings-section">
-          <div><h2>Lovable build environment</h2><p>Lovable generation opens through its Build with URL API. GeekHeros then clones the synced Git repository, runs a controlled Node 22 build and serves the static application through Nginx.</p></div>
-          <div className="setup-note"><span><Info aria-hidden="true" /></span><p>Lovable’s current API does not return source artifacts directly. GitHub or GitLab sync is the bridge used for self-hosting.</p></div>
+          <div><h2>Lovable build environment</h2><p>GeekHeros creates projects through Lovable’s connected MCP service, then clones the synced Git repository, runs a controlled Node 22 build and serves the static application through Nginx.</p></div>
+          <div className="setup-note"><span><Info aria-hidden="true" /></span><p>GeekHeros deploys from the project’s GitHub or GitLab sync. Lovable authorization is never exposed to build containers.</p></div>
         </div>
         <div className="settings-section">
           <div><h2>One-click WordPress login</h2><p>GeekHeros installs a protected MU-plugin into managed sites. Login capabilities are random, single-use, expire after 60 seconds and are posted rather than placed in URLs.</p></div>
@@ -392,19 +471,97 @@ function LaunchChoiceModal({ onClose, onChoose }: { onClose: () => void; onChoos
 
 function WordPressLaunchModal({ clients, busy, onBack, onClose, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="launch-title"><div className="modal-head"><div><p className="eyebrow">WORDPRESS WORKLOAD</p><h2 id="launch-title">Launch WordPress</h2><p>Creates isolated WordPress and MariaDB containers, persistent volumes, networking and edge routing.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><input type="hidden" name="kind" value="wordpress" /><div className="form-grid"><label>Site name<input name="name" required maxLength={80} placeholder="Client marketing site" autoFocus /></label><label>Domain<input name="domain" required placeholder="client.localhost" /></label><label>Client<select name="clientId" defaultValue=""><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select></label><label>Container profile<select name="pod" defaultValue="Standard"><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select></label><label className="full-field">Tags<input name="tags" placeholder="production, managed, ecommerce" /></label><label>Administrator username<input name="adminUser" required defaultValue="admin" autoComplete="username" /></label><label>Administrator email<input name="adminEmail" type="email" required placeholder="admin@example.com" autoComplete="email" /></label><label className="full-field">Administrator password<input name="adminPassword" type="password" required minLength={12} placeholder="At least 12 characters" autoComplete="new-password" /></label></div><div className="launch-footnote"><span><Info aria-hidden="true" /></span><p>The password is used during installation and is not exposed in Docker labels or activity logs.</p></div><div className="modal-actions"><button type="button" className="secondary-button back-choice" onClick={onBack} disabled={busy}><ArrowLeft aria-hidden="true" />Change source</button><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Starting containers…' : 'Launch WordPress'}</button></div></form></section></div>; }
 
-function LovableLaunchModal({ clients, busy, onBack, onClose, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  const [builderOpened, setBuilderOpened] = useState(false);
-  function openBuilder(form: HTMLFormElement) {
+function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onOpenSettings: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  const [connection, setConnection] = useState<LovableConnection>({ connected: false, account: null, workspaces: [], connectedAt: null });
+  const [connectionLoading, setConnectionLoading] = useState(true);
+  const [workspaceId, setWorkspaceId] = useState('');
+  const [project, setProject] = useState<LovableProject | null>(null);
+  const [projectBusy, setProjectBusy] = useState(false);
+  const [projectError, setProjectError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void fetch('/api/lovable', { cache: 'no-store' }).then(async (response) => {
+      const result = await response.json() as LovableConnection & { error?: string };
+      if (!response.ok) throw new Error(result.error || 'Lovable connection status is unavailable.');
+      if (active) {
+        setConnection(result);
+        setWorkspaceId(result.workspaces[0]?.id || '');
+      }
+    }).catch((failure) => { if (active) setProjectError(messageFrom(failure, 'Lovable connection status is unavailable.')); })
+      .finally(() => { if (active) setConnectionLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  async function createProject(form: HTMLFormElement) {
     const prompt = form.elements.namedItem('lovablePrompt') as HTMLTextAreaElement | null;
     if (!prompt?.reportValidity()) return;
+    const popup = window.open('about:blank', 'geekheros_lovable_project');
+    if (!popup) { setProjectError('Allow pop-ups for GeekHeros, then try again.'); return; }
+    popup.opener = null;
+    popup.document.title = 'Creating Lovable project';
+    popup.document.body.textContent = 'Creating your project in Lovable…';
     const data = new FormData(form);
-    const parameters = new URLSearchParams({ prompt: String(data.get('lovablePrompt') || '') });
-    for (const image of splitReferenceUrls(String(data.get('imageUrls') || ''))) parameters.append('images', image);
-    for (const page of splitReferenceUrls(String(data.get('htmlUrls') || ''))) parameters.append('html', page);
-    window.open(`https://lovable.dev/?autosubmit=true#${parameters.toString()}`, '_blank', 'noopener,noreferrer');
-    setBuilderOpened(true);
+    setProjectBusy(true); setProjectError(null);
+    try {
+      const response = await fetch('/api/lovable/projects', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId,
+          initialMessage: lovableInitialMessage(
+            String(data.get('lovablePrompt') || ''),
+            splitReferenceUrls(String(data.get('imageUrls') || '')),
+            splitReferenceUrls(String(data.get('htmlUrls') || '')),
+          ),
+        }),
+      });
+      const result = await response.json() as { project?: LovableProject; error?: string };
+      if (!response.ok || !result.project) throw new Error(result.error || 'Lovable could not create the project.');
+      const projectUrl = result.project.editorUrl || result.project.previewUrl;
+      if (!projectUrl) throw new Error('Lovable created the project but did not return an editor URL.');
+      setProject(result.project);
+      popup.location.replace(projectUrl);
+    } catch (failure) {
+      popup.close();
+      setProjectError(messageFrom(failure, 'Lovable could not create the project.'));
+    } finally { setProjectBusy(false); }
   }
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal lovable-launch-modal" role="dialog" aria-modal="true" aria-labelledby="lovable-launch-title"><div className="modal-head"><div><p className="eyebrow">LOVABLE WORKLOAD</p><h2 id="lovable-launch-title">Build with Lovable</h2><p>Start the Lovable generation flow, sync the finished project to Git, then let GeekHeros build and host it in Docker.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><input type="hidden" name="kind" value="lovable" /><div className="lovable-workflow"><span>1</span><p><strong>Generate</strong>Open the prefilled Lovable builder and finish the application.</p><span>2</span><p><strong>Sync</strong>Connect that Lovable project to GitHub or GitLab.</p><span>3</span><p><strong>Host</strong>Paste the repository below and launch its container.</p></div><div className="form-grid"><label>Site name<input name="name" required maxLength={80} placeholder="Client web application" autoFocus /></label><label>Domain<input name="domain" required placeholder="app.client.localhost" /></label><label>Client<select name="clientId" defaultValue=""><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select></label><label>Container profile<select name="pod" defaultValue="Standard"><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select></label><label className="full-field">Tags<input name="tags" placeholder="production, lovable, application" /></label><label className="full-field">Lovable prompt<textarea name="lovablePrompt" required maxLength={50000} rows={5} placeholder="Describe the application, pages, features and visual direction Lovable should build." /></label><label>Reference image URLs<textarea name="imageUrls" rows={3} placeholder="https://example.com/logo.png" /><small>JPEG, PNG or WebP. One public URL per line.</small></label><label>Reference page URLs<textarea name="htmlUrls" rows={3} placeholder="https://example.com/reference-page" /><small>Public pages only. Ten combined references maximum.</small></label><div className="full-field lovable-builder-action"><button type="button" className="secondary-button" onClick={(event) => { const form = event.currentTarget.form; if (form) openBuilder(form); }}><Sparkles aria-hidden="true" />{builderOpened ? 'Open Lovable again' : 'Open prefilled Lovable builder'}<ExternalLink aria-hidden="true" /></button><span>{builderOpened ? 'Lovable was opened in a new tab. Complete the project and connect Git before continuing.' : 'Uses the Lovable browser session configured from Settings.'}</span></div><label className="full-field">Git repository URL<input name="repositoryUrl" type="url" required placeholder="https://github.com/your-account/lovable-project" /><small>Use the repository Lovable creates through Git sync.</small></label><label>Branch<input name="repositoryBranch" defaultValue="main" required /></label><label>Repository access token<input name="repositoryToken" type="password" autoComplete="off" placeholder="Optional for private repos" /><small>Stored only in the local GeekHeros agent state.</small></label><label className="full-field">Frontend build variables<textarea name="buildEnvironment" rows={4} placeholder={'VITE_SUPABASE_URL=https://…\nVITE_SUPABASE_PUBLISHABLE_KEY=…'} /><small>Optional VITE_ variables, one KEY=value per line. These values are compiled into the browser bundle, so do not use server secrets.</small></label></div><div className="launch-footnote"><span><Info aria-hidden="true" /></span><p>GeekHeros uses a controlled Node 22 build and Nginx runtime. The repository’s Dockerfile is not executed.</p></div><div className="modal-actions"><button type="button" className="secondary-button back-choice" onClick={onBack} disabled={busy}><ArrowLeft aria-hidden="true" />Change source</button><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Building container…' : 'Build & launch'}</button></div></form></section></div>;
+
+  const locked = busy || projectBusy;
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !locked) onClose(); }}>
+    <section className="modal lovable-launch-modal" role="dialog" aria-modal="true" aria-labelledby="lovable-launch-title">
+      <div className="modal-head"><div><p className="eyebrow">LOVABLE WORKLOAD</p><h2 id="lovable-launch-title">Build with Lovable</h2><p>Create the project through your linked Lovable account, sync it to Git, then let GeekHeros build and host it in Docker.</p></div><button onClick={onClose} disabled={locked} aria-label="Close"><X aria-hidden="true" /></button></div>
+      <form onSubmit={onSubmit}>
+        <input type="hidden" name="kind" value="lovable" />
+        <input type="hidden" name="lovableProjectId" value={project?.id || ''} />
+        <input type="hidden" name="lovableProjectUrl" value={project?.editorUrl || project?.previewUrl || ''} />
+        <div className="lovable-workflow"><span>1</span><p><strong>Generate</strong>Create the project through the linked Lovable account.</p><span>2</span><p><strong>Sync</strong>Connect that Lovable project to GitHub or GitLab.</p><span>3</span><p><strong>Host</strong>Paste the repository below and launch its container.</p></div>
+        <div className="form-grid">
+          <label>Site name<input name="name" required maxLength={80} placeholder="Client web application" autoFocus /></label>
+          <label>Domain<input name="domain" required placeholder="app.client.localhost" /></label>
+          <label>Client<select name="clientId" defaultValue=""><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select></label>
+          <label>Container profile<select name="pod" defaultValue="Standard"><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select></label>
+          <label className="full-field">Tags<input name="tags" placeholder="production, lovable, application" /></label>
+          <label className="full-field">Lovable prompt<textarea name="lovablePrompt" required maxLength={50000} rows={5} placeholder="Describe the application, pages, features and visual direction Lovable should build." /></label>
+          <label>Reference image URLs<textarea name="imageUrls" rows={3} placeholder="https://example.com/logo.png" /><small>JPEG, PNG or WebP. One public URL per line.</small></label>
+          <label>Reference page URLs<textarea name="htmlUrls" rows={3} placeholder="https://example.com/reference-page" /><small>Public pages only. Ten combined references maximum.</small></label>
+          {connection.connected && connection.workspaces.length > 1 && <label className="full-field">Lovable workspace<select value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)}>{connection.workspaces.map((workspace) => <option value={workspace.id} key={workspace.id}>{workspace.name}</option>)}</select><small>The project will be created in this workspace.</small></label>}
+          <div className="full-field lovable-builder-action">
+            {project ? <a className="secondary-button link-button" href={project.editorUrl || project.previewUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open Lovable project<ExternalLink aria-hidden="true" /></a> : connection.connected ? <button type="button" className="secondary-button" disabled={connectionLoading || projectBusy} onClick={(event) => { const form = event.currentTarget.form; if (form) void createProject(form); }}><Sparkles aria-hidden="true" />{projectBusy ? 'Creating in Lovable…' : 'Create project in Lovable'}<ExternalLink aria-hidden="true" /></button> : <button type="button" className="secondary-button" disabled={connectionLoading} onClick={onOpenSettings}><LogIn aria-hidden="true" />{connectionLoading ? 'Checking Lovable…' : 'Connect Lovable in Settings'}</button>}
+            <span>{project ? `${project.name} was created through the linked account. Finish the build and connect Git before continuing.` : connection.connected ? 'This creates a real Lovable project and uses your Lovable credits.' : 'GeekHeros needs an authorized Lovable connection before it can create a project.'}</span>
+            {projectError && <strong className="connector-error" role="alert">{projectError}</strong>}
+          </div>
+          <label className="full-field">Git repository URL<input name="repositoryUrl" type="url" required placeholder="https://github.com/your-account/lovable-project" /><small>Use the repository Lovable creates through Git sync.</small></label>
+          <label>Branch<input name="repositoryBranch" defaultValue="main" required /></label>
+          <label>Repository access token<input name="repositoryToken" type="password" autoComplete="off" placeholder="Optional for private repos" /><small>Stored only in the local GeekHeros agent state.</small></label>
+          <label className="full-field">Frontend build variables<textarea name="buildEnvironment" rows={4} placeholder={'VITE_SUPABASE_URL=https://…\nVITE_SUPABASE_PUBLISHABLE_KEY=…'} /><small>Optional VITE_ variables, one KEY=value per line. These values are compiled into the browser bundle, so do not use server secrets.</small></label>
+        </div>
+        <div className="launch-footnote"><span><Info aria-hidden="true" /></span><p>GeekHeros uses a controlled Node 22 build and Nginx runtime. The repository’s Dockerfile is not executed.</p></div>
+        <div className="modal-actions"><button type="button" className="secondary-button back-choice" onClick={onBack} disabled={locked}><ArrowLeft aria-hidden="true" />Change source</button><button type="button" className="secondary-button" onClick={onClose} disabled={locked}>Cancel</button><button className="primary-button" disabled={locked}>{busy ? 'Building container…' : 'Build & launch'}</button></div>
+      </form>
+    </section>
+  </div>;
 }
 
 function ClientModal({ client, busy, onClose, onSubmit }: { client: Client | null; busy: boolean; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal small-modal" role="dialog" aria-modal="true" aria-labelledby="client-title"><div className="modal-head"><div><p className="eyebrow">CLIENT RECORD</p><h2 id="client-title">{client ? 'Edit client' : 'Add client'}</h2><p>{client ? 'Update the client record without changing its assigned sites.' : 'Create an empty client record, then assign real sites to it.'}</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><div className="form-grid"><label>Client name<input name="name" required maxLength={100} defaultValue={client?.name || ''} autoFocus /></label><label>Company<input name="company" maxLength={120} defaultValue={client?.company || ''} /></label><label>Email<input name="email" type="email" maxLength={160} defaultValue={client?.email || ''} /></label><label>Phone<input name="phone" maxLength={60} defaultValue={client?.phone || ''} /></label><label className="full-field">Notes<textarea name="notes" maxLength={1000} rows={4} defaultValue={client?.notes || ''} /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Saving…' : 'Save client'}</button></div></form></section></div>; }
@@ -414,6 +571,12 @@ function Empty({ title, copy }: { title: string; copy: string }) { return <div c
 function initials(value: string) { return value.split(/\s+/).filter(Boolean).map((word) => word[0]).join('').slice(0, 2).toUpperCase(); }
 function humanizeSlug(value: string) { return value.split(/[-_]/).filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join(' '); }
 function splitReferenceUrls(value: string) { return value.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean); }
+function lovableInitialMessage(prompt: string, imageUrls: string[], pageUrls: string[]) {
+  const sections = [prompt.trim()];
+  if (imageUrls.length) sections.push(`Reference images:\n${imageUrls.map((url) => `- ${url}`).join('\n')}`);
+  if (pageUrls.length) sections.push(`Reference pages:\n${pageUrls.map((url) => `- ${url}`).join('\n')}`);
+  return sections.filter(Boolean).join('\n\n');
+}
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000)); if (seconds < 60) return 'just now'; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`; return `${Math.floor(seconds / 86400)}d ago`; }
