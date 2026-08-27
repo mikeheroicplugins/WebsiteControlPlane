@@ -15,6 +15,10 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 const localBindingConfig = {
   main: 'vinext/server/app-router-entry',
   compatibility_flags: ['nodejs_compat'],
+  vars: {
+    GEEKHEROS_AGENT_URL: process.env.GEEKHEROS_AGENT_URL ?? '',
+    GEEKHEROS_AGENT_TOKEN: process.env.GEEKHEROS_AGENT_TOKEN ?? '',
+  },
   d1_databases: d1
     ? [
         {
