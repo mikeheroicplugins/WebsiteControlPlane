@@ -12,6 +12,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const stateDir = path.join(projectRoot, '.geekheros');
 const stateFile = path.join(stateDir, 'state.json');
 const backupRoot = path.join(stateDir, 'backups');
+const sourceRoot = path.join(stateDir, 'sources');
 const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
 const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
 const authToken = process.env.GEEKHEROS_AGENT_TOKEN;
@@ -84,7 +85,7 @@ if (!authToken || authToken.length < 24) {
 let stateQueue = Promise.resolve();
 
 function emptyState() {
-  return { version: 2, sites: {}, clients: {}, activity: [] };
+  return { version: 3, sites: {}, clients: {}, activity: [] };
 }
 
 async function readState() {
@@ -93,10 +94,11 @@ async function readState() {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8'));
     const sites = Object.fromEntries(Object.entries(parsed.sites || {}).map(([id, site]) => [id, {
       ...site,
+      kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
       clientId: site.clientId || null,
       tags: Array.isArray(site.tags) ? site.tags : [],
     }]));
-    return { ...emptyState(), ...parsed, version: 2, sites, clients: parsed.clients || {}, activity: parsed.activity || [] };
+    return { ...emptyState(), ...parsed, version: 3, sites, clients: parsed.clients || {}, activity: parsed.activity || [] };
   } catch (error) {
     if (error?.code === 'ENOENT') return emptyState();
     throw error;
@@ -138,6 +140,22 @@ async function docker(args, options = {}) {
     const wrapped = new Error(detail || 'Docker command failed');
     wrapped.code = error?.code;
     throw wrapped;
+  }
+}
+
+async function git(args, options = {}) {
+  try {
+    const result = await execFileAsync('git', args, {
+      encoding: 'utf8',
+      maxBuffer: options.maxBuffer || 16 * 1024 * 1024,
+      timeout: options.timeout || 600_000,
+      windowsHide: true,
+    });
+    return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+  } catch (error) {
+    let detail = String(error?.stderr || error?.stdout || error?.message || 'Git command failed');
+    if (options.secret) detail = detail.replaceAll(options.secret, '[redacted]');
+    throw new Error(detail.trim().slice(0, 800) || 'Git command failed');
   }
 }
 
@@ -229,21 +247,87 @@ function normalizeDomain(value) {
   return value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '');
 }
 
+function parseReferenceUrls(value, type) {
+  const values = (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/))
+    .map((item) => String(item || '').trim()).filter(Boolean);
+  return values.map((item) => {
+    let parsed;
+    try { parsed = new URL(item); } catch { throw new Error(`Enter a valid public ${type} URL.`); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.hostname === 'localhost' || /^127\./.test(parsed.hostname)) {
+      throw new Error(`Lovable ${type} references must use a public HTTP or HTTPS URL.`);
+    }
+    if (type === 'image' && /\.(?:svg|gif)(?:$|[?#])/i.test(parsed.pathname + parsed.search + parsed.hash)) throw new Error('Lovable image references must be JPEG, PNG or WebP URLs.');
+    return parsed.toString();
+  });
+}
+
+function validateRepositoryUrl(value) {
+  let repository;
+  try { repository = new URL(String(value || '').trim()); } catch { throw new Error('Enter the Git repository created from the Lovable project.'); }
+  if (repository.protocol !== 'https:' || repository.username || repository.password || !['github.com', 'gitlab.com'].includes(repository.hostname.toLowerCase())) {
+    throw new Error('Use a credential-free HTTPS GitHub or GitLab repository URL.');
+  }
+  return repository.toString().replace(/\/$/, '');
+}
+
+function buildLovableUrl(prompt, images, html) {
+  const parameters = new URLSearchParams({ prompt });
+  for (const image of images) parameters.append('images', image);
+  for (const page of html) parameters.append('html', page);
+  return `https://lovable.dev/?autosubmit=true#${parameters.toString()}`;
+}
+
+function validateBuildEnvironment(value) {
+  const entries = {};
+  const lines = String(value || '').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator < 1) throw new Error('Build environment entries must use KEY=value, one per line.');
+    const key = trimmed.slice(0, separator).trim();
+    const entryValue = trimmed.slice(separator + 1);
+    if (!/^VITE_[A-Z0-9_]{1,80}$/.test(key)) throw new Error('Lovable frontend build variables must begin with VITE_ and use uppercase letters, numbers or underscores.');
+    if (entryValue.length > 4000 || /[\u0000\r\n]/.test(entryValue)) throw new Error(`The value for ${key} is invalid.`);
+    entries[key] = entryValue;
+  }
+  if (Object.keys(entries).length > 50) throw new Error('Use no more than 50 Lovable build variables.');
+  return entries;
+}
+
 function validateSiteInput(input) {
   const name = String(input.name || '').trim();
   const domain = normalizeDomain(String(input.domain || ''));
-  const adminUser = String(input.adminUser || '').trim();
-  const adminEmail = String(input.adminEmail || '').trim().toLowerCase();
-  const adminPassword = String(input.adminPassword || '');
+  const kind = input.kind === 'lovable' ? 'lovable' : 'wordpress';
   const pod = ['Micro', 'Standard', 'Performance', 'Power'].includes(input.pod) ? input.pod : 'Standard';
   if (!name || name.length > 80) throw new Error('Enter a site name up to 80 characters.');
   if (!domain || domain.length > 253 || !/^(?=.{1,253}$)(localhost|([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,62})$/.test(domain)) {
     throw new Error('Enter a valid hostname, such as client.example.com or client.localhost.');
   }
+  if (kind === 'lovable') {
+    const prompt = String(input.lovablePrompt || '').trim();
+    if (!prompt || prompt.length > 50_000) throw new Error('Enter a Lovable prompt up to 50,000 characters.');
+    const images = parseReferenceUrls(input.imageUrls, 'image');
+    const html = parseReferenceUrls(input.htmlUrls, 'page');
+    if (images.length + html.length > 10) throw new Error('Lovable supports up to 10 combined image and page references.');
+    const repositoryUrl = validateRepositoryUrl(input.repositoryUrl);
+    const branch = String(input.repositoryBranch || 'main').trim();
+    if (!branch || branch.length > 200 || branch.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) throw new Error('Enter a valid Git branch name.');
+    const repositoryToken = String(input.repositoryToken || '').trim();
+    if (repositoryToken.length > 500) throw new Error('The repository access token is too long.');
+    return {
+      name, domain, kind, pod, region: 'Local Docker', repositoryUrl, repositoryBranch: branch,
+      repositoryToken, lovablePrompt: prompt, lovableBuildUrl: buildLovableUrl(prompt, images, html),
+      lovableReferences: { images, html }, buildEnvironment: validateBuildEnvironment(input.buildEnvironment),
+    };
+  }
+  const adminUser = String(input.adminUser || '').trim();
+  const adminEmail = String(input.adminEmail || '').trim().toLowerCase();
+  const adminPassword = String(input.adminPassword || '');
   if (!/^[A-Za-z0-9_.-]{1,60}$/.test(adminUser)) throw new Error('The admin username may contain letters, numbers, dots, dashes and underscores.');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) throw new Error('Enter a valid administrator email address.');
   if (adminPassword.length < 12) throw new Error('Use an administrator password with at least 12 characters.');
-  return { name, domain, adminUser, adminEmail, adminPassword, pod, region: 'Local Docker' };
+  return { name, domain, kind, adminUser, adminEmail, adminPassword, pod, region: 'Local Docker' };
 }
 
 function validateTags(value) {
@@ -433,6 +517,120 @@ async function getDirectPort(container) {
   }
 }
 
+function lovableSourceDirectory(site) {
+  return path.join(sourceRoot, site.id);
+}
+
+async function prepareLovableSource(site) {
+  const sourceDirectory = lovableSourceDirectory(site);
+  await mkdir(sourceRoot, { recursive: true });
+  await rm(sourceDirectory, { recursive: true, force: true });
+  const cloneArgs = [];
+  const repositoryToken = site.secrets?.repositoryToken || '';
+  if (repositoryToken) cloneArgs.push('-c', `http.extraHeader=Authorization: Bearer ${repositoryToken}`);
+  cloneArgs.push('clone', '--depth', '1', '--branch', site.repositoryBranch || 'main', '--single-branch', site.repositoryUrl, sourceDirectory);
+  await git(cloneArgs, { secret: repositoryToken, timeout: 600_000 });
+
+  let packageDefinition;
+  try { packageDefinition = JSON.parse(await readFile(path.join(sourceDirectory, 'package.json'), 'utf8')); } catch {
+    throw new Error('The Lovable repository does not contain a valid package.json file.');
+  }
+  if (!packageDefinition?.scripts?.build) throw new Error('The Lovable repository does not define an npm build script.');
+
+  const buildKeys = Object.keys(site.buildEnvironment || {});
+  const environmentLines = buildKeys.flatMap((key) => [`ARG ${key}`, `ENV ${key}=\${${key}}`]);
+  const dockerfile = [
+    'FROM node:22-alpine AS build',
+    'WORKDIR /app',
+    'COPY package*.json ./',
+    'RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi',
+    'COPY . .',
+    ...environmentLines,
+    'RUN npm run build',
+    '',
+    'FROM nginx:1.27-alpine',
+    'COPY --from=build /app/dist /usr/share/nginx/html',
+    'COPY .geekheros-nginx.conf /etc/nginx/conf.d/default.conf',
+    'EXPOSE 80',
+    'HEALTHCHECK --interval=10s --timeout=3s --retries=6 CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1',
+    '',
+  ].join('\n');
+  const nginx = [
+    'server {',
+    '  listen 80;',
+    '  server_name _;',
+    '  root /usr/share/nginx/html;',
+    '  index index.html;',
+    '  location / { try_files $uri $uri/ /index.html; }',
+    '  location ~* \\.(?:css|js|jpg|jpeg|gif|png|webp|ico|svg|woff2?)$ { expires 7d; add_header Cache-Control "public, immutable"; try_files $uri =404; }',
+    '}',
+    '',
+  ].join('\n');
+  await writeFile(path.join(sourceDirectory, '.geekheros.Dockerfile'), dockerfile, 'utf8');
+  await writeFile(path.join(sourceDirectory, '.geekheros.Dockerfile.dockerignore'), ['.git', 'node_modules', 'dist', '.env*', '*.log', ''].join('\n'), 'utf8');
+  await writeFile(path.join(sourceDirectory, '.geekheros-nginx.conf'), nginx, 'utf8');
+  const revision = (await git(['-C', sourceDirectory, 'rev-parse', 'HEAD'], { timeout: 30_000 })).stdout;
+  return { sourceDirectory, revision };
+}
+
+async function buildLovableImage(site) {
+  const { sourceDirectory, revision } = await prepareLovableSource(site);
+  const args = ['build', '--pull', '-f', path.join(sourceDirectory, '.geekheros.Dockerfile'), '-t', site.image];
+  for (const [key, value] of Object.entries(site.buildEnvironment || {})) args.push('--build-arg', `${key}=${value}`);
+  args.push(sourceDirectory);
+  await docker(args, { timeout: 1_200_000, maxBuffer: 32 * 1024 * 1024 });
+  return revision;
+}
+
+async function ensureLovableContainer(site, recreate = false) {
+  const existing = await inspectContainer(site.wpContainer);
+  if (existing && recreate) await docker(['rm', '-f', site.wpContainer]);
+  else if (existing) return;
+  const router = `gh-${site.id.replace(/[^a-z0-9]/g, '').slice(0, 12)}`;
+  await docker([
+    'run', '-d', '--name', site.wpContainer, '--restart', 'unless-stopped',
+    '--network', site.network,
+    ...limitsForPod(site.pod),
+    '-p', '127.0.0.1::80',
+    '--label', managedLabel, '--label', 'com.geekheros.role=lovable',
+    '--label', `com.geekheros.site.id=${site.id}`, '--label', `com.geekheros.site.name=${site.name}`,
+    '--label', `com.geekheros.site.domain=${site.domain}`, '--label', `com.geekheros.site.pod=${site.pod}`,
+    '--label', 'traefik.enable=true',
+    '--label', `traefik.http.routers.${router}.rule=Host(\`${site.domain}\`)`,
+    '--label', `traefik.http.routers.${router}.entrypoints=web`,
+    '--label', `traefik.http.services.${router}.loadbalancer.server.port=80`,
+    '--label', `traefik.docker.network=${edgeNetwork}`,
+    site.image,
+  ], { timeout: 600_000 });
+  await docker(['network', 'connect', edgeNetwork, site.wpContainer]);
+}
+
+async function deployLovableSite(site, recreate = false) {
+  await setSiteState(site.id, { phase: 'Cloning Lovable source', error: null });
+  const revision = await buildLovableImage(site);
+  await setSiteState(site.id, { phase: 'Starting Lovable build' });
+  await ensureLovableContainer(site, recreate);
+  const directPort = await getDirectPort(site.wpContainer);
+  await setSiteState(site.id, {
+    phase: null, status: 'Running', error: null, directPort, sourceRevision: revision,
+    lastScannedAt: new Date().toISOString(), updates: 0,
+  });
+  return { directPort, revision };
+}
+
+async function refreshLovableSourceStatus(site) {
+  const repositoryToken = site.secrets?.repositoryToken || '';
+  const args = [];
+  if (repositoryToken) args.push('-c', `http.extraHeader=Authorization: Bearer ${repositoryToken}`);
+  args.push('ls-remote', '--heads', site.repositoryUrl, `refs/heads/${site.repositoryBranch || 'main'}`);
+  const result = await git(args, { secret: repositoryToken, timeout: 120_000 });
+  const remoteRevision = result.stdout.split(/\s+/)[0] || null;
+  if (!remoteRevision) throw new Error('The configured Lovable repository branch could not be found.');
+  const updates = site.sourceRevision && site.sourceRevision !== remoteRevision ? 1 : 0;
+  await setSiteState(site.id, { remoteRevision, updates, lastScannedAt: new Date().toISOString() });
+  return { remoteRevision, updates };
+}
+
 function parseJsonOutput(stdout, fallback = []) {
   if (!stdout) return fallback;
   try { return JSON.parse(stdout); } catch { return fallback; }
@@ -498,6 +696,14 @@ async function provisionSite(siteId) {
   const site = state.sites[siteId];
   if (!site) return;
   try {
+    if (site.kind === 'lovable') {
+      await setSiteState(siteId, { phase: 'Preparing build environment', error: null });
+      await ensureEdge();
+      await ensureNetwork(site.network, [managedLabel, `com.geekheros.site.id=${site.id}`]);
+      await deployLovableSite(site);
+      await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched from Lovable source in Docker Desktop.` });
+      return;
+    }
     await setSiteState(siteId, { phase: 'Pulling images', error: null });
     await ensureEdge();
     await ensureNetwork(site.network, [managedLabel, `com.geekheros.site.id=${site.id}`]);
@@ -534,21 +740,29 @@ async function provisionSite(siteId) {
 }
 
 async function createSite(input) {
-  const values = validateSiteInput(input);
+  let values;
+  try { values = validateSiteInput(input); } catch (error) { throw Object.assign(error, { status: Number(error?.status) || 400 }); }
   const state = await readState();
   if (Object.values(state.sites).some((site) => site.domain === values.domain)) throw new Error('That domain is already managed by GeekHeros.');
   const clientId = input.clientId ? String(input.clientId) : null;
   if (clientId && !state.clients[clientId]) throw new Error('The selected client no longer exists.');
   const id = `site_${randomBytes(6).toString('hex')}`;
   const namespace = `gh-${slugify(values.domain)}-${id.slice(-4)}`;
+  const repositoryToken = values.kind === 'lovable' ? values.repositoryToken : '';
+  const publicValues = { ...values };
+  delete publicValues.repositoryToken;
+  const isLovable = values.kind === 'lovable';
   const site = {
-    id, ...values, namespace, clientId, tags: validateTags(input.tags),
-    network: `${namespace}-net`, dbContainer: `${namespace}-db`, wpContainer: `${namespace}-wp`,
-    dbVolume: `${namespace}-db`, wpVolume: `${namespace}-wp`,
-    image: wordpressImage, status: 'Provisioning', phase: 'Queued', error: null,
-    wpVersion: '—', phpVersion: '—', updates: 0, backups: [],
+    id, ...publicValues, namespace, clientId, tags: validateTags(input.tags),
+    network: `${namespace}-net`, dbContainer: isLovable ? null : `${namespace}-db`, wpContainer: `${namespace}-${isLovable ? 'app' : 'wp'}`,
+    dbVolume: isLovable ? null : `${namespace}-db`, wpVolume: isLovable ? null : `${namespace}-wp`,
+    image: isLovable ? `geekheros/lovable-${id.slice(-12)}:latest` : wordpressImage,
+    status: 'Provisioning', phase: 'Queued', error: null,
+    wpVersion: isLovable ? 'Lovable' : '—', phpVersion: isLovable ? 'Node 22' : '—', updates: 0, backups: [],
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    secrets: { dbPassword: randomBytes(24).toString('base64url'), dbRootPassword: randomBytes(32).toString('base64url') },
+    secrets: isLovable
+      ? { repositoryToken }
+      : { dbPassword: randomBytes(24).toString('base64url'), dbRootPassword: randomBytes(32).toString('base64url') },
   };
   await updateState((next) => { next.sites[id] = site; });
   void provisionSite(id);
@@ -570,15 +784,21 @@ function publicSite(site, inspect) {
   const status = site.phase ? 'Provisioning' : site.status === 'Error' ? 'Error' : dockerStatus === 'running' ? 'Running' : dockerStatus === 'exited' || dockerStatus === 'created' ? 'Stopped' : dockerStatus ? 'Attention' : site.status || 'Unknown';
   return {
     id: site.id, name: site.name, domain: site.domain, status, phase: site.phase || null, error: site.error || null,
+    kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
     clientId: site.clientId || null, tags: Array.isArray(site.tags) ? site.tags : [],
     region: 'Local Docker', pod: site.pod, wp: site.wpVersion || '—', php: site.phpVersion || '—',
     updates: Number(site.updates || 0), uptime: status === 'Running' ? durationSince(inspect?.State?.StartedAt || site.createdAt) : '—',
     createdAt: site.createdAt, updatedAt: site.updatedAt, containerId: inspect?.Id?.slice(0, 12) || null,
-    containerName: site.wpContainer, databaseContainer: site.dbContainer, image: site.image,
+    containerName: site.wpContainer, databaseContainer: site.dbContainer || 'Not required', image: site.image,
     directUrl: directPort ? `http://127.0.0.1:${directPort}` : null,
-    siteUrl: `http://${site.domain}`, adminUrl: `http://${site.domain}/wp-admin/`,
-    backupCount: site.backups?.length || 0, lastBackupAt: site.backups?.[0]?.createdAt || null,
+    siteUrl: `http://${site.domain}`, adminUrl: site.kind === 'lovable' ? null : `http://${site.domain}/wp-admin/`,
+    backupCount: site.backups?.length || 0, backups: Array.isArray(site.backups) ? site.backups : [],
+    lastBackupAt: site.backups?.[0]?.createdAt || null,
     lastScannedAt: site.lastScannedAt || null, updateCounts: site.updateCounts || { core: 0, plugins: 0, themes: 0 },
+    repositoryUrl: site.kind === 'lovable' ? site.repositoryUrl : null,
+    repositoryBranch: site.kind === 'lovable' ? site.repositoryBranch : null,
+    sourceRevision: site.kind === 'lovable' ? site.sourceRevision || null : null,
+    lovableBuildUrl: site.kind === 'lovable' ? site.lovableBuildUrl : null,
   };
 }
 
@@ -674,6 +894,7 @@ async function deleteClient(clientId) {
 
 async function getSiteInventory(siteId) {
   const site = await requireSite(siteId);
+  if (site.kind === 'lovable') throw Object.assign(new Error('Lovable sites use source deployments instead of WordPress package inventory.'), { status: 409 });
   const inventory = await readInventory(site);
   await setSiteState(site.id, {
     wpVersion: inventory.core.version,
@@ -686,6 +907,7 @@ async function getSiteInventory(siteId) {
 
 async function issueOneClickLogin(siteId) {
   const site = await requireSite(siteId);
+  if (site.kind === 'lovable') throw Object.assign(new Error('One-click WP Admin is only available for WordPress sites.'), { status: 409 });
   const inspect = await inspectContainer(site.wpContainer);
   if (!inspect?.State?.Running) throw Object.assign(new Error('Start the WordPress container before opening WP Admin.'), { status: 409 });
   await ensureControlPlaneMuPlugin(site);
@@ -710,6 +932,15 @@ async function createBackup(site) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const siteBackupDir = path.join(backupRoot, site.id);
   await mkdir(siteBackupDir, { recursive: true });
+  if (site.kind === 'lovable') {
+    const filesName = `${stamp}-lovable-source.tar.gz`;
+    const sourceDirectory = lovableSourceDirectory(site);
+    try { await readFile(path.join(sourceDirectory, 'package.json')); } catch { throw new Error('The Lovable source checkout is unavailable. Redeploy the site before creating a backup.'); }
+    await docker(['run', '--rm', '-v', `${sourceDirectory}:/source:ro`, '-v', `${siteBackupDir}:/backups`, 'alpine:latest', 'tar', '-czf', `/backups/${filesName}`, '-C', '/source', '.'], { timeout: 600_000 });
+    const backup = { id: randomUUID(), createdAt: new Date().toISOString(), files: [filesName] };
+    await updateState((state) => { state.sites[site.id].backups.unshift(backup); });
+    return backup;
+  }
   const databaseFile = path.join(siteBackupDir, `${stamp}-database.sql`);
   const filesName = `${stamp}-wordpress.tar.gz`;
   await dockerToFile(['exec', '-e', `MYSQL_PWD=${site.secrets.dbRootPassword}`, site.dbContainer, 'mariadb-dump', '-uroot', 'wordpress'], databaseFile);
@@ -722,19 +953,21 @@ async function createBackup(site) {
 async function runOperation(siteId, type, input = {}) {
   const site = await requireSite(siteId);
   const operation = String(type || '').replace(/^site\./, '');
-  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan', 'delete'].includes(operation)) {
+  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'redeploy', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan', 'delete'].includes(operation)) {
     throw Object.assign(new Error('Unsupported operation.'), { status: 400 });
   }
   if (site.phase) throw Object.assign(new Error(`The site is currently ${site.phase.toLowerCase()}.`), { status: 409 });
 
   if (operation === 'delete') {
     await docker(['rm', '-f', site.wpContainer]).catch((error) => { if (!/No such/i.test(error.message)) throw error; });
-    await docker(['rm', '-f', site.dbContainer]).catch((error) => { if (!/No such/i.test(error.message)) throw error; });
+    if (site.dbContainer) await docker(['rm', '-f', site.dbContainer]).catch((error) => { if (!/No such/i.test(error.message)) throw error; });
     await docker(['network', 'rm', site.network]).catch(() => undefined);
     if (input.deleteData === true) {
-      await docker(['volume', 'rm', '-f', site.wpVolume]).catch(() => undefined);
-      await docker(['volume', 'rm', '-f', site.dbVolume]).catch(() => undefined);
+      if (site.wpVolume) await docker(['volume', 'rm', '-f', site.wpVolume]).catch(() => undefined);
+      if (site.dbVolume) await docker(['volume', 'rm', '-f', site.dbVolume]).catch(() => undefined);
       await rm(path.join(backupRoot, site.id), { recursive: true, force: true });
+      await rm(lovableSourceDirectory(site), { recursive: true, force: true });
+      if (site.kind === 'lovable') await docker(['image', 'rm', '-f', site.image]).catch(() => undefined);
     }
     await updateState((state) => { delete state.sites[site.id]; });
     await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name} was removed${input.deleteData ? ' with its data' : '; volumes were preserved'}.` });
@@ -743,6 +976,33 @@ async function runOperation(siteId, type, input = {}) {
 
   await setSiteState(site.id, { phase: `${operation[0].toUpperCase()}${operation.slice(1)} in progress`, error: null });
   try {
+    if (site.kind === 'lovable') {
+      if (['update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme'].includes(operation)) {
+        throw Object.assign(new Error('WordPress package operations are not available for Lovable sites.'), { status: 409 });
+      }
+      if (operation === 'start') {
+        await docker(['start', site.wpContainer]);
+      } else if (operation === 'stop') {
+        await docker(['stop', '-t', '20', site.wpContainer]);
+      } else if (operation === 'restart') {
+        await docker(['restart', '-t', '20', site.wpContainer]);
+      } else if (operation === 'refresh') {
+        await refreshLovableSourceStatus(site);
+      } else if (operation === 'backup') {
+        await createBackup(site);
+      } else if (operation === 'update' || operation === 'redeploy') {
+        await createBackup(site);
+        await deployLovableSite(site, true);
+      } else if (operation === 'scan') {
+        await refreshLovableSourceStatus(site);
+        await readFile(path.join(lovableSourceDirectory(site), 'package.json'));
+      }
+      const nextStatus = operation === 'stop' ? 'Stopped' : 'Running';
+      await setSiteState(site.id, { phase: null, status: nextStatus, error: null });
+      await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name}: ${operation} completed.` });
+      const current = await requireSite(site.id);
+      return { site: publicSite(current, await inspectContainer(current.wpContainer)) };
+    }
     if (operation === 'start') {
       await docker(['start', site.dbContainer]);
       await waitForDatabase(site, 120_000);
@@ -905,7 +1165,7 @@ server.listen(port, host, async () => {
         void provisionSite(site.id);
       } else {
         const container = await inspectContainer(site.wpContainer).catch(() => null);
-        if (container?.State?.Running) {
+        if (container?.State?.Running && site.kind !== 'lovable') {
           await ensureLocalPreviewConfig(site).catch((error) => {
             console.error(`Unable to enable local preview for ${site.name}:`, error.message);
           });
