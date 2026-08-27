@@ -14,6 +14,7 @@ const stateDir = path.join(projectRoot, '.geekheros');
 const stateFile = path.join(stateDir, 'state.json');
 const backupRoot = path.join(stateDir, 'backups');
 const sourceRoot = path.join(stateDir, 'sources');
+const blueprintRoot = path.join(stateDir, 'blueprints');
 const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
 const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
 const authToken = process.env.GEEKHEROS_AGENT_TOKEN;
@@ -90,7 +91,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 4, sites: {}, clients: {}, activity: [], integrations: { lovable: {} } };
+  return { version: 5, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {} } };
 }
 
 async function readState() {
@@ -107,9 +108,10 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 4,
+      version: 5,
       sites,
       clients: parsed.clients || {},
+      blueprints: parsed.blueprints || {},
       activity: parsed.activity || [],
       integrations: {
         ...base.integrations,
@@ -630,7 +632,9 @@ function validateSiteInput(input) {
   if (!/^[A-Za-z0-9_.-]{1,60}$/.test(adminUser)) throw new Error('The admin username may contain letters, numbers, dots, dashes and underscores.');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) throw new Error('Enter a valid administrator email address.');
   if (adminPassword.length < 12) throw new Error('Use an administrator password with at least 12 characters.');
-  return { name, domain, kind, adminUser, adminEmail, adminPassword, pod, region: 'Local Docker' };
+  const blueprintId = String(input.blueprintId || '').trim();
+  if (blueprintId && !/^blueprint_[a-f0-9]{12}$/.test(blueprintId)) throw new Error('Choose a valid WordPress blueprint.');
+  return { name, domain, kind, adminUser, adminEmail, adminPassword, blueprintId: blueprintId || null, pod, region: 'Local Docker' };
 }
 
 function validateTags(value) {
@@ -663,6 +667,195 @@ function validateClientInput(input, partial = false) {
   }
   if (values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) throw new Error('Enter a valid client email address.');
   return values;
+}
+
+const blueprintFileRules = {
+  plugin: { extension: '.zip', label: 'plugin ZIP' },
+  theme: { extension: '.zip', label: 'theme ZIP' },
+  settings: { extension: '.json', label: 'settings JSON' },
+  content: { extension: '.xml', label: 'WordPress export XML' },
+  'mu-plugin': { extension: '.php', label: 'must-use plugin PHP' },
+  'wp-content': { extension: null, label: 'wp-content file' },
+};
+const blueprintMaxFileBytes = 25 * 1024 * 1024;
+const blueprintMaxTotalBytes = 75 * 1024 * 1024;
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function normalizeBlueprintSlugs(value, label, maximum = 100) {
+  const source = Array.isArray(value) ? value : String(value || '').split(/[\s,]+/);
+  const slugs = [];
+  for (const item of source) {
+    const slug = String(typeof item === 'object' && item ? item.slug : item || '').trim().toLowerCase();
+    if (!slug) continue;
+    if (!/^[a-z0-9][a-z0-9-]{0,190}$/.test(slug)) throw new Error(`The ${label} slug "${slug}" is invalid.`);
+    const activate = typeof item === 'object' && item ? item.activate !== false : true;
+    if (!slugs.some((entry) => entry.slug === slug)) slugs.push({ slug, activate });
+  }
+  if (slugs.length > maximum) throw new Error(`A blueprint may include up to ${maximum} ${label} entries.`);
+  return slugs;
+}
+
+function normalizeBlueprintSettings(value) {
+  if (!isPlainObject(value)) throw new Error('Blueprint settings JSON must contain an object.');
+  const unsupported = Object.keys(value).filter((key) => !['options', 'plugins', 'themes', 'pages'].includes(key));
+  if (unsupported.length) throw new Error(`Blueprint settings JSON contains unsupported fields: ${unsupported.join(', ')}.`);
+  const options = isPlainObject(value.options) ? value.options : {};
+  const optionEntries = Object.entries(options);
+  if (optionEntries.length > 200) throw new Error('Blueprint settings may update up to 200 WordPress options.');
+  for (const [key, optionValue] of optionEntries) {
+    if (!/^[A-Za-z0-9_.:-]{1,191}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error(`The WordPress option "${key}" is invalid.`);
+    if (JSON.stringify(optionValue).length > 8_000) throw new Error(`The WordPress option "${key}" is too large.`);
+  }
+  const pages = Array.isArray(value.pages) ? value.pages.map((page, index) => {
+    if (!isPlainObject(page)) throw new Error(`Blueprint page ${index + 1} must be an object.`);
+    const title = String(page.title || '').trim();
+    const content = String(page.content || '');
+    const slug = String(page.slug || '').trim();
+    const status = String(page.status || 'publish').trim();
+    const template = String(page.template || '').trim();
+    if (!title || title.length > 200) throw new Error(`Blueprint page ${index + 1} needs a title up to 200 characters.`);
+    if (content.length > 8_000) throw new Error(`Blueprint page "${title}" is too large; use a WordPress export XML file for larger content.`);
+    if (slug && !/^[a-z0-9][a-z0-9-]{0,190}$/.test(slug)) throw new Error(`Blueprint page "${title}" has an invalid slug.`);
+    if (!['draft', 'pending', 'private', 'publish'].includes(status)) throw new Error(`Blueprint page "${title}" has an invalid status.`);
+    if (template.length > 190 || /[\\/]/.test(template)) throw new Error(`Blueprint page "${title}" has an invalid template.`);
+    return { title, content, slug, status, template };
+  }) : [];
+  if (pages.length > 100) throw new Error('Blueprint settings may create up to 100 pages.');
+  return {
+    options,
+    plugins: normalizeBlueprintSlugs(value.plugins || [], 'plugin'),
+    themes: normalizeBlueprintSlugs(value.themes || [], 'theme', 20),
+    pages,
+  };
+}
+
+function cleanBlueprintFileName(value) {
+  const name = path.basename(String(value || '')).replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_').trim();
+  if (!name || name === '.' || name === '..' || name.length > 180) throw new Error('A blueprint file has an invalid name.');
+  return name;
+}
+
+function cleanBlueprintDestination(value, name) {
+  const raw = String(value || `wp-content/blueprint-files/${name}`).replace(/\\/g, '/').trim();
+  const segments = raw.split('/');
+  if (!raw || raw.startsWith('/') || raw.length > 300 || /[\u0000-\u001f]/.test(raw) || segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw new Error(`${name} has an invalid wp-content destination.`);
+  }
+  const destination = path.posix.normalize(raw);
+  if (!destination.startsWith('wp-content/')) throw new Error(`${name} must be placed inside wp-content.`);
+  const protectedDestination = destination.toLowerCase();
+  if (protectedDestination === 'wp-content/mu-plugins/geekheros-control-plane.php' || segments.some((segment) => segment.toLowerCase().startsWith('.geekheros-blueprint-'))) {
+    throw new Error(`${name} cannot overwrite GeekHeros control files.`);
+  }
+  return destination;
+}
+
+function decodeBlueprintFile(file) {
+  const kind = String(file?.kind || '');
+  const rule = blueprintFileRules[kind];
+  if (!rule) throw new Error('Choose a supported purpose for every blueprint file.');
+  const name = cleanBlueprintFileName(file?.name);
+  if (rule.extension && path.extname(name).toLowerCase() !== rule.extension) throw new Error(`${name} must be a ${rule.label}.`);
+  const destination = kind === 'wp-content' ? cleanBlueprintDestination(file?.destination, name) : '';
+  const encoded = String(file?.content || '').replace(/\s/g, '');
+  if (!encoded || encoded.length > Math.ceil(blueprintMaxFileBytes * 4 / 3) + 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error(`${name} is not a valid upload.`);
+  const contents = Buffer.from(encoded, 'base64');
+  if (!contents.length || contents.length > blueprintMaxFileBytes || contents.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) throw new Error(`${name} is not a valid upload.`);
+  if (rule.extension === '.zip' && !['504b0304', '504b0506', '504b0708'].includes(contents.subarray(0, 4).toString('hex'))) throw new Error(`${name} is not a valid ZIP archive.`);
+  if (rule.extension === '.json') {
+    let settings;
+    try { settings = JSON.parse(contents.toString('utf8')); } catch { throw new Error(`${name} must contain valid JSON.`); }
+    normalizeBlueprintSettings(settings);
+  }
+  if (rule.extension === '.xml' && !contents.subarray(0, Math.min(contents.length, 4096)).toString('utf8').includes('<')) throw new Error(`${name} is not a valid XML file.`);
+  if (rule.extension === '.php' && !contents.subarray(0, Math.min(contents.length, 4096)).toString('utf8').includes('<?php')) throw new Error(`${name} must contain a PHP opening tag.`);
+  return { kind, name, destination, contents };
+}
+
+function publicBlueprint(blueprint, sites = []) {
+  const files = Array.isArray(blueprint.files) ? blueprint.files.map((file) => ({
+    id: file.id, name: file.name, kind: file.kind, destination: file.destination || '',
+    size: Number(file.size || 0), sha256: file.sha256,
+  })) : [];
+  return {
+    id: blueprint.id,
+    name: blueprint.name,
+    description: blueprint.description || '',
+    plugins: Array.isArray(blueprint.plugins) ? blueprint.plugins : [],
+    themes: Array.isArray(blueprint.themes) ? blueprint.themes : [],
+    files,
+    fileCount: files.length,
+    totalBytes: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
+    usageCount: sites.filter((site) => site.blueprintId === blueprint.id).length,
+    createdAt: blueprint.createdAt,
+    updatedAt: blueprint.updatedAt,
+  };
+}
+
+async function listBlueprints() {
+  const state = await readState();
+  const sites = Object.values(state.sites);
+  return Object.values(state.blueprints).map((blueprint) => publicBlueprint(blueprint, sites))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+}
+
+async function createBlueprint(input) {
+  const name = String(input.name || '').trim();
+  const description = String(input.description || '').trim();
+  if (!name || name.length > 100) throw Object.assign(new Error('Enter a blueprint name up to 100 characters.'), { status: 400 });
+  if (description.length > 500) throw Object.assign(new Error('Blueprint descriptions may be up to 500 characters.'), { status: 400 });
+  let plugins;
+  let themes;
+  try {
+    plugins = normalizeBlueprintSlugs(input.plugins || [], 'plugin');
+    themes = normalizeBlueprintSlugs(input.themes || [], 'theme', 20);
+  } catch (error) {
+    throw Object.assign(error, { status: 400 });
+  }
+  const sourceFiles = Array.isArray(input.files) ? input.files : [];
+  if (sourceFiles.length > 25) throw Object.assign(new Error('A blueprint may contain up to 25 uploaded files.'), { status: 400 });
+  if (!plugins.length && !themes.length && !sourceFiles.length) throw Object.assign(new Error('Add at least one plugin, theme, settings file, content export or must-use plugin.'), { status: 400 });
+  let decodedFiles;
+  try { decodedFiles = sourceFiles.map(decodeBlueprintFile); } catch (error) { throw Object.assign(error, { status: 400 }); }
+  const totalBytes = decodedFiles.reduce((sum, file) => sum + file.contents.length, 0);
+  if (totalBytes > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint uploads may total up to 75 MB.'), { status: 413 });
+  const id = `blueprint_${randomBytes(6).toString('hex')}`;
+  const directory = path.join(blueprintRoot, id);
+  const now = new Date().toISOString();
+  await mkdir(directory, { recursive: true });
+  let blueprint;
+  try {
+    const files = [];
+    for (const file of decodedFiles) {
+      const fileId = randomBytes(8).toString('hex');
+      const storageName = `${fileId}${path.extname(file.name).toLowerCase()}`;
+      await writeFile(path.join(directory, storageName), file.contents);
+      files.push({ id: fileId, name: file.name, kind: file.kind, destination: file.destination, size: file.contents.length, sha256: createHash('sha256').update(file.contents).digest('hex'), storageName });
+    }
+    blueprint = { id, name, description, plugins, themes, files, createdAt: now, updatedAt: now };
+    await updateState((state) => { state.blueprints[id] = blueprint; });
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
+    throw error;
+  }
+  await recordActivity({ siteId: '', siteName: name, type: 'blueprint.create', message: `${name} was saved as a WordPress blueprint.` }).catch((error) => console.error('Unable to record blueprint creation:', error.message));
+  return publicBlueprint(blueprint);
+}
+
+async function deleteBlueprint(blueprintId) {
+  const blueprint = await updateState((state) => {
+    const current = state.blueprints[blueprintId];
+    if (!current) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+    if (Object.values(state.sites).some((site) => site.blueprintId === blueprintId)) throw Object.assign(new Error('This blueprint is used by a managed site and cannot be removed.'), { status: 409 });
+    delete state.blueprints[blueprintId];
+    return current;
+  });
+  await rm(path.join(blueprintRoot, blueprintId), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await recordActivity({ siteId: '', siteName: blueprint.name, type: 'blueprint.delete', message: `${blueprint.name} was removed from WordPress blueprints.` }).catch((error) => console.error('Unable to record blueprint deletion:', error.message));
+  return { deleted: true };
 }
 
 function validatePackageNames(value) {
@@ -737,6 +930,90 @@ function wpCliArgs(site, command) {
 
 async function runWp(site, command, options = {}) {
   return docker(wpCliArgs(site, command), { timeout: options.timeout || 300_000, maxBuffer: 32 * 1024 * 1024 });
+}
+
+async function installBlueprintSlug(site, packageType, entry) {
+  const command = [packageType, 'install', entry.slug, '--force'];
+  if (entry.activate !== false) command.push('--activate');
+  await runWp(site, command, { timeout: 600_000 });
+}
+
+function blueprintPageSlug(page) {
+  if (page.slug) return page.slug;
+  return page.title.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 190) || `page-${createHash('sha256').update(page.title).digest('hex').slice(0, 12)}`;
+}
+
+async function applyBlueprintSettings(site, rawSettings) {
+  const settings = normalizeBlueprintSettings(rawSettings);
+  for (const plugin of settings.plugins) await installBlueprintSlug(site, 'plugin', plugin);
+  for (const theme of settings.themes) await installBlueprintSlug(site, 'theme', theme);
+  for (const [key, value] of Object.entries(settings.options)) {
+    await runWp(site, ['option', 'update', key, JSON.stringify(value), '--format=json'], { timeout: 120_000 });
+  }
+  for (const page of settings.pages) {
+    const slug = blueprintPageSlug(page);
+    let existingId = '';
+    try { existingId = (await runWp(site, ['post', 'list', '--post_type=page', `--name=${slug}`, '--field=ID'], { timeout: 90_000 })).stdout.split(/\s+/)[0] || ''; } catch {}
+    const command = ['post', existingId ? 'update' : 'create'];
+    if (existingId) command.push(existingId);
+    command.push('--post_type=page', `--post_title=${page.title}`, `--post_name=${slug}`, `--post_status=${page.status}`, `--post_content=${page.content}`);
+    if (page.template) command.push(`--page_template=${page.template}`);
+    await runWp(site, command, { timeout: 180_000 });
+  }
+}
+
+async function applyWordPressBlueprint(site) {
+  if (!site.blueprintId || site.blueprintAppliedAt) return;
+  const state = await readState();
+  const blueprint = state.blueprints[site.blueprintId];
+  if (!blueprint) throw new Error('The selected WordPress blueprint is no longer available.');
+  await setSiteState(site.id, { phase: `Applying ${blueprint.name} blueprint` });
+  const staging = `/var/www/html/wp-content/.geekheros-blueprint-${blueprint.id}`;
+  await docker(['exec', site.wpContainer, 'mkdir', '-p', staging], { timeout: 30_000 });
+  try {
+    for (const plugin of blueprint.plugins || []) await installBlueprintSlug(site, 'plugin', plugin);
+    for (const theme of blueprint.themes || []) await installBlueprintSlug(site, 'theme', theme);
+    const orderedFiles = [...(blueprint.files || [])].sort((left, right) => {
+      const order = { plugin: 0, theme: 1, 'mu-plugin': 2, 'wp-content': 3, settings: 4, content: 5 };
+      return (order[left.kind] ?? 99) - (order[right.kind] ?? 99);
+    });
+    for (const file of orderedFiles) {
+      if (path.basename(String(file.storageName || '')) !== file.storageName) throw new Error(`Blueprint file metadata is invalid for ${file.name}.`);
+      const source = path.join(blueprintRoot, blueprint.id, file.storageName);
+      const contents = await readFile(source);
+      if (createHash('sha256').update(contents).digest('hex') !== file.sha256) throw new Error(`Blueprint file ${file.name} failed its integrity check.`);
+      if (file.kind === 'settings') {
+        await applyBlueprintSettings(site, JSON.parse(contents.toString('utf8')));
+        continue;
+      }
+      if (file.kind === 'mu-plugin') {
+        const destination = `/var/www/html/wp-content/mu-plugins/${cleanBlueprintFileName(file.name)}`;
+        await docker(['exec', site.wpContainer, 'mkdir', '-p', path.posix.dirname(destination)], { timeout: 30_000 });
+        await docker(['cp', source, `${site.wpContainer}:${destination}`], { timeout: 120_000 });
+        await docker(['exec', site.wpContainer, 'chmod', '0644', destination], { timeout: 30_000 });
+        continue;
+      }
+      if (file.kind === 'wp-content') {
+        const relative = cleanBlueprintDestination(file.destination, file.name);
+        const destination = `/var/www/html/${relative}`;
+        await docker(['exec', site.wpContainer, 'mkdir', '-p', path.posix.dirname(destination)], { timeout: 30_000 });
+        await docker(['cp', source, `${site.wpContainer}:${destination}`], { timeout: 120_000 });
+        continue;
+      }
+      const stagedFile = `${staging}/${file.id}${path.extname(file.name).toLowerCase()}`;
+      await docker(['cp', source, `${site.wpContainer}:${stagedFile}`], { timeout: 120_000 });
+      if (file.kind === 'plugin') await runWp(site, ['plugin', 'install', stagedFile, '--force', '--activate'], { timeout: 600_000 });
+      else if (file.kind === 'theme') await runWp(site, ['theme', 'install', stagedFile, '--force', '--activate'], { timeout: 600_000 });
+      else if (file.kind === 'content') {
+        await runWp(site, ['plugin', 'install', 'wordpress-importer', '--force', '--activate'], { timeout: 600_000 });
+        await runWp(site, ['import', stagedFile, '--authors=create'], { timeout: 600_000 });
+      } else throw new Error(`Blueprint file ${file.name} has an unsupported purpose.`);
+    }
+    await runWp(site, ['rewrite', 'flush', '--hard'], { timeout: 120_000 });
+    await setSiteState(site.id, { blueprintAppliedAt: new Date().toISOString() });
+  } finally {
+    await docker(['exec', site.wpContainer, 'rm', '-rf', staging], { timeout: 30_000 }).catch(() => undefined);
+  }
 }
 
 async function ensureDatabaseContainer(site) {
@@ -1033,6 +1310,8 @@ async function provisionSite(siteId) {
       await runWp(site, ['rewrite', 'structure', '/%postname%/', '--hard'], { timeout: 90_000 });
     }
 
+    await applyWordPressBlueprint(site);
+
     await setSiteState(siteId, { phase: null, status: 'Running', error: null, directPort, adminPassword: undefined });
     await refreshVersions({ ...site, directPort });
     await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched in Docker Desktop.` });
@@ -1047,6 +1326,8 @@ async function createSite(input) {
   try { values = validateSiteInput(input); } catch (error) { throw Object.assign(error, { status: Number(error?.status) || 400 }); }
   const state = await readState();
   if (Object.values(state.sites).some((site) => site.domain === values.domain)) throw new Error('That domain is already managed by GeekHeros.');
+  const blueprint = values.kind === 'wordpress' && values.blueprintId ? state.blueprints[values.blueprintId] : null;
+  if (values.kind === 'wordpress' && values.blueprintId && !blueprint) throw Object.assign(new Error('The selected WordPress blueprint no longer exists.'), { status: 400 });
   const clientId = input.clientId ? String(input.clientId) : null;
   if (clientId && !state.clients[clientId]) throw new Error('The selected client no longer exists.');
   const id = `site_${randomBytes(6).toString('hex')}`;
@@ -1056,7 +1337,7 @@ async function createSite(input) {
   delete publicValues.repositoryToken;
   const isLovable = values.kind === 'lovable';
   const site = {
-    id, ...publicValues, namespace, clientId, tags: validateTags(input.tags),
+    id, ...publicValues, namespace, clientId, tags: validateTags(input.tags), blueprintName: blueprint?.name || null,
     network: `${namespace}-net`, dbContainer: isLovable ? null : `${namespace}-db`, wpContainer: `${namespace}-${isLovable ? 'app' : 'wp'}`,
     dbVolume: isLovable ? null : `${namespace}-db`, wpVolume: isLovable ? null : `${namespace}-wp`,
     image: isLovable ? `geekheros/lovable-${id.slice(-12)}:latest` : wordpressImage,
@@ -1089,6 +1370,9 @@ function publicSite(site, inspect) {
     id: site.id, name: site.name, domain: site.domain, status, phase: site.phase || null, error: site.error || null,
     kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
     clientId: site.clientId || null, tags: Array.isArray(site.tags) ? site.tags : [],
+    blueprintId: site.kind === 'wordpress' ? site.blueprintId || null : null,
+    blueprintName: site.kind === 'wordpress' ? site.blueprintName || null : null,
+    blueprintAppliedAt: site.kind === 'wordpress' ? site.blueprintAppliedAt || null : null,
     region: 'Local Docker', pod: site.pod, wp: site.wpVersion || '—', php: site.phpVersion || '—',
     updates: Number(site.updates || 0), uptime: status === 'Running' ? durationSince(inspect?.State?.StartedAt || site.createdAt) : '—',
     createdAt: site.createdAt, updatedAt: site.updatedAt, containerId: inspect?.Id?.slice(0, 12) || null,
@@ -1429,11 +1713,11 @@ function sendLovableCallback(response, status, success) {
   response.end(body);
 }
 
-async function readJson(request) {
+async function readJson(request, maximumBytes = 1_000_000) {
   let body = '';
   for await (const chunk of request) {
     body += chunk;
-    if (body.length > 1_000_000) throw Object.assign(new Error('Request body is too large.'), { status: 413 });
+    if (body.length > maximumBytes) throw Object.assign(new Error('Request body is too large.'), { status: 413 });
   }
   if (!body) return {};
   try { return JSON.parse(body); } catch { throw Object.assign(new Error('Request body must be valid JSON.'), { status: 400 }); }
@@ -1461,6 +1745,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/lovable/projects') return send(response, 201, { project: await createLovableProject(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/sites') return send(response, 200, { sites: await listSites() });
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
+    if (request.method === 'GET' && url.pathname === '/blueprints') return send(response, 200, { blueprints: await listBlueprints() });
+    if (request.method === 'POST' && url.pathname === '/blueprints') return send(response, 201, { blueprint: await createBlueprint(await readJson(request, 105_000_000)) });
     if (request.method === 'GET' && url.pathname === '/clients') return send(response, 200, { clients: await listClients() });
     if (request.method === 'POST' && url.pathname === '/clients') return send(response, 201, { client: await createClient(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/activity') {
@@ -1470,6 +1756,8 @@ const server = createServer(async (request, response) => {
     const clientMatch = url.pathname.match(/^\/clients\/([^/]+)$/);
     if (clientMatch && request.method === 'PATCH') return send(response, 200, { client: await updateClient(decodeURIComponent(clientMatch[1]), await readJson(request)) });
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
+    const blueprintMatch = url.pathname.match(/^\/blueprints\/([^/]+)$/);
+    if (blueprintMatch && request.method === 'DELETE') return send(response, 200, await deleteBlueprint(decodeURIComponent(blueprintMatch[1])));
     const siteMatch = url.pathname.match(/^\/sites\/([^/]+)$/);
     if (siteMatch && request.method === 'PATCH') return send(response, 200, { site: await updateSiteMetadata(decodeURIComponent(siteMatch[1]), await readJson(request)) });
     const inventoryMatch = url.pathname.match(/^\/sites\/([^/]+)\/inventory$/);

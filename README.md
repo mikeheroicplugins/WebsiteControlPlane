@@ -23,10 +23,17 @@ Open `http://localhost:3000`.
 - A private per-site Docker network.
 - A Traefik hostname route on the shared `geekheros-edge` network.
 - A random loopback port for direct diagnostics.
+- An optional reusable blueprint applied before the site becomes available.
+
+## WordPress blueprints
+
+Blueprints are stored under the ignored local `.geekheros/` directory. A blueprint can include WordPress.org plugin or theme slugs, uploaded plugin/theme ZIPs, a WordPress export XML file, must-use plugin PHP, and arbitrary files placed under `wp-content/`.
+
+Settings JSON supports four top-level fields: `options`, `plugins`, `themes`, and `pages`. Download the example from the Add blueprint modal for a working schema. Uploaded files are size-limited, validated for their selected purpose, hashed for integrity, and copied only into the new WordPress volume. The launch modal defaults to `Default — Clean WordPress install`; selecting a blueprint applies it after WordPress core installation and before the site is marked ready.
 
 ## Lovable launches
 
-Connect Lovable from Settings using its OAuth-protected MCP service. The local GeekHeros agent stores the resulting token only in the ignored local state file, reads the authorized account and workspaces, and creates real Lovable projects from the launch flow. Connect each finished project to GitHub or GitLab and paste that repository into GeekHeros for self-hosting.
+Connect Lovable from Settings using its OAuth-protected MCP service. The local GeekHeros agent stores the resulting token only in the ignored local state file and reads the authorized account and workspaces. Connect each finished Lovable project to GitHub or GitLab and paste that repository into GeekHeros for self-hosting.
 
 GeekHeros then:
 
@@ -43,6 +50,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 ## Working operations
 
 - Launch, start, stop, restart and permanently delete WordPress or Lovable sites.
+- Create reusable WordPress blueprints and apply one during a new launch.
 - Create client records, assign sites to clients and organize sites with persistent tags.
 - Read live Docker, WordPress, PHP, plugin and theme versions.
 - Back up the MariaDB database and WordPress volume.
@@ -52,7 +60,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 - Open WP Admin using a 60-second, single-use login capability without exposing the administrator password.
 - Route domains to the correct container through Traefik.
 - Record completed and failed operations in the local activity log.
-- Create a project through a linked Lovable account, deploy its Git-synced source, check for new commits and rebuild its container.
+- Connect a Lovable account, deploy Git-synced source, check for new commits and rebuild its container.
 
 ## One-click WP Admin
 

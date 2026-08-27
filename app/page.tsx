@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
-type View = 'Overview' | 'Sites' | 'Clients' | 'Activity' | 'Settings';
+type View = 'Overview' | 'Sites' | 'Clients' | 'Blueprints' | 'Activity' | 'Settings';
 type Filter = 'All' | 'Running' | 'Attention';
 type SiteTab = 'Overview' | 'Updates' | 'Backups' | 'Tools';
 type SiteKind = 'wordpress' | 'lovable';
@@ -26,6 +26,7 @@ type Site = {
   backups: Backup[]; lastBackupAt: string | null; lastScannedAt: string | null;
   repositoryUrl: string | null; repositoryBranch: string | null; sourceRevision: string | null;
   lovableBuildUrl: string | null;
+  blueprintId: string | null; blueprintName: string | null; blueprintAppliedAt: string | null;
 };
 type Client = {
   id: string; name: string; company: string; email: string; phone: string; notes: string;
@@ -58,9 +59,19 @@ type ActivityEntry = {
   id: string; siteId: string; siteName: string; type: string; state: string; message: string; createdAt: string;
 };
 type LoginResponse = { actionUrl: string; action: string; token: string; expiresAt: string };
+type BlueprintFileKind = 'plugin' | 'theme' | 'settings' | 'content' | 'mu-plugin' | 'wp-content';
+type BlueprintFile = { id: string; name: string; kind: BlueprintFileKind; destination: string; size: number; sha256: string };
+type BlueprintPackage = { slug: string; activate: boolean };
+type Blueprint = {
+  id: string; name: string; description: string; plugins: BlueprintPackage[]; themes: BlueprintPackage[];
+  files: BlueprintFile[]; fileCount: number; totalBytes: number; usageCount: number; createdAt: string; updatedAt: string;
+};
+type BlueprintUpload = { id: string; file: File; kind: BlueprintFileKind; destination: string };
+type BlueprintInput = { name: string; description: string; plugins: string[]; themes: string[]; files: Array<{ name: string; kind: BlueprintFileKind; destination: string; content: string }> };
 
 const nav: Array<{ view: View; icon: LucideIcon }> = [
   { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Clients', icon: Users },
+  { view: 'Blueprints', icon: Boxes },
   { view: 'Activity', icon: Activity }, { view: 'Settings', icon: Settings },
 ];
 
@@ -68,6 +79,7 @@ export default function Home() {
   const [view, setView] = useState<View>('Sites');
   const [sites, setSites] = useState<Site[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
+  const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
   const [system, setSystem] = useState<SystemInfo>({ connected: false });
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -75,6 +87,8 @@ export default function Home() {
   const [filter, setFilter] = useState<Filter>('All');
   const [launchMode, setLaunchMode] = useState<LaunchMode>(null);
   const [clientOpen, setClientOpen] = useState(false);
+  const [blueprintOpen, setBlueprintOpen] = useState(false);
+  const [preferredBlueprintId, setPreferredBlueprintId] = useState<string | null>(null);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
@@ -84,18 +98,21 @@ export default function Home() {
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [systemResponse, sitesResponse, clientsResponse, activityResponse] = await Promise.all([
+      const [systemResponse, sitesResponse, clientsResponse, blueprintsResponse, activityResponse] = await Promise.all([
         fetch('/api/system', { cache: 'no-store' }), fetch('/api/sites', { cache: 'no-store' }),
-        fetch('/api/clients', { cache: 'no-store' }), fetch('/api/activity', { cache: 'no-store' }),
+        fetch('/api/clients', { cache: 'no-store' }), fetch('/api/blueprints', { cache: 'no-store' }),
+        fetch('/api/activity', { cache: 'no-store' }),
       ]);
-      const [systemData, sitesData, clientsData, activityData] = await Promise.all([
+      const [systemData, sitesData, clientsData, blueprintsData, activityData] = await Promise.all([
         systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
         sitesResponse.json().catch(() => ({ sites: [] })), clientsResponse.json().catch(() => ({ clients: [] })),
+        blueprintsResponse.json().catch(() => ({ blueprints: [] })),
         activityResponse.json().catch(() => ({ activity: [] })),
-      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { clients?: Client[] }, { activity?: ActivityEntry[] }];
+      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { clients?: Client[] }, { blueprints?: Blueprint[] }, { activity?: ActivityEntry[] }];
       setSystem(systemData);
       if (sitesResponse.ok) setSites(sitesData.sites || []);
       if (clientsResponse.ok) setClients(clientsData.clients || []);
+      if (blueprintsResponse.ok) setBlueprints(blueprintsData.blueprints || []);
       if (activityResponse.ok) setActivity(activityData.activity || []);
       setError(systemResponse.ok ? null : systemData.error || sitesData.error || 'Docker Desktop agent is offline.');
     } catch {
@@ -127,8 +144,10 @@ export default function Home() {
     return searchMatch && filterMatch;
   }), [clientNames, filter, query, sites]);
   const visibleClients = useMemo(() => clients.filter((client) => `${client.name} ${client.company} ${client.email} ${client.phone}`.toLowerCase().includes(query.toLowerCase())), [clients, query]);
+  const visibleBlueprints = useMemo(() => blueprints.filter((blueprint) => `${blueprint.name} ${blueprint.description} ${blueprint.plugins.map((plugin) => plugin.slug).join(' ')} ${blueprint.themes.map((theme) => theme.slug).join(' ')} ${blueprint.files.map((file) => file.name).join(' ')}`.toLowerCase().includes(query.toLowerCase())), [blueprints, query]);
 
   function navigate(next: View) { setView(next); setSelectedId(null); }
+  function openLaunch() { setPreferredBlueprintId(null); setLaunchMode('choose'); }
 
   async function createSite(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy('create');
@@ -165,6 +184,29 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || 'The client could not be removed.');
       setToast(`${client.name} was removed. Sites were kept.`); await refresh(true);
     } catch (failure) { setToast(messageFrom(failure, 'The client could not be removed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function createBlueprint(input: BlueprintInput) {
+    setBusy('blueprint:create');
+    try {
+      const response = await fetch('/api/blueprints', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) });
+      const result = await response.json() as { blueprint?: Blueprint; error?: string };
+      if (!response.ok || !result.blueprint) throw new Error(result.error || 'The blueprint could not be saved.');
+      setBlueprintOpen(false); setToast(`${result.blueprint.name} is ready for WordPress launches.`); await refresh(true);
+    } catch (failure) { throw new Error(messageFrom(failure, 'The blueprint could not be saved.')); }
+    finally { setBusy(null); }
+  }
+
+  async function deleteBlueprint(blueprint: Blueprint) {
+    if (!window.confirm(`Remove ${blueprint.name}? Existing sites are protected and will prevent removal.`)) return;
+    setBusy(`blueprint:${blueprint.id}:delete`);
+    try {
+      const response = await fetch(`/api/blueprints/${encodeURIComponent(blueprint.id)}`, { method: 'DELETE' });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || 'The blueprint could not be removed.');
+      setToast(`${blueprint.name} was removed.`); await refresh(true);
+    } catch (failure) { setToast(messageFrom(failure, 'The blueprint could not be removed.')); }
     finally { setBusy(null); }
   }
 
@@ -223,25 +265,27 @@ export default function Home() {
     <aside className="sidebar">
       <button className="brand" onClick={() => navigate('Overview')}><span className="brand-mark">G</span><span>GeekHeros</span></button>
       <div className="workspace-switcher static-workspace"><span className="workspace-avatar">DK</span><span className="workspace-copy"><strong>Docker Desktop</strong><small>{system.connected ? 'Local node connected' : 'Agent offline'}</small></span><span className={`connection-light ${system.connected ? 'online' : ''}`} /></div>
-      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}</button>)}</nav>
+      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}</button>)}</nav>
       <div className="node-card"><div className="node-card-head"><span>Managed fleet</span><strong>{system.runningSites || 0}/{system.managedSites || 0}</strong></div><div className="capacity-track"><span style={{ width: `${system.managedSites ? Math.round(((system.runningSites || 0) / system.managedSites) * 100) : 0}%` }} /></div><small>{system.cpuCount || 0} CPU · {formatBytes(system.memoryBytes || 0)} memory</small></div>
       <div className="sidebar-user"><span className="user-avatar">GH</span><span className="workspace-copy"><strong>Local administrator</strong><small>Docker access enabled</small></span></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, clients and tags" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
+      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, clients and blueprints" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
       {error && <div className="connection-banner"><span><CircleAlert aria-hidden="true" /></span><div><strong>Docker control is unavailable</strong><p>{error}</p></div><button onClick={() => void refresh()}>Retry connection</button></div>}
       {selected ? <SiteWorkspace key={selected.id} site={selected} clients={clients} busy={busy} onBack={() => setSelectedId(null)} onOperate={operate} onSaveMetadata={saveMetadata} onLogin={oneClickLogin} /> : <div className="page-content">
-        {view === 'Overview' && <Overview sites={sites} clients={clients} system={system} activity={activity} onLaunch={() => setLaunchMode('choose')} onOpen={setSelectedId} />}
-        {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={() => setLaunchMode('choose')} onOpen={setSelectedId} />}
+        {view === 'Overview' && <Overview sites={sites} clients={clients} system={system} activity={activity} onLaunch={openLaunch} onOpen={setSelectedId} />}
+        {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
+        {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
         {view === 'Activity' && <ActivityView entries={activity} />}
         {view === 'Settings' && <SettingsView system={system} onToast={setToast} />}
       </div>}
     </section>
-    {launchMode === 'choose' && <LaunchChoiceModal onClose={() => setLaunchMode(null)} onChoose={setLaunchMode} />}
-    {launchMode === 'wordpress' && <WordPressLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onSubmit={createSite} />}
+    {launchMode === 'choose' && <LaunchChoiceModal onClose={() => setLaunchMode(null)} onChoose={(kind) => { setPreferredBlueprintId(null); setLaunchMode(kind); }} />}
+    {launchMode === 'wordpress' && <WordPressLaunchModal clients={clients} blueprints={blueprints} defaultBlueprintId={preferredBlueprintId || ''} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onSubmit={createSite} />}
     {launchMode === 'lovable' && <LovableLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onOpenSettings={() => { setLaunchMode(null); navigate('Settings'); }} onSubmit={createSite} />}
     {clientOpen && <ClientModal client={editingClient} busy={busy === 'client:save'} onClose={() => { setClientOpen(false); setEditingClient(null); }} onSubmit={createClient} />}
+    {blueprintOpen && <BlueprintModal busy={busy === 'blueprint:create'} onClose={() => setBlueprintOpen(false)} onSubmit={createBlueprint} />}
     {toast && <div className="toast" role="status"><span><Check aria-hidden="true" /></span>{toast}<button onClick={() => setToast(null)} aria-label="Dismiss notification"><X aria-hidden="true" /></button></div>}
   </main>;
 }
@@ -272,6 +316,15 @@ function ClientsView({ clients, sites, busy, onAdd, onEdit, onDelete, onOpenSite
     <section className="client-list-panel">{clients.map((client) => { const clientSites = sites.filter((site) => site.clientId === client.id); return <article className="client-record" key={client.id}><div className="client-record-head"><span className="client-avatar">{initials(client.name)}</span><div><h2>{client.name}</h2>{client.company && <p>{client.company}</p>}</div><div className="client-record-actions"><button onClick={() => onEdit(client)}>Edit</button><button className="quiet-danger" disabled={busy === `client:${client.id}:delete`} onClick={() => onDelete(client)}>Remove</button></div></div><div className="client-contact">{client.email && <a href={`mailto:${client.email}`}>{client.email}</a>}{client.phone && <span>{client.phone}</span>}{!client.email && !client.phone && <span>No contact details saved</span>}</div>{client.notes && <p className="client-notes">{client.notes}</p>}<div className="client-sites"><strong>{client.siteCount} site{client.siteCount === 1 ? '' : 's'}</strong>{clientSites.map((site) => <button key={site.id} onClick={() => onOpenSite(site.id)}><span>{site.name} · {site.kind === 'lovable' ? 'Lovable' : 'WordPress'}</span><Status site={site} /><em><ChevronRight aria-hidden="true" /></em></button>)}{!clientSites.length && <small>Assign a site from its Overview tab.</small>}</div></article>; })}{!clients.length && <Empty title="No clients yet" copy="Add a client, then assign existing WordPress or Lovable sites to it." />}</section></>;
 }
 
+function BlueprintsView({ blueprints, busy, onAdd, onDelete, onLaunch }: { blueprints: Blueprint[]; busy: string | null; onAdd: () => void; onDelete: (blueprint: Blueprint) => void; onLaunch: (blueprintId: string) => void }) {
+  const pluginCount = blueprints.reduce((sum, blueprint) => sum + blueprint.plugins.length + blueprint.files.filter((file) => file.kind === 'plugin' || file.kind === 'mu-plugin').length, 0);
+  const configurationCount = blueprints.reduce((sum, blueprint) => sum + blueprint.files.filter((file) => !['plugin', 'mu-plugin'].includes(file.kind)).length, 0);
+  const usageCount = blueprints.reduce((sum, blueprint) => sum + blueprint.usageCount, 0);
+  return <><PageHeading eyebrow="WORDPRESS STARTERS" title="Blueprints" description="Reusable plugin, theme, content and configuration packages for nearly finished WordPress launches." actions={<button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add blueprint</button>} />
+    <div className="metric-grid compact-metrics"><MetricCard icon={Boxes} tone="green" label="Blueprints" value={String(blueprints.length)} detail="Stored only on this local control plane" /><MetricCard icon={Package} tone="violet" label="Plugin packages" value={String(pluginCount)} detail="WordPress.org, ZIP and must-use plugins" /><MetricCard icon={Database} tone="blue" label="Setup files" value={String(configurationCount)} detail="Settings, content, themes and wp-content files" /><MetricCard icon={CirclePlay} tone="amber" label="Sites launched" value={String(usageCount)} detail="Managed sites tied to a blueprint" /></div>
+    <section className="blueprint-grid">{blueprints.map((blueprint, index) => <article className="blueprint-card" key={blueprint.id}><div className={`blueprint-cover ${index % 3 === 1 ? 'violet' : index % 3 === 2 ? 'blue' : ''}`}><span><Boxes aria-hidden="true" /></span><small>WORDPRESS BLUEPRINT</small></div><div className="blueprint-body"><div className="blueprint-title"><h2>{blueprint.name}</h2><button className="blueprint-remove" disabled={busy === `blueprint:${blueprint.id}:delete` || blueprint.usageCount > 0} onClick={() => onDelete(blueprint)}>{blueprint.usageCount > 0 ? 'In use' : 'Remove'}</button></div><p>{blueprint.description || 'Reusable WordPress setup package.'}</p><div className="blueprint-meta"><span>{blueprint.plugins.length} plugin slug{blueprint.plugins.length === 1 ? '' : 's'}</span><span>{blueprint.themes.length} theme{blueprint.themes.length === 1 ? '' : 's'}</span><span>{blueprint.fileCount} file{blueprint.fileCount === 1 ? '' : 's'}</span><span>{formatBytes(blueprint.totalBytes)}</span></div><div className="blueprint-files">{blueprint.plugins.slice(0, 2).map((plugin) => <span key={`plugin:${plugin.slug}`}><Package aria-hidden="true" /><strong>{plugin.slug}</strong><small>WordPress.org plugin</small></span>)}{blueprint.themes.slice(0, 1).map((theme) => <span key={`theme:${theme.slug}`}><Boxes aria-hidden="true" /><strong>{theme.slug}</strong><small>WordPress.org theme</small></span>)}{blueprint.files.slice(0, Math.max(0, 4 - Math.min(3, blueprint.plugins.length + blueprint.themes.length))).map((file) => <span key={file.id}><ArchiveRestore aria-hidden="true" /><strong>{file.name}</strong><small>{blueprintFileKindLabel(file.kind)}</small></span>)}{blueprintItemCount(blueprint) > 4 && <em>+{blueprintItemCount(blueprint) - 4} more item{blueprintItemCount(blueprint) - 4 === 1 ? '' : 's'}</em>}</div><button className="secondary-button full-button" onClick={() => onLaunch(blueprint.id)}><CirclePlay aria-hidden="true" />Launch with blueprint</button></div></article>)}{!blueprints.length && <div className="blueprint-empty"><Empty title="No WordPress blueprints yet" copy="Add plugins, themes, settings JSON, content exports, must-use plugins or any file destined for wp-content." /><button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add your first blueprint</button></div>}</section></>;
+}
+
 function SiteWorkspace({ site, clients, busy, onBack, onOperate, onSaveMetadata, onLogin }: { site: Site; clients: Client[]; busy: string | null; onBack: () => void; onOperate: (site: Site, type: string, options?: Record<string, unknown>) => Promise<boolean>; onSaveMetadata: (site: Site, clientId: string | null, tags: string[]) => Promise<boolean>; onLogin: (site: Site) => Promise<void> }) {
   const [tab, setTab] = useState<SiteTab>('Overview');
   const [inventory, setInventory] = useState<Inventory | null>(null);
@@ -298,7 +351,7 @@ function SiteWorkspace({ site, clients, busy, onBack, onOperate, onSaveMetadata,
   async function run(type: string, options: Record<string, unknown> = {}) { if (await onOperate(site, type, options)) await loadInventory(); }
   async function saveAssignment(event: FormEvent<HTMLFormElement>) { event.preventDefault(); await onSaveMetadata(site, clientId || null, tags.split(',').map((tag) => tag.trim()).filter(Boolean)); }
 
-  return <div className="site-workspace"><div className="site-hero"><button className="back-button" onClick={onBack}><ArrowLeft aria-hidden="true" />All sites</button><div className="site-hero-row"><div className="site-identity"><span className="large-site-avatar">{initials(site.name)}</span><div><div className="identity-title"><h1>{site.name}</h1><Status site={site} /></div><a href={site.siteUrl} target="_blank" rel="noreferrer">{site.domain}<ExternalLink aria-hidden="true" /></a><div className="hero-tags"><span>{site.kind === 'lovable' ? 'Lovable' : 'WordPress'}</span>{site.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></div></div><div className="site-actions">{site.status === 'Stopped' ? <button className="secondary-button" disabled={!canOperate} onClick={() => void run('start')}><Play aria-hidden="true" />Start</button> : <button className="secondary-button" disabled={!canOperate} onClick={() => void run('stop')}><Square aria-hidden="true" />Stop</button>}<button className="secondary-button" disabled={!canOperate} onClick={() => void run('restart')}><RotateCw aria-hidden="true" />Restart</button>{site.kind === 'wordpress' ? <button className="primary-button" disabled={!canOperate || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />One-click WP Admin</button> : site.lovableBuildUrl && <a className="primary-button link-button" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open in Lovable</a>}</div></div><div className="site-quick-meta"><span><small>{site.kind === 'lovable' ? 'Source' : 'WordPress'}</small><strong>{site.kind === 'lovable' ? 'Lovable / Git' : site.wp}</strong></span><span><small>{site.kind === 'lovable' ? 'Branch' : 'PHP'}</small><strong>{site.kind === 'lovable' ? site.repositoryBranch || 'main' : site.php}</strong></span><span><small>Profile</small><strong>{site.pod}</strong></span><span><small>Container</small><strong>{site.containerId || 'Preparing'}</strong></span><span><small>Uptime</small><strong>{site.uptime}</strong></span></div><nav className="site-tabs">{(['Overview', 'Updates', 'Backups', 'Tools'] as SiteTab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{site.kind === 'lovable' && item === 'Updates' ? 'Deployments' : item}{item === 'Updates' && site.updates > 0 && <em>{site.updates}</em>}</button>)}</nav></div>
+  return <div className="site-workspace"><div className="site-hero"><button className="back-button" onClick={onBack}><ArrowLeft aria-hidden="true" />All sites</button><div className="site-hero-row"><div className="site-identity"><span className="large-site-avatar">{initials(site.name)}</span><div><div className="identity-title"><h1>{site.name}</h1><Status site={site} /></div><a href={site.siteUrl} target="_blank" rel="noreferrer">{site.domain}<ExternalLink aria-hidden="true" /></a><div className="hero-tags"><span>{site.kind === 'lovable' ? 'Lovable' : 'WordPress'}</span>{site.blueprintName && <span>{site.blueprintName} blueprint</span>}{site.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></div></div><div className="site-actions">{site.status === 'Stopped' ? <button className="secondary-button" disabled={!canOperate} onClick={() => void run('start')}><Play aria-hidden="true" />Start</button> : <button className="secondary-button" disabled={!canOperate} onClick={() => void run('stop')}><Square aria-hidden="true" />Stop</button>}<button className="secondary-button" disabled={!canOperate} onClick={() => void run('restart')}><RotateCw aria-hidden="true" />Restart</button>{site.kind === 'wordpress' ? <button className="primary-button" disabled={!canOperate || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />One-click WP Admin</button> : site.lovableBuildUrl && <a className="primary-button link-button" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open in Lovable</a>}</div></div><div className="site-quick-meta"><span><small>{site.kind === 'lovable' ? 'Source' : 'WordPress'}</small><strong>{site.kind === 'lovable' ? 'Lovable / Git' : site.wp}</strong></span><span><small>{site.kind === 'lovable' ? 'Branch' : 'PHP'}</small><strong>{site.kind === 'lovable' ? site.repositoryBranch || 'main' : site.php}</strong></span><span><small>Profile</small><strong>{site.pod}</strong></span><span><small>Container</small><strong>{site.containerId || 'Preparing'}</strong></span><span><small>Uptime</small><strong>{site.uptime}</strong></span></div><nav className="site-tabs">{(['Overview', 'Updates', 'Backups', 'Tools'] as SiteTab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{site.kind === 'lovable' && item === 'Updates' ? 'Deployments' : item}{item === 'Updates' && site.updates > 0 && <em>{site.updates}</em>}</button>)}</nav></div>
     <div className="site-tab-content">{site.error && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Last operation failed</strong><p>{site.error}</p></div></div>}{site.phase && <div className="provisioning-banner"><span className="spinner" /><div><strong>{site.phase}</strong><p>GeekHeros is applying the requested Docker state. This page refreshes automatically.</p></div></div>}{site.kind === 'wordpress' && inventoryError && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Live WordPress inventory unavailable</strong><p>{inventoryError}</p></div></div>}
       {tab === 'Overview' && <SiteOverview site={site} clients={clients} clientId={clientId} tags={tags} busy={isBusy} onClientId={setClientId} onTags={setTags} onSave={saveAssignment} />}
       {tab === 'Updates' && (site.kind === 'lovable' ? <LovableDeploymentsPanel site={site} disabled={!canOperate} onRun={run} /> : <UpdatesPanel site={site} inventory={inventory} loading={inventoryLoading} disabled={!canOperate} onRun={run} onRefresh={loadInventory} />)}
@@ -468,7 +521,7 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
 
 function LaunchChoiceModal({ onClose, onChoose }: { onClose: () => void; onChoose: (kind: SiteKind) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section className="modal launch-choice-modal" role="dialog" aria-modal="true" aria-labelledby="launch-choice-title"><div className="modal-head"><div><p className="eyebrow">NEW DOCKER SITE</p><h2 id="launch-choice-title">Choose a site source</h2><p>Both options use the same GeekHeros clients, tags, container profiles, routing and lifecycle controls.</p></div><button onClick={onClose} aria-label="Close"><X aria-hidden="true" /></button></div><div className="launch-choice-grid"><button onClick={() => onChoose('wordpress')}><span className="launch-choice-icon wordpress-choice"><Container aria-hidden="true" /></span><strong>WordPress</strong><p>Install WordPress and MariaDB with persistent volumes and one-click WP Admin.</p><em>Launch WordPress<ArrowRight aria-hidden="true" /></em></button><button onClick={() => onChoose('lovable')}><span className="launch-choice-icon lovable-choice"><Sparkles aria-hidden="true" /></span><strong>Lovable build</strong><p>Generate in Lovable, sync to Git, then build and host the Vite application here.</p><em>Launch Lovable<ArrowRight aria-hidden="true" /></em></button></div></section></div>; }
 
-function WordPressLaunchModal({ clients, busy, onBack, onClose, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="launch-title"><div className="modal-head"><div><p className="eyebrow">WORDPRESS WORKLOAD</p><h2 id="launch-title">Launch WordPress</h2><p>Creates isolated WordPress and MariaDB containers, persistent volumes, networking and edge routing.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><input type="hidden" name="kind" value="wordpress" /><div className="form-grid"><label>Site name<input name="name" required maxLength={80} placeholder="Client marketing site" autoFocus /></label><label>Domain<input name="domain" required placeholder="client.localhost" /></label><label>Client<select name="clientId" defaultValue=""><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select></label><label>Container profile<select name="pod" defaultValue="Standard"><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select></label><label className="full-field">Tags<input name="tags" placeholder="production, managed, ecommerce" /></label><label>Administrator username<input name="adminUser" required defaultValue="admin" autoComplete="username" /></label><label>Administrator email<input name="adminEmail" type="email" required placeholder="admin@example.com" autoComplete="email" /></label><label className="full-field">Administrator password<input name="adminPassword" type="password" required minLength={12} placeholder="At least 12 characters" autoComplete="new-password" /></label></div><div className="launch-footnote"><span><Info aria-hidden="true" /></span><p>The password is used during installation and is not exposed in Docker labels or activity logs.</p></div><div className="modal-actions"><button type="button" className="secondary-button back-choice" onClick={onBack} disabled={busy}><ArrowLeft aria-hidden="true" />Change source</button><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Starting containers…' : 'Launch WordPress'}</button></div></form></section></div>; }
+function WordPressLaunchModal({ clients, blueprints, defaultBlueprintId, busy, onBack, onClose, onSubmit }: { clients: Client[]; blueprints: Blueprint[]; defaultBlueprintId: string; busy: boolean; onBack: () => void; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="launch-title"><div className="modal-head"><div><p className="eyebrow">WORDPRESS WORKLOAD</p><h2 id="launch-title">Launch WordPress</h2><p>Creates isolated WordPress and MariaDB containers, persistent volumes, networking and edge routing.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><input type="hidden" name="kind" value="wordpress" /><div className="form-grid"><label>Site name<input name="name" required maxLength={80} placeholder="Client marketing site" autoFocus /></label><label>Domain<input name="domain" required placeholder="client.localhost" /></label><label>Client<select name="clientId" defaultValue=""><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select></label><label>Container profile<select name="pod" defaultValue="Standard"><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select></label><label className="full-field">Tags<input name="tags" placeholder="production, managed, ecommerce" /></label><label className="full-field">WordPress blueprint<select name="blueprintId" defaultValue={defaultBlueprintId}><option value="">Default — Clean WordPress install</option>{blueprints.map((blueprint) => <option value={blueprint.id} key={blueprint.id}>{blueprint.name} — {blueprintItemCount(blueprint)} setup item{blueprintItemCount(blueprint) === 1 ? '' : 's'}</option>)}</select><small>Choose Default for a clean installation, or apply a saved package before the site becomes available.</small></label><label>Administrator username<input name="adminUser" required defaultValue="admin" autoComplete="username" /></label><label>Administrator email<input name="adminEmail" type="email" required placeholder="admin@example.com" autoComplete="email" /></label><label className="full-field">Administrator password<input name="adminPassword" type="password" required minLength={12} placeholder="At least 12 characters" autoComplete="new-password" /></label></div><div className="launch-footnote"><span><Info aria-hidden="true" /></span><p>The password is used during installation and is not exposed in Docker labels or activity logs. Blueprint files stay on this machine and are copied into the new WordPress volume during setup.</p></div><div className="modal-actions"><button type="button" className="secondary-button back-choice" onClick={onBack} disabled={busy}><ArrowLeft aria-hidden="true" />Change source</button><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Starting containers…' : 'Launch WordPress'}</button></div></form></section></div>; }
 
 function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, onSubmit }: { clients: Client[]; busy: boolean; onBack: () => void; onClose: () => void; onOpenSettings: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   const [connection, setConnection] = useState<LovableConnection>({ connected: false, account: null, workspaces: [], connectedAt: null });
@@ -515,12 +568,63 @@ function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, on
   </div>;
 }
 
+function BlueprintModal({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (input: BlueprintInput) => Promise<void> }) {
+  const [uploads, setUploads] = useState<BlueprintUpload[]>([]);
+  const [preparing, setPreparing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const locked = busy || preparing;
+
+  function addFiles(files: FileList | null) {
+    if (!files?.length) return;
+    setError(null);
+    const next = [...uploads];
+    for (const file of Array.from(files)) {
+      if (next.length >= 25) { setError('A blueprint may contain up to 25 uploaded files.'); break; }
+      if (file.size > 25 * 1024 * 1024) { setError(`${file.name} is larger than the 25 MB per-file limit.`); continue; }
+      const kind = inferBlueprintFileKind(file.name);
+      next.push({ id: window.crypto.randomUUID(), file, kind, destination: `wp-content/blueprint-files/${file.name}` });
+    }
+    if (next.reduce((sum, upload) => sum + upload.file.size, 0) > 75 * 1024 * 1024) { setError('Blueprint uploads may total up to 75 MB.'); return; }
+    setUploads(next);
+  }
+
+  function updateUpload(id: string, patch: Partial<Pick<BlueprintUpload, 'kind' | 'destination'>>) {
+    setUploads((current) => current.map((upload) => upload.id === id ? { ...upload, ...patch } : upload));
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setPreparing(true); setError(null);
+    try {
+      const form = new FormData(event.currentTarget);
+      const files: BlueprintInput['files'] = [];
+      for (const upload of uploads) files.push({ name: upload.file.name, kind: upload.kind, destination: upload.kind === 'wp-content' ? upload.destination : '', content: await fileToBase64(upload.file) });
+      await onSubmit({
+        name: String(form.get('name') || ''),
+        description: String(form.get('description') || ''),
+        plugins: splitBlueprintSlugs(String(form.get('plugins') || '')),
+        themes: splitBlueprintSlugs(String(form.get('themes') || '')),
+        files,
+      });
+    } catch (failure) { setError(messageFrom(failure, 'The blueprint could not be saved.')); }
+    finally { setPreparing(false); }
+  }
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !locked) onClose(); }}><section className="modal blueprint-modal" role="dialog" aria-modal="true" aria-labelledby="blueprint-modal-title"><div className="modal-head"><div><p className="eyebrow">WORDPRESS STARTER</p><h2 id="blueprint-modal-title">Add blueprint</h2><p>Bundle the packages and configuration that turn a clean WordPress install into your standard starting point.</p></div><button onClick={onClose} disabled={locked} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={submit}><div className="form-grid"><label>Blueprint name<input name="name" required maxLength={100} placeholder="Agency marketing starter" autoFocus /></label><label>Description<input name="description" maxLength={500} placeholder="SEO, forms, security and base pages" /></label><label>WordPress.org plugin slugs<textarea name="plugins" rows={4} placeholder={'wordpress-seo\nwordfence\nwpforms-lite'} /><small>One slug per line or separated by commas. Plugins install and activate automatically.</small></label><label>WordPress.org theme slugs<textarea name="themes" rows={4} placeholder="astra" /><small>Themes install automatically; the last listed theme becomes active.</small></label><label className="full-field blueprint-upload"><span>Blueprint files</span><input type="file" multiple onChange={(event) => { addFiles(event.target.files); event.target.value = ''; }} /><small>Add plugin or theme ZIPs, settings JSON, WordPress export XML, must-use plugin PHP, or any file that belongs under wp-content.</small></label><div className="full-field blueprint-upload-list">{uploads.map((upload) => <div className="blueprint-upload-row" key={upload.id}><span><strong>{upload.file.name}</strong><small>{formatBytes(upload.file.size)}</small></span><select aria-label={`Purpose for ${upload.file.name}`} value={upload.kind} onChange={(event) => updateUpload(upload.id, { kind: event.target.value as BlueprintFileKind })}>{blueprintKindsForFile(upload.file.name).map((kind) => <option key={kind} value={kind}>{blueprintFileKindLabel(kind)}</option>)}</select>{upload.kind === 'wp-content' && <input aria-label={`Destination for ${upload.file.name}`} value={upload.destination} onChange={(event) => updateUpload(upload.id, { destination: event.target.value })} placeholder={`wp-content/blueprint-files/${upload.file.name}`} />}<button type="button" onClick={() => setUploads((current) => current.filter((item) => item.id !== upload.id))} aria-label={`Remove ${upload.file.name}`}><X aria-hidden="true" /></button></div>)}{!uploads.length && <p>No files selected. You can still create a blueprint from WordPress.org plugin or theme slugs.</p>}</div></div><div className="blueprint-json-note"><Info aria-hidden="true" /><p><strong>Settings JSON format</strong>Use the top-level fields <code>options</code>, <code>plugins</code>, <code>themes</code> and <code>pages</code>. Unknown fields are rejected so a bad export cannot silently misconfigure a launch.</p><button type="button" onClick={downloadBlueprintSettingsExample}>Download example JSON</button></div>{error && <p className="blueprint-form-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={locked}>Cancel</button><button className="primary-button" disabled={locked}>{locked ? 'Saving blueprint…' : 'Add blueprint'}</button></div></form></section></div>;
+}
+
 function ClientModal({ client, busy, onClose, onSubmit }: { client: Client | null; busy: boolean; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal small-modal" role="dialog" aria-modal="true" aria-labelledby="client-title"><div className="modal-head"><div><p className="eyebrow">CLIENT RECORD</p><h2 id="client-title">{client ? 'Edit client' : 'Add client'}</h2><p>{client ? 'Update the client record without changing its assigned sites.' : 'Create an empty client record, then assign real sites to it.'}</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><div className="form-grid"><label>Client name<input name="name" required maxLength={100} defaultValue={client?.name || ''} autoFocus /></label><label>Company<input name="company" maxLength={120} defaultValue={client?.company || ''} /></label><label>Email<input name="email" type="email" maxLength={160} defaultValue={client?.email || ''} /></label><label>Phone<input name="phone" maxLength={60} defaultValue={client?.phone || ''} /></label><label className="full-field">Notes<textarea name="notes" maxLength={1000} rows={4} defaultValue={client?.notes || ''} /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Saving…' : 'Save client'}</button></div></form></section></div>; }
 
 function Status({ site }: { site: Site }) { const tone = site.status.toLowerCase().replace(/[^a-z]+/g, '-'); return <span className={`status-pill ${tone}`}><i />{site.phase || site.status}</span>; }
 function Empty({ title, copy }: { title: string; copy: string }) { return <div className="empty-state"><strong>{title}</strong><span>{copy}</span></div>; }
 function initials(value: string) { return value.split(/\s+/).filter(Boolean).map((word) => word[0]).join('').slice(0, 2).toUpperCase(); }
 function humanizeSlug(value: string) { return value.split(/[-_]/).filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join(' '); }
+function splitBlueprintSlugs(value: string) { return [...new Set(value.split(/[\s,]+/).map((item) => item.trim().toLowerCase()).filter(Boolean))]; }
+function inferBlueprintFileKind(name: string): BlueprintFileKind { const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0]; return extension === '.zip' ? 'plugin' : extension === '.json' ? 'settings' : extension === '.xml' ? 'content' : extension === '.php' ? 'mu-plugin' : 'wp-content'; }
+function blueprintKindsForFile(name: string): BlueprintFileKind[] { const inferred = inferBlueprintFileKind(name); return inferred === 'plugin' ? ['plugin', 'theme', 'wp-content'] : inferred === 'settings' ? ['settings', 'wp-content'] : inferred === 'content' ? ['content', 'wp-content'] : inferred === 'mu-plugin' ? ['mu-plugin', 'wp-content'] : ['wp-content']; }
+function blueprintFileKindLabel(kind: BlueprintFileKind) { return ({ plugin: 'Plugin ZIP', theme: 'Theme ZIP', settings: 'Settings JSON', content: 'WordPress export XML', 'mu-plugin': 'Must-use plugin', 'wp-content': 'wp-content file' } as const)[kind]; }
+function blueprintItemCount(blueprint: Blueprint) { return blueprint.plugins.length + blueprint.themes.length + blueprint.fileCount; }
+function fileToBase64(file: File) { return new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onerror = () => reject(new Error(`${file.name} could not be read.`)); reader.onload = () => { const result = String(reader.result || ''); const separator = result.indexOf(','); if (separator < 0) reject(new Error(`${file.name} could not be encoded.`)); else resolve(result.slice(separator + 1)); }; reader.readAsDataURL(file); }); }
+function downloadBlueprintSettingsExample() { const example = { options: { blogdescription: 'A concise site tagline', timezone_string: 'America/Los_Angeles', default_comment_status: 'closed' }, plugins: [{ slug: 'wordpress-seo', activate: true }], themes: [{ slug: 'astra', activate: true }], pages: [{ title: 'Home', slug: 'home', status: 'publish', content: '<h1>Welcome</h1>' }] }; const url = URL.createObjectURL(new Blob([`${JSON.stringify(example, null, 2)}\n`], { type: 'application/json' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'geekheros-blueprint-settings.json'; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 0); }
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000)); if (seconds < 60) return 'just now'; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`; return `${Math.floor(seconds / 86400)}d ago`; }
