@@ -11,7 +11,7 @@ const env = {
   GEEKHEROS_AGENT_TOKEN: token,
 };
 const children = [
-  spawn(process.execPath, ['agent/server.mjs'], { cwd: projectRoot, env, stdio: 'inherit', windowsHide: true }),
+  spawn(process.execPath, ['--watch', '--watch-preserve-output', 'agent/server.mjs'], { cwd: projectRoot, env, stdio: 'inherit', windowsHide: true }),
   spawn(process.execPath, ['node_modules/vinext/dist/cli.js', 'dev'], { cwd: projectRoot, env, stdio: 'inherit', windowsHide: true }),
 ];
 

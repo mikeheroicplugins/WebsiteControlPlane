@@ -29,12 +29,19 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 ## Working operations
 
 - Launch, start, stop, restart and permanently delete sites.
-- Read live Docker, WordPress and PHP versions.
+- Create client records, assign sites to clients and organize sites with persistent tags.
+- Read live Docker, WordPress, PHP, plugin and theme versions.
 - Back up the MariaDB database and WordPress volume.
-- Update WordPress core, plugins and themes after creating a backup.
+- Update WordPress core, individual or all plugins, and individual or all themes after creating a backup.
+- Activate and deactivate plugins and switch installed themes through WP-CLI.
 - Verify WordPress core and plugin checksums.
+- Open WP Admin using a 60-second, single-use login capability without exposing the administrator password.
 - Route domains to the correct container through Traefik.
 - Record completed and failed operations in the local activity log.
+
+## One-click WP Admin
+
+Every managed site receives `wp-content/mu-plugins/geekheros-control-plane.php`. The control plane stores only a hash-backed, expiring WordPress transient, then posts the one-time capability to WordPress. The MU-plugin consumes the capability before setting a browser-session authentication cookie, so the same capability cannot be replayed. It cannot be deactivated from WordPress, and its must-use plugin table is hidden from client administrators.
 
 Local state and backups live under `.geekheros/` and are excluded from source control. Deleting a site from the UI with data removal enabled deletes its containers, named volumes and backup directory.
 

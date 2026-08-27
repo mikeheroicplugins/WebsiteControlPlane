@@ -28,6 +28,53 @@ if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::
   define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
   define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
 }`;
+const controlPlaneMuPlugin = String.raw`<?php
+/**
+ * Plugin Name: GeekHeros Control Plane
+ * Description: Secure, one-time control-plane access for managed WordPress sites.
+ * Version: 1.0.0
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+function geekheros_control_plane_login() {
+    if ( 'POST' !== strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? $_SERVER['REQUEST_METHOD'] : '' ) ) {
+        status_header( 405 );
+        exit;
+    }
+
+    $token = isset( $_POST['geekheros_token'] ) ? sanitize_text_field( wp_unslash( $_POST['geekheros_token'] ) ) : '';
+    if ( ! preg_match( '/^[A-Za-z0-9_-]{43}$/D', $token ) ) {
+        wp_die( esc_html__( 'This login link is invalid.', 'geekheros' ), '', array( 'response' => 403 ) );
+    }
+
+    $transient = 'geekheros_login_' . hash( 'sha256', $token );
+    $payload   = get_transient( $transient );
+    delete_transient( $transient );
+    $data = is_string( $payload ) ? json_decode( $payload, true ) : null;
+    $user = is_array( $data ) && ! empty( $data['user_id'] ) ? get_user_by( 'id', (int) $data['user_id'] ) : false;
+
+    if ( ! $user || ! user_can( $user, 'manage_options' ) ) {
+        wp_die( esc_html__( 'This login link has expired or was already used.', 'geekheros' ), '', array( 'response' => 403 ) );
+    }
+
+    nocache_headers();
+    header( 'Referrer-Policy: no-referrer' );
+    wp_clear_auth_cookie();
+    wp_set_current_user( $user->ID, $user->user_login );
+    wp_set_auth_cookie( $user->ID, false, is_ssl() );
+    do_action( 'wp_login', $user->user_login, $user );
+    wp_safe_redirect( admin_url() );
+    exit;
+}
+
+add_action( 'admin_post_nopriv_geekheros_login', 'geekheros_control_plane_login' );
+add_action( 'admin_post_geekheros_login', 'geekheros_control_plane_login' );
+
+add_filter( 'show_advanced_plugins', function ( $show, $type ) {
+    return 'mustuse' === $type ? false : $show;
+}, 10, 2 );
+`;
 
 if (!authToken || authToken.length < 24) {
   console.error('GEEKHEROS_AGENT_TOKEN must be set to a random value of at least 24 characters.');
@@ -37,14 +84,19 @@ if (!authToken || authToken.length < 24) {
 let stateQueue = Promise.resolve();
 
 function emptyState() {
-  return { version: 1, sites: {}, activity: [] };
+  return { version: 2, sites: {}, clients: {}, activity: [] };
 }
 
 async function readState() {
   await mkdir(stateDir, { recursive: true });
   try {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8'));
-    return { ...emptyState(), ...parsed, sites: parsed.sites || {}, activity: parsed.activity || [] };
+    const sites = Object.fromEntries(Object.entries(parsed.sites || {}).map(([id, site]) => [id, {
+      ...site,
+      clientId: site.clientId || null,
+      tags: Array.isArray(site.tags) ? site.tags : [],
+    }]));
+    return { ...emptyState(), ...parsed, version: 2, sites, clients: parsed.clients || {}, activity: parsed.activity || [] };
   } catch (error) {
     if (error?.code === 'ENOENT') return emptyState();
     throw error;
@@ -194,6 +246,47 @@ function validateSiteInput(input) {
   return { name, domain, adminUser, adminEmail, adminPassword, pod, region: 'Local Docker' };
 }
 
+function validateTags(value) {
+  const source = Array.isArray(value) ? value : String(value || '').split(',');
+  const tags = [];
+  for (const item of source) {
+    const tag = String(item || '').trim().replace(/\s+/g, ' ');
+    if (!tag) continue;
+    if (tag.length > 32) throw new Error('Tags may be up to 32 characters each.');
+    if (!/^[\p{L}\p{N}][\p{L}\p{N} ._/-]*$/u.test(tag)) throw new Error(`Tag "${tag}" contains unsupported characters.`);
+    if (!tags.some((existing) => existing.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+  }
+  if (tags.length > 20) throw new Error('A site may have up to 20 tags.');
+  return tags;
+}
+
+function validateClientInput(input, partial = false) {
+  const values = {};
+  if (!partial || Object.hasOwn(input, 'name')) {
+    const name = String(input.name || '').trim();
+    if (!name || name.length > 100) throw new Error('Enter a client name up to 100 characters.');
+    values.name = name;
+  }
+  for (const [field, max] of [['company', 120], ['email', 160], ['phone', 60], ['notes', 1000]]) {
+    if (!partial || Object.hasOwn(input, field)) {
+      const value = String(input[field] || '').trim();
+      if (value.length > max) throw new Error(`${field[0].toUpperCase()}${field.slice(1)} is too long.`);
+      values[field] = value;
+    }
+  }
+  if (values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) throw new Error('Enter a valid client email address.');
+  return values;
+}
+
+function validatePackageNames(value) {
+  const names = Array.isArray(value) ? value.map(String) : [];
+  if (!names.length) return [];
+  if (names.length > 100 || names.some((name) => !/^[a-z0-9][a-z0-9._-]{0,190}$/i.test(name))) {
+    throw new Error('One or more package names are invalid.');
+  }
+  return [...new Set(names)];
+}
+
 function limitsForPod(pod) {
   return {
     Micro: ['--cpus', '0.5', '--memory', '512m'],
@@ -316,6 +409,20 @@ async function ensureLocalPreviewConfig(site) {
   await docker(['exec', site.wpContainer, 'php', '-r', php], { timeout: 30_000 });
 }
 
+async function ensureControlPlaneMuPlugin(site) {
+  const encodedPlugin = Buffer.from(controlPlaneMuPlugin, 'utf8').toString('base64');
+  const php = [
+    '$directory="/var/www/html/wp-content/mu-plugins";',
+    '$path=$directory."/geekheros-control-plane.php";',
+    `$contents=base64_decode("${encodedPlugin}");`,
+    'if (!is_dir($directory) && !mkdir($directory, 0755, true)) { fwrite(STDERR, "Unable to create the MU-plugin directory.\\n"); exit(1); }',
+    '$current=is_file($path) ? file_get_contents($path) : false;',
+    'if ($current !== $contents && file_put_contents($path, $contents, LOCK_EX) === false) { fwrite(STDERR, "Unable to install the GeekHeros MU-plugin.\\n"); exit(1); }',
+    'chmod($path, 0644);',
+  ].join('');
+  await docker(['exec', site.wpContainer, 'php', '-r', php], { timeout: 30_000 });
+}
+
 async function getDirectPort(container) {
   try {
     const { stdout } = await docker(['port', container, '80/tcp'], { timeout: 20_000 });
@@ -326,15 +433,62 @@ async function getDirectPort(container) {
   }
 }
 
+function parseJsonOutput(stdout, fallback = []) {
+  if (!stdout) return fallback;
+  try { return JSON.parse(stdout); } catch { return fallback; }
+}
+
+async function readInventory(site) {
+  const inspect = await inspectContainer(site.wpContainer);
+  if (!inspect?.State?.Running) throw Object.assign(new Error('Start the WordPress container before reading its inventory.'), { status: 409 });
+
+  const [coreVersion, pluginsResult, themesResult] = await Promise.all([
+    runWp(site, ['core', 'version'], { timeout: 60_000 }),
+    runWp(site, ['plugin', 'list', '--format=json'], { timeout: 120_000 }),
+    runWp(site, ['theme', 'list', '--format=json'], { timeout: 120_000 }),
+  ]);
+  let coreUpdates = [];
+  try { coreUpdates = parseJsonOutput((await runWp(site, ['core', 'check-update', '--format=json'], { timeout: 120_000 })).stdout, []); } catch {}
+
+  const normalizePackage = (item) => ({
+    name: String(item.name || ''),
+    status: String(item.status || 'inactive'),
+    version: String(item.version || '—'),
+    update: String(item.update || 'none'),
+    updateVersion: item.update_version ? String(item.update_version) : null,
+    autoUpdate: String(item.auto_update || 'off'),
+  });
+  const plugins = parseJsonOutput(pluginsResult.stdout, []).map(normalizePackage);
+  const themes = parseJsonOutput(themesResult.stdout, []).map(normalizePackage);
+  const coreUpdate = Array.isArray(coreUpdates) && coreUpdates.length ? {
+    version: String(coreUpdates[0].version || ''),
+    updateType: String(coreUpdates[0].update_type || ''),
+    packageUrl: coreUpdates[0].package_url ? String(coreUpdates[0].package_url) : null,
+  } : null;
+  return {
+    readAt: new Date().toISOString(),
+    core: { version: coreVersion.stdout || site.wpVersion || '—', update: coreUpdate },
+    plugins,
+    themes,
+    updates: {
+      core: coreUpdate ? 1 : 0,
+      plugins: plugins.filter((item) => item.update === 'available').length,
+      themes: themes.filter((item) => item.update === 'available').length,
+    },
+    backups: Array.isArray(site.backups) ? site.backups : [],
+  };
+}
+
 async function refreshVersions(site) {
   let wpVersion = site.wpVersion || '—';
   let phpVersion = site.phpVersion || '—';
   let updates = Number(site.updates || 0);
-  try { wpVersion = (await runWp(site, ['core', 'version'], { timeout: 60_000 })).stdout || wpVersion; } catch {}
   try { phpVersion = (await docker(['exec', site.wpContainer, 'php', '-r', 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;'], { timeout: 30_000 })).stdout || phpVersion; } catch {}
   try {
-    const result = await runWp(site, ['eval', '$u=get_core_updates(); $p=get_plugin_updates(); $t=get_theme_updates(); echo count($u)+count($p)+count($t);'], { timeout: 120_000 });
-    updates = Number(result.stdout) || 0;
+    const inventory = await readInventory(site);
+    wpVersion = inventory.core.version || wpVersion;
+    updates = inventory.updates.core + inventory.updates.plugins + inventory.updates.themes;
+    await setSiteState(site.id, { updateCounts: inventory.updates });
   } catch {}
   await setSiteState(site.id, { wpVersion, phpVersion, updates, lastScannedAt: new Date().toISOString() });
 }
@@ -357,6 +511,7 @@ async function provisionSite(siteId) {
     await setSiteState(siteId, { phase: 'Installing WordPress', directPort });
     await waitForWordPressFiles(site);
     await ensureLocalPreviewConfig(site);
+    await ensureControlPlaneMuPlugin(site);
 
     let installed = false;
     try { await runWp(site, ['core', 'is-installed'], { timeout: 60_000 }); installed = true; } catch {}
@@ -382,10 +537,12 @@ async function createSite(input) {
   const values = validateSiteInput(input);
   const state = await readState();
   if (Object.values(state.sites).some((site) => site.domain === values.domain)) throw new Error('That domain is already managed by GeekHeros.');
+  const clientId = input.clientId ? String(input.clientId) : null;
+  if (clientId && !state.clients[clientId]) throw new Error('The selected client no longer exists.');
   const id = `site_${randomBytes(6).toString('hex')}`;
   const namespace = `gh-${slugify(values.domain)}-${id.slice(-4)}`;
   const site = {
-    id, ...values, namespace,
+    id, ...values, namespace, clientId, tags: validateTags(input.tags),
     network: `${namespace}-net`, dbContainer: `${namespace}-db`, wpContainer: `${namespace}-wp`,
     dbVolume: `${namespace}-db`, wpVolume: `${namespace}-wp`,
     image: wordpressImage, status: 'Provisioning', phase: 'Queued', error: null,
@@ -413,6 +570,7 @@ function publicSite(site, inspect) {
   const status = site.phase ? 'Provisioning' : site.status === 'Error' ? 'Error' : dockerStatus === 'running' ? 'Running' : dockerStatus === 'exited' || dockerStatus === 'created' ? 'Stopped' : dockerStatus ? 'Attention' : site.status || 'Unknown';
   return {
     id: site.id, name: site.name, domain: site.domain, status, phase: site.phase || null, error: site.error || null,
+    clientId: site.clientId || null, tags: Array.isArray(site.tags) ? site.tags : [],
     region: 'Local Docker', pod: site.pod, wp: site.wpVersion || '—', php: site.phpVersion || '—',
     updates: Number(site.updates || 0), uptime: status === 'Running' ? durationSince(inspect?.State?.StartedAt || site.createdAt) : '—',
     createdAt: site.createdAt, updatedAt: site.updatedAt, containerId: inspect?.Id?.slice(0, 12) || null,
@@ -420,7 +578,7 @@ function publicSite(site, inspect) {
     directUrl: directPort ? `http://127.0.0.1:${directPort}` : null,
     siteUrl: `http://${site.domain}`, adminUrl: `http://${site.domain}/wp-admin/`,
     backupCount: site.backups?.length || 0, lastBackupAt: site.backups?.[0]?.createdAt || null,
-    lastScannedAt: site.lastScannedAt || null,
+    lastScannedAt: site.lastScannedAt || null, updateCounts: site.updateCounts || { core: 0, plugins: 0, themes: 0 },
   };
 }
 
@@ -435,6 +593,117 @@ async function requireSite(siteId) {
   const site = state.sites[siteId];
   if (!site) throw Object.assign(new Error('Site not found.'), { status: 404 });
   return site;
+}
+
+async function updateSiteMetadata(siteId, input) {
+  const state = await readState();
+  const site = state.sites[siteId];
+  if (!site) throw Object.assign(new Error('Site not found.'), { status: 404 });
+  const patch = {};
+  if (Object.hasOwn(input, 'clientId')) {
+    const clientId = input.clientId ? String(input.clientId) : null;
+    if (clientId && !state.clients[clientId]) throw new Error('The selected client no longer exists.');
+    patch.clientId = clientId;
+  }
+  if (Object.hasOwn(input, 'tags')) patch.tags = validateTags(input.tags);
+  await setSiteState(siteId, patch);
+  const current = await requireSite(siteId);
+  await recordActivity({ siteId, siteName: site.name, type: 'metadata', message: `${site.name} client and tags were updated.` });
+  return publicSite(current, await inspectContainer(current.wpContainer));
+}
+
+function publicClient(client, sites) {
+  const assignedSites = sites.filter((site) => site.clientId === client.id);
+  return {
+    id: client.id,
+    name: client.name,
+    company: client.company || '',
+    email: client.email || '',
+    phone: client.phone || '',
+    notes: client.notes || '',
+    createdAt: client.createdAt,
+    updatedAt: client.updatedAt,
+    siteCount: assignedSites.length,
+    runningSiteCount: assignedSites.filter((site) => site.status === 'Running').length,
+  };
+}
+
+async function listClients() {
+  const state = await readState();
+  const sites = await Promise.all(Object.values(state.sites).map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
+  return Object.values(state.clients)
+    .map((client) => publicClient(client, sites))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function createClient(input) {
+  const values = validateClientInput(input);
+  const id = `client_${randomBytes(6).toString('hex')}`;
+  const now = new Date().toISOString();
+  const client = { id, ...values, createdAt: now, updatedAt: now };
+  await updateState((state) => { state.clients[id] = client; });
+  await recordActivity({ siteId: '', siteName: client.name, type: 'client.create', message: `${client.name} was added as a client.` });
+  return publicClient(client, []);
+}
+
+async function updateClient(clientId, input) {
+  const values = validateClientInput(input, true);
+  const client = await updateState((state) => {
+    if (!state.clients[clientId]) throw Object.assign(new Error('Client not found.'), { status: 404 });
+    Object.assign(state.clients[clientId], values, { updatedAt: new Date().toISOString() });
+    return state.clients[clientId];
+  });
+  const sites = await listSites();
+  await recordActivity({ siteId: '', siteName: client.name, type: 'client.update', message: `${client.name}'s client record was updated.` });
+  return publicClient(client, sites);
+}
+
+async function deleteClient(clientId) {
+  const client = await updateState((state) => {
+    const current = state.clients[clientId];
+    if (!current) throw Object.assign(new Error('Client not found.'), { status: 404 });
+    for (const site of Object.values(state.sites)) {
+      if (site.clientId === clientId) site.clientId = null;
+    }
+    delete state.clients[clientId];
+    return current;
+  });
+  await recordActivity({ siteId: '', siteName: client.name, type: 'client.delete', message: `${client.name} was removed; assigned sites were kept.` });
+  return { deleted: true };
+}
+
+async function getSiteInventory(siteId) {
+  const site = await requireSite(siteId);
+  const inventory = await readInventory(site);
+  await setSiteState(site.id, {
+    wpVersion: inventory.core.version,
+    updates: inventory.updates.core + inventory.updates.plugins + inventory.updates.themes,
+    updateCounts: inventory.updates,
+    lastScannedAt: inventory.readAt,
+  });
+  return inventory;
+}
+
+async function issueOneClickLogin(siteId) {
+  const site = await requireSite(siteId);
+  const inspect = await inspectContainer(site.wpContainer);
+  if (!inspect?.State?.Running) throw Object.assign(new Error('Start the WordPress container before opening WP Admin.'), { status: 409 });
+  await ensureControlPlaneMuPlugin(site);
+  const userId = Number((await runWp(site, ['user', 'get', site.adminUser, '--field=ID'], { timeout: 60_000 })).stdout);
+  if (!Number.isInteger(userId) || userId < 1) throw new Error('The managed WordPress administrator account could not be found.');
+  const token = randomBytes(32).toString('base64url');
+  const tokenHash = createHash('sha256').update(token).digest('hex');
+  const transient = `geekheros_login_${tokenHash}`;
+  await runWp(site, ['transient', 'set', transient, JSON.stringify({ user_id: userId }), '60'], { timeout: 60_000 });
+  const directPort = await getDirectPort(site.wpContainer);
+  const baseUrl = directPort ? `http://127.0.0.1:${directPort}` : `http://${site.domain}`;
+  await recordActivity({ siteId, siteName: site.name, type: 'one-click-login', message: `A one-time WP Admin session was issued for ${site.name}.` });
+  return {
+    actionUrl: `${baseUrl}/wp-admin/admin-post.php`,
+    action: 'geekheros_login',
+    token,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
 }
 
 async function createBackup(site) {
@@ -453,7 +722,7 @@ async function createBackup(site) {
 async function runOperation(siteId, type, input = {}) {
   const site = await requireSite(siteId);
   const operation = String(type || '').replace(/^site\./, '');
-  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'scan', 'delete'].includes(operation)) {
+  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan', 'delete'].includes(operation)) {
     throw Object.assign(new Error('Unsupported operation.'), { status: 400 });
   }
   if (site.phase) throw Object.assign(new Error(`The site is currently ${site.phase.toLowerCase()}.`), { status: 409 });
@@ -492,15 +761,42 @@ async function runOperation(siteId, type, input = {}) {
     } else if (operation === 'update') {
       await createBackup(site);
       await runWp(site, ['core', 'update'], { timeout: 600_000 });
+      await runWp(site, ['core', 'update-db'], { timeout: 300_000 });
       await runWp(site, ['plugin', 'update', '--all'], { timeout: 600_000 });
       await runWp(site, ['theme', 'update', '--all'], { timeout: 600_000 });
       await refreshVersions(site);
+    } else if (operation === 'update-core') {
+      await createBackup(site);
+      await runWp(site, ['core', 'update'], { timeout: 600_000 });
+      await runWp(site, ['core', 'update-db'], { timeout: 300_000 });
+      await refreshVersions(site);
+    } else if (operation === 'update-plugins') {
+      const packages = validatePackageNames(input.packages);
+      await createBackup(site);
+      await runWp(site, ['plugin', 'update', ...(packages.length ? packages : ['--all'])], { timeout: 600_000 });
+      await refreshVersions(site);
+    } else if (operation === 'update-themes') {
+      const packages = validatePackageNames(input.packages);
+      await createBackup(site);
+      await runWp(site, ['theme', 'update', ...(packages.length ? packages : ['--all'])], { timeout: 600_000 });
+      await refreshVersions(site);
+    } else if (operation === 'activate-plugin' || operation === 'deactivate-plugin') {
+      const packages = validatePackageNames(input.packages);
+      if (packages.length !== 1) throw new Error('Choose one plugin.');
+      await runWp(site, ['plugin', operation === 'activate-plugin' ? 'activate' : 'deactivate', packages[0]], { timeout: 120_000 });
+    } else if (operation === 'activate-theme') {
+      const packages = validatePackageNames(input.packages);
+      if (packages.length !== 1) throw new Error('Choose one theme.');
+      await runWp(site, ['theme', 'activate', packages[0]], { timeout: 120_000 });
     } else if (operation === 'scan') {
       await runWp(site, ['core', 'verify-checksums'], { timeout: 300_000 });
       await runWp(site, ['plugin', 'verify-checksums', '--all', '--strict'], { timeout: 300_000 });
       await setSiteState(site.id, { lastScannedAt: new Date().toISOString() });
     }
-    if (operation === 'start' || operation === 'restart') await ensureLocalPreviewConfig(site);
+    if (operation === 'start' || operation === 'restart') {
+      await ensureLocalPreviewConfig(site);
+      await ensureControlPlaneMuPlugin(site);
+    }
     const nextStatus = operation === 'stop' ? 'Stopped' : 'Running';
     await setSiteState(site.id, { phase: null, status: nextStatus, error: null });
     await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name}: ${operation} completed.` });
@@ -573,10 +869,21 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo());
     if (request.method === 'GET' && url.pathname === '/sites') return send(response, 200, { sites: await listSites() });
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
+    if (request.method === 'GET' && url.pathname === '/clients') return send(response, 200, { clients: await listClients() });
+    if (request.method === 'POST' && url.pathname === '/clients') return send(response, 201, { client: await createClient(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/activity') {
       const state = await readState();
       return send(response, 200, { activity: state.activity });
     }
+    const clientMatch = url.pathname.match(/^\/clients\/([^/]+)$/);
+    if (clientMatch && request.method === 'PATCH') return send(response, 200, { client: await updateClient(decodeURIComponent(clientMatch[1]), await readJson(request)) });
+    if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
+    const siteMatch = url.pathname.match(/^\/sites\/([^/]+)$/);
+    if (siteMatch && request.method === 'PATCH') return send(response, 200, { site: await updateSiteMetadata(decodeURIComponent(siteMatch[1]), await readJson(request)) });
+    const inventoryMatch = url.pathname.match(/^\/sites\/([^/]+)\/inventory$/);
+    if (inventoryMatch && request.method === 'GET') return send(response, 200, { inventory: await getSiteInventory(decodeURIComponent(inventoryMatch[1])) });
+    const loginMatch = url.pathname.match(/^\/sites\/([^/]+)\/login$/);
+    if (loginMatch && request.method === 'POST') return send(response, 200, { login: await issueOneClickLogin(decodeURIComponent(loginMatch[1])) });
     const operationMatch = url.pathname.match(/^\/sites\/([^/]+)\/operations$/);
     if (request.method === 'POST' && operationMatch) {
       const body = await readJson(request);
@@ -598,9 +905,14 @@ server.listen(port, host, async () => {
         void provisionSite(site.id);
       } else {
         const container = await inspectContainer(site.wpContainer).catch(() => null);
-        if (container?.State?.Running) await ensureLocalPreviewConfig(site).catch((error) => {
-          console.error(`Unable to enable local preview for ${site.name}:`, error.message);
-        });
+        if (container?.State?.Running) {
+          await ensureLocalPreviewConfig(site).catch((error) => {
+            console.error(`Unable to enable local preview for ${site.name}:`, error.message);
+          });
+          await ensureControlPlaneMuPlugin(site).catch((error) => {
+            console.error(`Unable to install the control-plane MU-plugin for ${site.name}:`, error.message);
+          });
+        }
       }
     }
   } catch (error) {
