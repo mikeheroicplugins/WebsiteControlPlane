@@ -46,18 +46,25 @@ export default function Home() {
 
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
-    const [systemResponse, sitesResponse, activityResponse] = await Promise.all([
-      fetch('/api/system', { cache: 'no-store' }), fetch('/api/sites', { cache: 'no-store' }), fetch('/api/activity', { cache: 'no-store' }),
-    ]);
-    const [systemData, sitesData, activityData] = await Promise.all([
-      systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
-      sitesResponse.json().catch(() => ({ sites: [] })), activityResponse.json().catch(() => ({ activity: [] })),
-    ]) as [SystemInfo, { sites?: Site[]; error?: string }, { activity?: ActivityEntry[] }];
-    setSystem(systemData);
-    if (sitesResponse.ok) setSites(sitesData.sites || []);
-    if (activityResponse.ok) setActivity(activityData.activity || []);
-    setError(systemResponse.ok ? null : systemData.error || sitesData.error || 'Docker Desktop agent is offline.');
-    setLoading(false);
+    try {
+      const [systemResponse, sitesResponse, activityResponse] = await Promise.all([
+        fetch('/api/system', { cache: 'no-store' }), fetch('/api/sites', { cache: 'no-store' }), fetch('/api/activity', { cache: 'no-store' }),
+      ]);
+      const [systemData, sitesData, activityData] = await Promise.all([
+        systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
+        sitesResponse.json().catch(() => ({ sites: [] })), activityResponse.json().catch(() => ({ activity: [] })),
+      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { activity?: ActivityEntry[] }];
+      setSystem(systemData);
+      if (sitesResponse.ok) setSites(sitesData.sites || []);
+      if (activityResponse.ok) setActivity(activityData.activity || []);
+      setError(systemResponse.ok ? null : systemData.error || sitesData.error || 'Docker Desktop agent is offline.');
+    } catch {
+      const message = 'The local control plane briefly lost its connection. Keep npm run dev open, then retry.';
+      setSystem((current) => ({ ...current, connected: false, error: message }));
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
