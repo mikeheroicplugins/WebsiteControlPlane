@@ -22,6 +22,12 @@ const wordpressImage = process.env.GEEKHEROS_WORDPRESS_IMAGE || 'wordpress:lates
 const cliImage = process.env.GEEKHEROS_WPCLI_IMAGE || 'wordpress:cli';
 const databaseImage = process.env.GEEKHEROS_DATABASE_IMAGE || 'mariadb:lts';
 const edgeImage = process.env.GEEKHEROS_EDGE_IMAGE || 'traefik:v3';
+const localPreviewConfigMarker = 'GeekHeros local port preview';
+const localPreviewConfig = String.raw`/* ${localPreviewConfigMarker} */
+if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/', $_SERVER['HTTP_HOST'])) {
+  define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
+  define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
+}`;
 
 if (!authToken || authToken.length < 24) {
   console.error('GEEKHEROS_AGENT_TOKEN must be set to a random value of at least 24 characters.');
@@ -285,11 +291,29 @@ async function ensureWordPressContainer(site) {
     '--label', `traefik.docker.network=${edgeNetwork}`,
     '-e', 'WORDPRESS_DB_HOST=db:3306', '-e', 'WORDPRESS_DB_NAME=wordpress', '-e', 'WORDPRESS_DB_USER=wordpress',
     '-e', `WORDPRESS_DB_PASSWORD=${site.secrets.dbPassword}`,
-    '-e', "WORDPRESS_CONFIG_EXTRA=define('FS_METHOD', 'direct'); define('DISALLOW_FILE_EDIT', true);",
+    '-e', `WORDPRESS_CONFIG_EXTRA=${localPreviewConfig} define('FS_METHOD', 'direct'); define('DISALLOW_FILE_EDIT', true);`,
     '-v', `${site.wpVolume}:/var/www/html`,
     wordpressImage,
   ], { timeout: 600_000 });
   await docker(['network', 'connect', edgeNetwork, site.wpContainer]);
+}
+
+async function ensureLocalPreviewConfig(site) {
+  const encodedBlock = Buffer.from(`\n${localPreviewConfig}\n`, 'utf8').toString('base64');
+  const php = [
+    '$path="/var/www/html/wp-config.php";',
+    `$marker="${localPreviewConfigMarker}";`,
+    `$block=base64_decode("${encodedBlock}");`,
+    '$config=file_get_contents($path);',
+    'if ($config === false) { fwrite(STDERR, "Unable to read wp-config.php.\\n"); exit(1); }',
+    'if (strpos($config, $marker) !== false) { exit(0); }',
+    "$position=strpos($config, \"/* That's all, stop editing!\");",
+    'if ($position === false) { $position=strpos($config, "require_once ABSPATH"); }',
+    'if ($position === false) { fwrite(STDERR, "Unable to locate the wp-config.php insertion point.\\n"); exit(1); }',
+    '$updated=substr($config, 0, $position).$block.substr($config, $position);',
+    'if (file_put_contents($path, $updated) === false) { fwrite(STDERR, "Unable to update wp-config.php.\\n"); exit(1); }',
+  ].join('');
+  await docker(['exec', site.wpContainer, 'php', '-r', php], { timeout: 30_000 });
 }
 
 async function getDirectPort(container) {
@@ -332,6 +356,7 @@ async function provisionSite(siteId) {
     const directPort = await getDirectPort(site.wpContainer);
     await setSiteState(siteId, { phase: 'Installing WordPress', directPort });
     await waitForWordPressFiles(site);
+    await ensureLocalPreviewConfig(site);
 
     let installed = false;
     try { await runWp(site, ['core', 'is-installed'], { timeout: 60_000 }); installed = true; } catch {}
@@ -383,6 +408,8 @@ function durationSince(iso) {
 
 function publicSite(site, inspect) {
   const dockerStatus = inspect?.State?.Status;
+  const inspectedPort = Number(inspect?.NetworkSettings?.Ports?.['80/tcp']?.[0]?.HostPort);
+  const directPort = Number.isInteger(inspectedPort) && inspectedPort > 0 ? inspectedPort : site.directPort;
   const status = site.phase ? 'Provisioning' : site.status === 'Error' ? 'Error' : dockerStatus === 'running' ? 'Running' : dockerStatus === 'exited' || dockerStatus === 'created' ? 'Stopped' : dockerStatus ? 'Attention' : site.status || 'Unknown';
   return {
     id: site.id, name: site.name, domain: site.domain, status, phase: site.phase || null, error: site.error || null,
@@ -390,7 +417,7 @@ function publicSite(site, inspect) {
     updates: Number(site.updates || 0), uptime: status === 'Running' ? durationSince(inspect?.State?.StartedAt || site.createdAt) : '—',
     createdAt: site.createdAt, updatedAt: site.updatedAt, containerId: inspect?.Id?.slice(0, 12) || null,
     containerName: site.wpContainer, databaseContainer: site.dbContainer, image: site.image,
-    directUrl: site.directPort ? `http://127.0.0.1:${site.directPort}` : null,
+    directUrl: directPort ? `http://127.0.0.1:${directPort}` : null,
     siteUrl: `http://${site.domain}`, adminUrl: `http://${site.domain}/wp-admin/`,
     backupCount: site.backups?.length || 0, lastBackupAt: site.backups?.[0]?.createdAt || null,
     lastScannedAt: site.lastScannedAt || null,
@@ -473,6 +500,7 @@ async function runOperation(siteId, type, input = {}) {
       await runWp(site, ['plugin', 'verify-checksums', '--all', '--strict'], { timeout: 300_000 });
       await setSiteState(site.id, { lastScannedAt: new Date().toISOString() });
     }
+    if (operation === 'start' || operation === 'restart') await ensureLocalPreviewConfig(site);
     const nextStatus = operation === 'stop' ? 'Stopped' : 'Running';
     await setSiteState(site.id, { phase: null, status: nextStatus, error: null });
     await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name}: ${operation} completed.` });
@@ -566,7 +594,14 @@ server.listen(port, host, async () => {
   try {
     const state = await readState();
     for (const site of Object.values(state.sites)) {
-      if (site.phase || site.status === 'Provisioning') void provisionSite(site.id);
+      if (site.phase || site.status === 'Provisioning') {
+        void provisionSite(site.id);
+      } else {
+        const container = await inspectContainer(site.wpContainer).catch(() => null);
+        if (container?.State?.Running) await ensureLocalPreviewConfig(site).catch((error) => {
+          console.error(`Unable to enable local preview for ${site.name}:`, error.message);
+        });
+      }
     }
   } catch (error) {
     console.error('Unable to resume pending sites:', error.message);
