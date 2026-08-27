@@ -87,6 +87,7 @@ if (!authToken || authToken.length < 24) {
 }
 
 let stateQueue = Promise.resolve();
+const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
   return { version: 4, sites: {}, clients: {}, activity: [], integrations: { lovable: {} } };
@@ -124,9 +125,30 @@ async function readState() {
 
 async function writeState(state) {
   await mkdir(stateDir, { recursive: true });
-  const temporary = `${stateFile}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-  await rename(temporary, stateFile);
+  const contents = `${JSON.stringify(state, null, 2)}\n`;
+  const temporary = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, contents, 'utf8');
+  try {
+    let lastError;
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      try {
+        await rename(temporary, stateFile);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!stateReplaceRetryCodes.has(error?.code) || attempt === 6) break;
+        await new Promise((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
+      }
+    }
+    if (process.platform === 'win32' && stateReplaceRetryCodes.has(lastError?.code)) {
+      // Windows scanners can briefly block replacement even when the file itself remains writable.
+      await writeFile(stateFile, contents, 'utf8');
+      return;
+    }
+    throw lastError;
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 function updateState(mutator) {
