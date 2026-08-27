@@ -21,8 +21,8 @@ nav { flex:1; overflow:auto; }
 .nav-item { height:38px; margin:2px 0; padding:0 10px; display:flex; align-items:center; gap:10px; border-radius:8px; color:#9eaaa3; text-decoration:none; font-size:12px; font-weight:500; }
 .nav-item>span { width:17px; text-align:center; font-size:15px; color:#809087; }
 .nav-item:hover { background:#19251f; color:#e8eeeb; }
-.nav-item.active { color:#eff8f3; background:#24332b; box-shadow:inset 2px 0 0 var(--accent); }
-.nav-item.active>span { color:var(--accent); }
+.nav-item.active { color:#eff4f1; background:#24302a; }
+.nav-item.active>span { color:#c5d0ca; }
 .nav-item em,.nav-item b { margin-left:auto; font-style:normal; font-size:9px; }
 .nav-item em { color:#7f8b84; }
 .nav-item b { min-width:20px; padding:2px 5px; text-align:center; border-radius:10px; color:#132018; background:#e6b55b; }
