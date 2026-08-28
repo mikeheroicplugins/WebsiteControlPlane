@@ -80,6 +80,28 @@ const nav: Array<{ view: View; icon: LucideIcon }> = [
   { view: 'Activity', icon: Activity }, { view: 'Settings', icon: Settings },
 ];
 
+const hostedDashboardHost = 'geekheros-control-plane.heroiccrm.chatgpt.site';
+const localAgentOrigin = 'http://127.0.0.1:8788';
+
+function usesLocalAgentBridge() {
+  return typeof window !== 'undefined' && window.location.hostname === hostedDashboardHost;
+}
+
+function controlPlaneUrl(path: string) {
+  if (!usesLocalAgentBridge()) return path;
+  return `${localAgentOrigin}${path.startsWith('/api/') ? path.slice(4) : path}`;
+}
+
+function apiFetch(path: string, init: RequestInit = {}) {
+  if (!usesLocalAgentBridge()) return fetch(path, init);
+  return fetch(controlPlaneUrl(path), {
+    ...init,
+    mode: 'cors',
+    cache: init.cache || 'no-store',
+    targetAddressSpace: 'loopback',
+  } as RequestInit);
+}
+
 export default function Home() {
   const [view, setView] = useState<View>('Sites');
   const [sites, setSites] = useState<Site[]>([]);
@@ -104,9 +126,9 @@ export default function Home() {
     if (!silent) setLoading(true);
     try {
       const [systemResponse, sitesResponse, clientsResponse, blueprintsResponse, activityResponse] = await Promise.all([
-        fetch('/api/system', { cache: 'no-store' }), fetch('/api/sites', { cache: 'no-store' }),
-        fetch('/api/clients', { cache: 'no-store' }), fetch('/api/blueprints', { cache: 'no-store' }),
-        fetch('/api/activity', { cache: 'no-store' }),
+        apiFetch('/api/system', { cache: 'no-store' }), apiFetch('/api/sites', { cache: 'no-store' }),
+        apiFetch('/api/clients', { cache: 'no-store' }), apiFetch('/api/blueprints', { cache: 'no-store' }),
+        apiFetch('/api/activity', { cache: 'no-store' }),
       ]);
       const [systemData, sitesData, clientsData, blueprintsData, activityData] = await Promise.all([
         systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
@@ -121,7 +143,9 @@ export default function Home() {
       if (activityResponse.ok) setActivity(activityData.activity || []);
       setError(systemResponse.ok ? null : systemData.error || sitesData.error || 'Docker Desktop agent is offline.');
     } catch {
-      const message = 'The local control plane briefly lost its connection. Keep npm run dev open, then retry.';
+      const message = usesLocalAgentBridge()
+        ? 'Keep npm run dev open on this PC, allow Local Network Access when your browser asks, then retry.'
+        : 'The local control plane briefly lost its connection. Keep npm run dev open, then retry.';
       setSystem((current) => ({ ...current, connected: false, error: message }));
       setError(message);
     } finally { setLoading(false); }
@@ -158,7 +182,7 @@ export default function Home() {
     event.preventDefault(); setBusy('create');
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
     try {
-      const response = await fetch('/api/sites', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const response = await apiFetch('/api/sites', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       const result = await response.json() as { site?: Site; error?: string };
       if (!response.ok || !result.site) throw new Error(result.error || 'The site could not be launched.');
       setLaunchMode(null); setView('Sites'); setSelectedId(result.site.id);
@@ -172,7 +196,7 @@ export default function Home() {
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
     try {
       const endpoint = editingClient ? `/api/clients/${encodeURIComponent(editingClient.id)}` : '/api/clients';
-      const response = await fetch(endpoint, { method: editingClient ? 'PATCH' : 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const response = await apiFetch(endpoint, { method: editingClient ? 'PATCH' : 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       const result = await response.json() as { client?: Client; error?: string };
       if (!response.ok || !result.client) throw new Error(result.error || 'The client could not be saved.');
       setClientOpen(false); setEditingClient(null); setToast(`${result.client.name} was saved.`); await refresh(true);
@@ -184,7 +208,7 @@ export default function Home() {
     if (!window.confirm(`Remove ${client.name}? Assigned sites will be kept and become unassigned.`)) return;
     setBusy(`client:${client.id}:delete`);
     try {
-      const response = await fetch(`/api/clients/${encodeURIComponent(client.id)}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/clients/${encodeURIComponent(client.id)}`, { method: 'DELETE' });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || 'The client could not be removed.');
       setToast(`${client.name} was removed. Sites were kept.`); await refresh(true);
@@ -195,7 +219,7 @@ export default function Home() {
   async function createBlueprint(input: BlueprintInput) {
     setBusy('blueprint:create');
     try {
-      const response = await fetch('/api/blueprints', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) });
+      const response = await apiFetch('/api/blueprints', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) });
       const result = await response.json() as { blueprint?: Blueprint; error?: string };
       if (!response.ok || !result.blueprint) throw new Error(result.error || 'The blueprint could not be saved.');
       setBlueprintOpen(false); setToast(`${result.blueprint.name} is ready for WordPress launches.`); await refresh(true);
@@ -207,7 +231,7 @@ export default function Home() {
     if (!window.confirm(`Remove ${blueprint.name}? Existing sites are protected and will prevent removal.`)) return;
     setBusy(`blueprint:${blueprint.id}:delete`);
     try {
-      const response = await fetch(`/api/blueprints/${encodeURIComponent(blueprint.id)}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/blueprints/${encodeURIComponent(blueprint.id)}`, { method: 'DELETE' });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || 'The blueprint could not be removed.');
       setToast(`${blueprint.name} was removed.`); await refresh(true);
@@ -219,7 +243,7 @@ export default function Home() {
     if (type === 'delete' && !window.confirm(`Delete ${site.name}, its containers, volumes and local backups? This cannot be undone.`)) return false;
     setBusy(`${site.id}:${type}`);
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}/operations`, {
+      const response = await apiFetch(`/api/sites/${encodeURIComponent(site.id)}/operations`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type, ...options }),
       });
       const result = await response.json() as { error?: string };
@@ -233,7 +257,7 @@ export default function Home() {
   async function saveMetadata(site: Site, clientId: string | null, tags: string[]) {
     setBusy(`${site.id}:metadata`);
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}`, {
+      const response = await apiFetch(`/api/sites/${encodeURIComponent(site.id)}`, {
         method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clientId, tags }),
       });
       const result = await response.json() as { error?: string };
@@ -252,7 +276,7 @@ export default function Home() {
     popup.document.body.textContent = 'Preparing a secure, one-time WordPress login…';
     setBusy(`${site.id}:login`);
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}/login`, { method: 'POST' });
+      const response = await apiFetch(`/api/sites/${encodeURIComponent(site.id)}/login`, { method: 'POST' });
       const result = await response.json() as { login?: LoginResponse; error?: string };
       if (!response.ok || !result.login) throw new Error(result.error || 'WP Admin login could not be created.');
       const form = document.createElement('form');
@@ -351,7 +375,7 @@ function SiteWorkspace({ site, clients, busy, onBack, onOperate, onSaveMetadata,
     if (site.kind === 'lovable' || site.status !== 'Running') { setInventory(null); setInventoryError(null); return; }
     setInventoryLoading(true);
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}/inventory`, { cache: 'no-store' });
+      const response = await apiFetch(`/api/sites/${encodeURIComponent(site.id)}/inventory`, { cache: 'no-store' });
       const result = await response.json() as { inventory?: Inventory; error?: string };
       if (!response.ok || !result.inventory) throw new Error(result.error || 'Inventory could not be loaded.');
       setInventory(result.inventory); setInventoryError(null);
@@ -383,6 +407,13 @@ function SiteThumbnail({ site }: { site: Site }) {
   const [loading, setLoading] = useState(site.status === 'Running');
   const [error, setError] = useState<string | null>(null);
   const [capturedAt, setCapturedAt] = useState(site.screenshot?.capturedAt || null);
+  const screenshotPath = `/api/sites/${encodeURIComponent(site.id)}/screenshot?v=${encodeURIComponent(revision)}`;
+  const [screenshotSrc, setScreenshotSrc] = useState(screenshotPath);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setScreenshotSrc(controlPlaneUrl(screenshotPath)));
+    return () => window.cancelAnimationFrame(frame);
+  }, [screenshotPath]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -395,7 +426,7 @@ function SiteThumbnail({ site }: { site: Site }) {
   async function refreshScreenshot() {
     setLoading(true); setError(null);
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}/screenshot`, { method: 'POST' });
+      const response = await apiFetch(`/api/sites/${encodeURIComponent(site.id)}/screenshot`, { method: 'POST' });
       const result = await response.json() as { screenshot?: { capturedAt: string }; error?: string };
       if (!response.ok || !result.screenshot) throw new Error(result.error || 'The site preview could not be refreshed.');
       setCapturedAt(result.screenshot.capturedAt);
@@ -406,7 +437,7 @@ function SiteThumbnail({ site }: { site: Site }) {
     }
   }
 
-  return <div className="site-thumbnail">{site.status === 'Running' ? <div className="site-thumbnail-frame">{loading && <div className="site-thumbnail-loading"><span className="spinner" /><strong>Capturing…</strong></div>}<img key={revision} src={`/api/sites/${encodeURIComponent(site.id)}/screenshot?v=${encodeURIComponent(revision)}`} alt={`Current frontend of ${site.name}`} onLoad={() => { setLoading(false); setError(null); }} onError={() => { setLoading(false); setError('Frontend preview unavailable'); }} /><button className="site-thumbnail-refresh" aria-label="Refresh site screenshot" title="Refresh site screenshot" disabled={loading} onClick={() => void refreshScreenshot()}><RefreshCw aria-hidden="true" /></button><span className="site-thumbnail-time">{capturedAt ? `Updated ${relativeTime(capturedAt)}` : 'Hourly preview'}</span>{error && <div className="site-thumbnail-error"><CircleAlert aria-hidden="true" />{error}</div>}</div> : <div className="site-thumbnail-offline"><Camera aria-hidden="true" /><strong>Site stopped</strong><small>Start it to capture the frontend.</small></div>}</div>;
+  return <div className="site-thumbnail">{site.status === 'Running' ? <div className="site-thumbnail-frame">{loading && <div className="site-thumbnail-loading"><span className="spinner" /><strong>Capturing…</strong></div>}<img key={screenshotSrc} src={screenshotSrc} crossOrigin="anonymous" alt={`Current frontend of ${site.name}`} onLoad={() => { setLoading(false); setError(null); }} onError={() => { setLoading(false); setError('Frontend preview unavailable'); }} /><button className="site-thumbnail-refresh" aria-label="Refresh site screenshot" title="Refresh site screenshot" disabled={loading} onClick={() => void refreshScreenshot()}><RefreshCw aria-hidden="true" /></button><span className="site-thumbnail-time">{capturedAt ? `Updated ${relativeTime(capturedAt)}` : 'Hourly preview'}</span>{error && <div className="site-thumbnail-error"><CircleAlert aria-hidden="true" />{error}</div>}</div> : <div className="site-thumbnail-offline"><Camera aria-hidden="true" /><strong>Site stopped</strong><small>Start it to capture the frontend.</small></div>}</div>;
 }
 
 function LovableDeploymentsPanel({ site, disabled, onRun }: { site: Site; disabled: boolean; onRun: (type: string) => Promise<void> }) {
@@ -476,7 +507,7 @@ function DeveloperToolModal({ site, tool, onClose }: { site: Site; tool: Develop
   const requestTool = useCallback(async (path: string, init?: RequestInit) => {
     setBusy(true); setError(null);
     try {
-      const response = await fetch(path, init);
+      const response = await apiFetch(path, init);
       const payload = await response.json() as { result?: unknown; error?: string };
       if (!response.ok) throw new Error(payload.error || 'The developer tool failed.');
       showResult(payload.result ?? payload);
@@ -538,7 +569,7 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
   const mcpJson = system.mcp ? JSON.stringify(system.mcp.config, null, 2) : '';
 
   const refreshLovable = useCallback(async () => {
-    const response = await fetch('/api/lovable', { cache: 'no-store' });
+    const response = await apiFetch('/api/lovable', { cache: 'no-store' });
     const result = await response.json() as LovableConnection & { error?: string };
     if (!response.ok) throw new Error(result.error || 'Lovable connection status is unavailable.');
     setLovable(result);
@@ -563,7 +594,7 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
     popup.document.body.textContent = 'Preparing a secure Lovable connection…';
     setLovableBusy(true); setLovableError(null);
     try {
-      const response = await fetch('/api/lovable', { method: 'POST' });
+      const response = await apiFetch('/api/lovable', { method: 'POST' });
       const result = await response.json() as { authorizationUrl?: string; error?: string };
       if (!response.ok || !result.authorizationUrl) throw new Error(result.error || 'Lovable did not start the connection.');
       popup.location.replace(result.authorizationUrl);
@@ -586,7 +617,7 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
   async function disconnectLovableAccount() {
     setLovableBusy(true); setLovableError(null);
     try {
-      const response = await fetch('/api/lovable', { method: 'DELETE' });
+      const response = await apiFetch('/api/lovable', { method: 'DELETE' });
       const result = await response.json() as LovableConnection & { error?: string };
       if (!response.ok) throw new Error(result.error || 'Lovable could not be disconnected.');
       setLovable(result); onToast('Lovable was disconnected from GeekHeros.');
@@ -681,7 +712,7 @@ function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, on
 
   useEffect(() => {
     let active = true;
-    void fetch('/api/lovable', { cache: 'no-store' }).then(async (response) => {
+    void apiFetch('/api/lovable', { cache: 'no-store' }).then(async (response) => {
       const result = await response.json() as LovableConnection & { error?: string };
       if (!response.ok) throw new Error(result.error || 'Lovable connection status is unavailable.');
       if (active) setConnection(result);

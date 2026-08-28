@@ -74,6 +74,8 @@ Managed site details include a real browser-rendered frontend capture that refre
 
 Every dashboard capability is also part of the authenticated MCP server. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
 
-## Hosted dashboard limitation
+## Hosted dashboard connection
 
-The private hosted Sites build can show the interface, but it cannot reach Docker Desktop on this computer without a secure tunnel. Use the local URL for container control. A tunnel-backed remote node can be added later without changing the Docker agent API.
+The private hosted dashboard connects back to the Docker agent through the browser's loopback interface. Keep `npm run dev` running on the same computer and allow the browser's Local Network Access prompt. The agent permits this bridge only from the private GeekHeros Sites origin; other browser origins remain blocked and non-browser requests still require the agent token.
+
+A browser on another computer cannot reach this machine through loopback and requires a separately configured private tunnel.

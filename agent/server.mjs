@@ -21,6 +21,11 @@ const screenshotRoot = path.join(stateDir, 'screenshots');
 const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
 const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
 const authToken = process.env.GEEKHEROS_AGENT_TOKEN;
+const hostedDashboardOrigins = new Set([
+  'https://geekheros-control-plane.heroiccrm.chatgpt.site',
+  ...String(process.env.GEEKHEROS_DASHBOARD_ORIGINS || '').split(',').map((value) => value.trim()).filter(Boolean),
+]);
+const privateNetworkAccessId = createHash('sha256').update(authToken || 'geekheros-local-agent').digest('hex').slice(0, 12).match(/.{2}/g).join(':');
 const edgeNetwork = 'geekheros-edge';
 const edgeContainer = 'geekheros-edge';
 const managedLabel = 'com.geekheros.managed=true';
@@ -2166,9 +2171,21 @@ function bearerToken(request) {
   return match?.[1]?.trim() || '';
 }
 
+function corsHeaders(response) {
+  const origin = response.geekherosCorsOrigin;
+  return origin ? {
+    'access-control-allow-origin': origin,
+    'access-control-allow-private-network': 'true',
+    'private-network-access-name': 'geekheros-control-plane',
+    'private-network-access-id': privateNetworkAccessId,
+    'vary': 'Origin',
+  } : {};
+}
+
 function send(response, status, payload) {
   const body = JSON.stringify(payload);
   response.writeHead(status, {
+    ...corsHeaders(response),
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
@@ -2179,6 +2196,7 @@ function send(response, status, payload) {
 
 function sendScreenshot(response, screenshot) {
   response.writeHead(200, {
+    ...corsHeaders(response),
     'content-type': 'image/png',
     'content-length': screenshot.contents.length,
     'cache-control': 'private, no-cache, must-revalidate',
@@ -2271,7 +2289,21 @@ const server = createServer(async (request, response) => {
     }
   }
   const origin = request.headers.origin;
-  if (origin && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return send(response, 403, { error: 'Origin not allowed.' });
+  const localDashboardOrigin = Boolean(origin && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin));
+  const hostedDashboardOrigin = Boolean(origin && hostedDashboardOrigins.has(origin));
+  if (origin && !localDashboardOrigin && !hostedDashboardOrigin) return send(response, 403, { error: 'Origin not allowed.' });
+  if (origin) response.geekherosCorsOrigin = origin;
+  if (request.method === 'OPTIONS') {
+    response.writeHead(204, {
+      ...corsHeaders(response),
+      'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+      'access-control-allow-headers': 'authorization, content-type, x-geekheros-token',
+      'access-control-max-age': '600',
+      'vary': 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers',
+    });
+    response.end();
+    return undefined;
+  }
   if (url.pathname === '/mcp') {
     try {
       const contentLength = Number(request.headers['content-length'] || 0);
@@ -2286,7 +2318,7 @@ const server = createServer(async (request, response) => {
       return undefined;
     }
   }
-  if (!tokenMatches(request.headers['x-geekheros-token'])) return send(response, 401, { error: 'Agent authentication failed.' });
+  if (!hostedDashboardOrigin && !tokenMatches(request.headers['x-geekheros-token'])) return send(response, 401, { error: 'Agent authentication failed.' });
   try {
     if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo(true));
     if (request.method === 'GET' && url.pathname === '/lovable') return send(response, 200, await getLovableConnection());
