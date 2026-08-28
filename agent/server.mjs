@@ -917,7 +917,10 @@ async function waitForWordPressFiles(site, timeoutMs = 120_000) {
 
 function wpCliArgs(site, command) {
   return [
-    'run', '--rm', '--network', site.network, '--volumes-from', site.wpContainer,
+    // The Apache WordPress image owns its shared volume as www-data (33:33).
+    // wordpress:cli uses a different www-data UID, so without this override it
+    // can read WordPress but cannot create wp-content/upgrade or install packages.
+    'run', '--rm', '--user', '33:33', '--network', site.network, '--volumes-from', site.wpContainer,
     '-e', 'WORDPRESS_DB_HOST=db:3306',
     '-e', 'WORDPRESS_DB_NAME=wordpress',
     '-e', 'WORDPRESS_DB_USER=wordpress',
