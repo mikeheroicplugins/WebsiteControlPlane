@@ -936,9 +936,45 @@ async function runWp(site, command, options = {}) {
 }
 
 async function installBlueprintSlug(site, packageType, entry) {
+  const installed = (await listWpPackages(site, packageType)).find((item) => item.name === entry.slug);
+  if (installed) {
+    if (entry.activate !== false && installed.status !== 'active' && installed.status !== 'must-use') {
+      await runWp(site, [packageType, 'activate', entry.slug], { timeout: 120_000 });
+    }
+    return;
+  }
   const command = [packageType, 'install', entry.slug, '--force'];
   if (entry.activate !== false) command.push('--activate');
   await runWp(site, command, { timeout: 600_000 });
+}
+
+async function listWpPackages(site, packageType) {
+  const { stdout } = await runWp(site, [packageType, 'list', '--format=json'], { timeout: 120_000 });
+  const packages = parseJsonOutput(stdout, []);
+  if (!Array.isArray(packages)) throw new Error(`WordPress returned an invalid ${packageType} inventory.`);
+  return packages.filter((entry) => entry && typeof entry.name === 'string' && entry.name);
+}
+
+async function installBlueprintArchive(site, packageType, stagedFile, displayName) {
+  const before = new Map((await listWpPackages(site, packageType)).map((entry) => [entry.name, entry]));
+  await runWp(site, [packageType, 'install', stagedFile, '--force'], { timeout: 600_000 });
+
+  const after = await listWpPackages(site, packageType);
+  let installed = after.filter((entry) => !before.has(entry.name));
+  if (!installed.length) {
+    installed = after.filter((entry) => before.get(entry.name)?.version !== entry.version);
+  }
+  if (!installed.length) {
+    throw new Error(`${displayName} was extracted, but WordPress could not identify the installed ${packageType}.`);
+  }
+
+  if (packageType === 'theme') {
+    if (installed.length !== 1) throw new Error(`${displayName} must contain exactly one WordPress theme.`);
+    if (installed[0].status !== 'active') await runWp(site, ['theme', 'activate', installed[0].name], { timeout: 120_000 });
+  } else {
+    const inactive = installed.filter((entry) => entry.status !== 'active' && entry.status !== 'must-use').map((entry) => entry.name);
+    if (inactive.length) await runWp(site, ['plugin', 'activate', ...inactive], { timeout: 120_000 });
+  }
 }
 
 function blueprintPageSlug(page) {
@@ -974,44 +1010,47 @@ async function applyWordPressBlueprint(site) {
   const staging = `/var/www/html/wp-content/.geekheros-blueprint-${blueprint.id}`;
   await docker(['exec', site.wpContainer, 'mkdir', '-p', staging], { timeout: 30_000 });
   try {
-    for (const plugin of blueprint.plugins || []) await installBlueprintSlug(site, 'plugin', plugin);
-    for (const theme of blueprint.themes || []) await installBlueprintSlug(site, 'theme', theme);
     const orderedFiles = [...(blueprint.files || [])].sort((left, right) => {
       const order = { plugin: 0, theme: 1, 'mu-plugin': 2, 'wp-content': 3, settings: 4, content: 5 };
       return (order[left.kind] ?? 99) - (order[right.kind] ?? 99);
     });
-    for (const file of orderedFiles) {
+    const applyFile = async (file) => {
       if (path.basename(String(file.storageName || '')) !== file.storageName) throw new Error(`Blueprint file metadata is invalid for ${file.name}.`);
       const source = path.join(blueprintRoot, blueprint.id, file.storageName);
       const contents = await readFile(source);
       if (createHash('sha256').update(contents).digest('hex') !== file.sha256) throw new Error(`Blueprint file ${file.name} failed its integrity check.`);
       if (file.kind === 'settings') {
         await applyBlueprintSettings(site, JSON.parse(contents.toString('utf8')));
-        continue;
+        return;
       }
       if (file.kind === 'mu-plugin') {
         const destination = `/var/www/html/wp-content/mu-plugins/${cleanBlueprintFileName(file.name)}`;
         await docker(['exec', site.wpContainer, 'mkdir', '-p', path.posix.dirname(destination)], { timeout: 30_000 });
         await docker(['cp', source, `${site.wpContainer}:${destination}`], { timeout: 120_000 });
         await docker(['exec', site.wpContainer, 'chmod', '0644', destination], { timeout: 30_000 });
-        continue;
+        return;
       }
       if (file.kind === 'wp-content') {
         const relative = cleanBlueprintDestination(file.destination, file.name);
         const destination = `/var/www/html/${relative}`;
         await docker(['exec', site.wpContainer, 'mkdir', '-p', path.posix.dirname(destination)], { timeout: 30_000 });
         await docker(['cp', source, `${site.wpContainer}:${destination}`], { timeout: 120_000 });
-        continue;
+        return;
       }
       const stagedFile = `${staging}/${file.id}${path.extname(file.name).toLowerCase()}`;
       await docker(['cp', source, `${site.wpContainer}:${stagedFile}`], { timeout: 120_000 });
-      if (file.kind === 'plugin') await runWp(site, ['plugin', 'install', stagedFile, '--force', '--activate'], { timeout: 600_000 });
-      else if (file.kind === 'theme') await runWp(site, ['theme', 'install', stagedFile, '--force', '--activate'], { timeout: 600_000 });
+      if (file.kind === 'plugin') await installBlueprintArchive(site, 'plugin', stagedFile, file.name);
+      else if (file.kind === 'theme') await installBlueprintArchive(site, 'theme', stagedFile, file.name);
       else if (file.kind === 'content') {
-        await runWp(site, ['plugin', 'install', 'wordpress-importer', '--force', '--activate'], { timeout: 600_000 });
+        await installBlueprintSlug(site, 'plugin', { slug: 'wordpress-importer', activate: true });
         await runWp(site, ['import', stagedFile, '--authors=create'], { timeout: 600_000 });
       } else throw new Error(`Blueprint file ${file.name} has an unsupported purpose.`);
-    }
+    };
+
+    for (const file of orderedFiles.filter((entry) => entry.kind === 'plugin' || entry.kind === 'theme')) await applyFile(file);
+    for (const plugin of blueprint.plugins || []) await installBlueprintSlug(site, 'plugin', plugin);
+    for (const theme of blueprint.themes || []) await installBlueprintSlug(site, 'theme', theme);
+    for (const file of orderedFiles.filter((entry) => entry.kind !== 'plugin' && entry.kind !== 'theme')) await applyFile(file);
     await runWp(site, ['rewrite', 'flush', '--hard'], { timeout: 120_000 });
     await setSiteState(site.id, { blueprintAppliedAt: new Date().toISOString() });
   } finally {
