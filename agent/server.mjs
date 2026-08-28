@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { controlPlaneMcpToolCount, createControlPlaneMcpHandler } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -91,7 +93,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 5, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {} } };
+  return { version: 6, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
 }
 
 async function readState() {
@@ -108,7 +110,7 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 5,
+      version: 6,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
@@ -117,6 +119,7 @@ async function readState() {
         ...base.integrations,
         ...(parsed.integrations || {}),
         lovable: { ...(parsed.integrations?.lovable || {}) },
+        mcp: { ...(parsed.integrations?.mcp || {}) },
       },
     };
   } catch (error) {
@@ -168,6 +171,23 @@ function lovableIntegration(state) {
   state.integrations ||= {};
   state.integrations.lovable ||= {};
   return state.integrations.lovable;
+}
+
+function mcpIntegration(state) {
+  state.integrations ||= {};
+  state.integrations.mcp ||= {};
+  return state.integrations.mcp;
+}
+
+async function ensureMcpToken() {
+  const current = mcpIntegration(await readState()).token;
+  if (typeof current === 'string' && current.length >= 32) return current;
+  return updateState((state) => {
+    const integration = mcpIntegration(state);
+    integration.token ||= randomBytes(32).toString('base64url');
+    integration.createdAt ||= new Date().toISOString();
+    return integration.token;
+  });
 }
 
 function createLovableOAuthProvider(onAuthorizationUrl = () => undefined) {
@@ -1699,12 +1719,31 @@ async function runOperation(siteId, type, input = {}) {
   }
 }
 
-async function systemInfo() {
+function mcpConnectionConfiguration(token) {
+  const connectionHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  const url = `http://${connectionHost}:${port}/mcp`;
+  return {
+    enabled: true,
+    url,
+    toolCount: controlPlaneMcpToolCount,
+    config: {
+      mcpServers: {
+        'geekheros-control-plane': {
+          type: 'http',
+          url,
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      },
+    },
+  };
+}
+
+async function systemInfo(includeMcpConnection = false) {
   const { stdout } = await docker(['info', '--format', '{{json .}}'], { timeout: 30_000 });
   const info = JSON.parse(stdout);
   const edge = await inspectContainer(edgeContainer);
   const sites = await listSites();
-  return {
+  const result = {
     connected: true,
     dockerVersion: info.ServerVersion,
     operatingSystem: info.OperatingSystem,
@@ -1719,13 +1758,25 @@ async function systemInfo() {
     edge: { installed: Boolean(edge), running: Boolean(edge?.State?.Running), container: edgeContainer, httpPort: 80, httpsPort: 443 },
     agent: { host, port },
   };
+  if (includeMcpConnection) result.mcp = mcpConnectionConfiguration(await ensureMcpToken());
+  return result;
+}
+
+function secureTokenMatches(expected, provided) {
+  if (!expected || !provided) return false;
+  const expectedHash = createHash('sha256').update(expected).digest();
+  const providedHash = createHash('sha256').update(provided).digest();
+  return timingSafeEqual(expectedHash, providedHash);
 }
 
 function tokenMatches(provided) {
-  if (!provided) return false;
-  const expectedHash = createHash('sha256').update(authToken).digest();
-  const providedHash = createHash('sha256').update(provided).digest();
-  return timingSafeEqual(expectedHash, providedHash);
+  return secureTokenMatches(authToken, provided);
+}
+
+function bearerToken(request) {
+  const authorization = String(request.headers.authorization || '');
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || '';
 }
 
 function send(response, status, payload) {
@@ -1737,6 +1788,16 @@ function send(response, status, payload) {
     'x-content-type-options': 'nosniff',
   });
   response.end(body);
+}
+
+function sendMcpError(response, status, message) {
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'www-authenticate': 'Bearer realm="GeekHeros Control Plane"',
+    'x-content-type-options': 'nosniff',
+  });
+  response.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message }, id: null }));
 }
 
 function sendLovableCallback(response, status, success) {
@@ -1765,6 +1826,31 @@ async function readJson(request, maximumBytes = 1_000_000) {
   try { return JSON.parse(body); } catch { throw Object.assign(new Error('Request body must be valid JSON.'), { status: 400 }); }
 }
 
+const controlPlaneMcpHandler = createControlPlaneMcpHandler({
+  getSystemInfo: () => systemInfo(false),
+  listActivity: async (limit) => (await readState()).activity.slice(0, limit),
+  listSites,
+  launchSite: createSite,
+  updateSiteMetadata,
+  getSiteInventory,
+  issueWordPressLogin: issueOneClickLogin,
+  runSiteOperation: runOperation,
+  listClients,
+  createClient,
+  updateClient,
+  deleteClient,
+  listBlueprints,
+  createBlueprint,
+  deleteBlueprint,
+  getLovableConnection,
+  startLovableConnection,
+  disconnectLovable,
+  createLovableProject,
+});
+const handleMcpRequest = toNodeHandler(controlPlaneMcpHandler, {
+  onerror: (error) => console.error('MCP transport failed:', error.message),
+});
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || '/', `http://${host}:${port}`);
   if (request.method === 'GET' && url.pathname === '/lovable/oauth/callback') {
@@ -1778,9 +1864,23 @@ const server = createServer(async (request, response) => {
   }
   const origin = request.headers.origin;
   if (origin && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return send(response, 403, { error: 'Origin not allowed.' });
+  if (url.pathname === '/mcp') {
+    try {
+      const contentLength = Number(request.headers['content-length'] || 0);
+      if (contentLength > 105_000_000) return sendMcpError(response, 413, 'MCP request body is too large.');
+      const expected = await ensureMcpToken();
+      if (!secureTokenMatches(expected, bearerToken(request))) return sendMcpError(response, 401, 'MCP authentication failed.');
+      return handleMcpRequest(request, response);
+    } catch (error) {
+      console.error('MCP endpoint failed:', error.message);
+      if (!response.headersSent) return sendMcpError(response, Number(error.status) || 500, error.message || 'MCP endpoint failed.');
+      response.end();
+      return undefined;
+    }
+  }
   if (!tokenMatches(request.headers['x-geekheros-token'])) return send(response, 401, { error: 'Agent authentication failed.' });
   try {
-    if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo());
+    if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo(true));
     if (request.method === 'GET' && url.pathname === '/lovable') return send(response, 200, await getLovableConnection());
     if (request.method === 'POST' && url.pathname === '/lovable/connect') return send(response, 200, await startLovableConnection());
     if (request.method === 'DELETE' && url.pathname === '/lovable') return send(response, 200, await disconnectLovable());

@@ -1,0 +1,207 @@
+import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
+import { z } from 'zod';
+
+export const controlPlaneMcpToolCount = 20;
+
+const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites.');
+const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
+const blueprintIdSchema = z.string().min(1).describe('Blueprint ID returned by list_blueprints.');
+const packageNamesSchema = z.array(z.string().min(1)).max(100).optional();
+
+function mcpResult(result) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    structuredContent: { result },
+  };
+}
+
+function register(server, name, config, handler) {
+  server.registerTool(name, config, async (args) => mcpResult(await handler(args || {})));
+}
+
+function createControlPlaneMcpServer(api) {
+  const server = new McpServer({ name: 'GeekHeros Control Plane', version: '0.1.0' }, {
+    instructions: 'Manage the local GeekHeros Docker control plane. Read current state before changing it, and confirm intent before destructive operations.',
+  });
+
+  register(server, 'get_system_info', {
+    title: 'Get system information',
+    description: 'Read Docker engine, edge gateway, agent and managed-site health.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.getSystemInfo());
+
+  register(server, 'list_activity', {
+    title: 'List activity',
+    description: 'Read the control-plane audit log.',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(100).default(50) }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, ({ limit }) => api.listActivity(limit));
+
+  register(server, 'list_sites', {
+    title: 'List sites',
+    description: 'List every managed WordPress and Lovable site with live container state.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listSites());
+
+  register(server, 'launch_site', {
+    title: 'Launch site',
+    description: 'Launch a WordPress or Lovable workload with every option available in the dashboard.',
+    inputSchema: z.object({
+      name: z.string().min(1).max(80),
+      domain: z.string().min(1).max(253),
+      kind: z.enum(['wordpress', 'lovable']).default('wordpress'),
+      pod: z.enum(['Micro', 'Standard', 'Performance', 'Power']).default('Standard'),
+      clientId: z.string().nullable().optional(),
+      tags: z.array(z.string()).max(20).optional(),
+      blueprintId: z.string().nullable().optional(),
+      adminUser: z.string().optional(),
+      adminEmail: z.string().optional(),
+      adminPassword: z.string().optional().describe('Required for WordPress; minimum 12 characters.'),
+      lovablePrompt: z.string().max(50_000).optional(),
+      lovableProjectId: z.string().max(200).optional(),
+      lovableProjectUrl: z.string().optional(),
+      imageUrls: z.array(z.string().url()).max(10).optional(),
+      htmlUrls: z.array(z.string().url()).max(10).optional(),
+      repositoryUrl: z.string().optional(),
+      repositoryBranch: z.string().default('main'),
+      repositoryToken: z.string().max(500).optional(),
+      buildEnvironment: z.record(z.string(), z.string()).optional().describe('Lovable frontend VITE_ variables.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, (input) => api.launchSite({
+    ...input,
+    buildEnvironment: Object.entries(input.buildEnvironment || {}).map(([key, value]) => `${key}=${value}`).join('\n'),
+  }));
+
+  register(server, 'update_site_metadata', {
+    title: 'Update site metadata',
+    description: 'Assign or unassign a client and replace the site tags.',
+    inputSchema: z.object({ siteId: siteIdSchema, clientId: z.string().nullable().optional(), tags: z.array(z.string()).max(20).optional() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, ({ siteId, ...input }) => api.updateSiteMetadata(siteId, input));
+
+  register(server, 'get_site_inventory', {
+    title: 'Get WordPress inventory',
+    description: 'Read WordPress core, plugin, theme, update and backup inventory for a managed WordPress site.',
+    inputSchema: z.object({ siteId: siteIdSchema }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, ({ siteId }) => api.getSiteInventory(siteId));
+
+  register(server, 'issue_wordpress_login', {
+    title: 'Issue WordPress login',
+    description: 'Create a single-use WordPress administrator login capability that expires after 60 seconds.',
+    inputSchema: z.object({ siteId: siteIdSchema }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, ({ siteId }) => api.issueWordPressLogin(siteId));
+
+  register(server, 'run_site_operation', {
+    title: 'Run site operation',
+    description: 'Start, stop, restart, refresh, back up, update, redeploy, activate packages or scan a managed site.',
+    inputSchema: z.object({
+      siteId: siteIdSchema,
+      operation: z.enum(['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'redeploy', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan']),
+      packages: packageNamesSchema,
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, ({ siteId, operation, packages }) => api.runSiteOperation(siteId, operation, { packages }));
+
+  register(server, 'delete_site', {
+    title: 'Delete site',
+    description: 'Remove a managed site. Set deleteData to remove its containers, volumes, source checkout and backups.',
+    inputSchema: z.object({ siteId: siteIdSchema, deleteData: z.boolean().default(false) }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ siteId, deleteData }) => api.runSiteOperation(siteId, 'delete', { deleteData }));
+
+  register(server, 'list_clients', {
+    title: 'List clients',
+    description: 'List client records and assigned site counts.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listClients());
+
+  register(server, 'create_client', {
+    title: 'Create client',
+    description: 'Create a client record.',
+    inputSchema: z.object({ name: z.string().min(1).max(100), company: z.string().max(120).optional(), email: z.string().max(160).optional(), phone: z.string().max(60).optional(), notes: z.string().max(1000).optional() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, (input) => api.createClient(input));
+
+  register(server, 'update_client', {
+    title: 'Update client',
+    description: 'Update any supplied fields on a client record.',
+    inputSchema: z.object({ clientId: clientIdSchema, name: z.string().min(1).max(100).optional(), company: z.string().max(120).optional(), email: z.string().max(160).optional(), phone: z.string().max(60).optional(), notes: z.string().max(1000).optional() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, ({ clientId, ...input }) => api.updateClient(clientId, input));
+
+  register(server, 'delete_client', {
+    title: 'Delete client',
+    description: 'Delete a client record and leave its sites unassigned.',
+    inputSchema: z.object({ clientId: clientIdSchema }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ clientId }) => api.deleteClient(clientId));
+
+  register(server, 'list_blueprints', {
+    title: 'List blueprints',
+    description: 'List reusable WordPress blueprints, packages, files and usage counts.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listBlueprints());
+
+  register(server, 'create_blueprint', {
+    title: 'Create blueprint',
+    description: 'Create a WordPress blueprint from catalog packages and base64-encoded plugin, theme, settings, content, MU-plugin or wp-content files.',
+    inputSchema: z.object({
+      name: z.string().min(1).max(100),
+      description: z.string().max(500).optional(),
+      plugins: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(100).optional(),
+      themes: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(20).optional(),
+      files: z.array(z.object({
+        name: z.string().min(1).max(180),
+        kind: z.enum(['plugin', 'theme', 'settings', 'content', 'mu-plugin', 'wp-content']),
+        destination: z.string().max(300).optional(),
+        content: z.string().min(1).max(35_000_000).describe('Base64-encoded file contents.'),
+      })).max(25).optional(),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, (input) => api.createBlueprint(input));
+
+  register(server, 'delete_blueprint', {
+    title: 'Delete blueprint',
+    description: 'Delete an unused WordPress blueprint and its stored files.',
+    inputSchema: z.object({ blueprintId: blueprintIdSchema }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ blueprintId }) => api.deleteBlueprint(blueprintId));
+
+  register(server, 'get_lovable_connection', {
+    title: 'Get Lovable connection',
+    description: 'Read Lovable authorization, account and workspace status.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  }, () => api.getLovableConnection());
+
+  register(server, 'start_lovable_connection', {
+    title: 'Start Lovable connection',
+    description: 'Start Lovable OAuth and return the authorization URL that a person must open.',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, () => api.startLovableConnection());
+
+  register(server, 'disconnect_lovable', {
+    title: 'Disconnect Lovable',
+    description: 'Revoke and remove the connected Lovable authorization.',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, () => api.disconnectLovable());
+
+  register(server, 'create_lovable_project', {
+    title: 'Create Lovable project',
+    description: 'Create a real project through the connected Lovable account.',
+    inputSchema: z.object({ initialMessage: z.string().min(1).max(100_000), workspaceId: z.string().max(200).optional() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, (input) => api.createLovableProject(input));
+
+  return server;
+}
+
+export function createControlPlaneMcpHandler(api) {
+  return createMcpHandler(() => createControlPlaneMcpServer(api), {
+    legacy: 'stateless',
+    responseMode: 'json',
+    onerror: (error) => console.error('MCP request failed:', error.message),
+  });
+}

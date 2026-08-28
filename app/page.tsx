@@ -3,7 +3,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity, ArchiveRestore, ArrowLeft, ArrowRight, Boxes, Check, ChevronRight, CircleAlert,
-  CirclePlay, Container, Database, ExternalLink, GitBranch, GitCommit, Globe2, House,
+  CirclePlay, Container, Copy, Database, ExternalLink, GitBranch, GitCommit, Globe2, House,
   Info, LogIn, Package, Play, Plus, RefreshCw, RotateCw, Search, Settings, ShieldCheck,
   Sparkles, Square, Upload, Users, X,
 } from 'lucide-react';
@@ -46,6 +46,7 @@ type SystemInfo = {
   provisioningSites?: number; attentionSites?: number;
   edge?: { installed: boolean; running: boolean; container: string; httpPort: number; httpsPort: number };
   agent?: { host: string; port: number }; error?: string;
+  mcp?: { enabled: boolean; url: string; toolCount: number; config: Record<string, unknown> };
 };
 type LovableWorkspace = { id: string; name: string };
 type LovableConnection = {
@@ -405,6 +406,8 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
   const [lovableLoading, setLovableLoading] = useState(true);
   const [lovableBusy, setLovableBusy] = useState(false);
   const [lovableError, setLovableError] = useState<string | null>(null);
+  const [mcpCopied, setMcpCopied] = useState(false);
+  const mcpJson = system.mcp ? JSON.stringify(system.mcp.config, null, 2) : '';
 
   const refreshLovable = useCallback(async () => {
     const response = await fetch('/api/lovable', { cache: 'no-store' });
@@ -463,6 +466,18 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
     finally { setLovableBusy(false); }
   }
 
+  async function copyMcpConfiguration() {
+    if (!mcpJson) return;
+    try {
+      await navigator.clipboard.writeText(mcpJson);
+      setMcpCopied(true);
+      onToast('MCP connection JSON copied.');
+      window.setTimeout(() => setMcpCopied(false), 1800);
+    } catch {
+      onToast('The MCP JSON could not be copied. Select the code and copy it manually.');
+    }
+  }
+
   return <>
     <PageHeading eyebrow="LOCAL RUNTIME" title="Settings" description="The control plane is connected to Docker Desktop through a loopback-only agent." />
     <div className="settings-layout">
@@ -482,6 +497,14 @@ function SettingsView({ system, onToast }: { system: SystemInfo; onToast: (messa
             <span><small>Agent</small><strong>{system.agent ? `${system.agent.host}:${system.agent.port}` : '—'}</strong></span>
             <span><small>Edge gateway</small><strong>{system.edge?.running ? 'Running' : 'Starts with first site'}</strong></span>
           </div>
+        </div>
+        <div className="settings-section">
+          <div className="mcp-section-heading"><div><h2>AI agent MCP</h2><p>Connect an MCP-compatible agent to every control-plane capability on this machine.</p></div>{system.mcp && <span>{system.mcp.toolCount} tools</span>}</div>
+          {mcpJson ? <div className="mcp-code-block">
+            <div><span>mcp.json</span><button type="button" onClick={() => void copyMcpConfiguration()} aria-label="Copy MCP configuration">{mcpCopied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}{mcpCopied ? 'Copied' : 'Copy'}</button></div>
+            <pre><code>{mcpJson}</code></pre>
+          </div> : <div className="mcp-unavailable">Start the local GeekHeros agent to generate an MCP connection.</div>}
+          <div className="setup-note mcp-setup-note"><span><Info aria-hidden="true" /></span><p>Give this JSON only to an agent running on this computer. The endpoint is loopback-only, requires <code>npm run dev</code> to stay running, and the embedded bearer token should be treated like a password.</p></div>
         </div>
         <div className="settings-section">
           <div><h2>Lovable connection</h2><p>Authorize GeekHeros to create and manage projects through Lovable’s OAuth-protected MCP service.</p></div>
