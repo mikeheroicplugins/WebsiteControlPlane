@@ -68,6 +68,12 @@ Every managed site receives `wp-content/mu-plugins/geekheros-control-plane.php`.
 
 Local state, Lovable source checkouts and backups live under `.geekheros/` and are excluded from source control. Deleting a site from the UI with data removal enabled deletes its containers, applicable named volumes, built image, source checkout and backup directory.
 
+## Site care and MCP parity
+
+Managed site details include a real browser-rendered frontend capture that refreshes every 60 minutes, 10-minute uptime checks, safety-backed restore operations, container logs, an audited terminal and WP-CLI console, database queries, a scoped `wp-content` code editor, and runtime inspection. Microsoft Edge or Google Chrome is required on the agent machine for frontend captures.
+
+Every dashboard capability is also part of the authenticated MCP server. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
+
 ## Hosted dashboard limitation
 
 The private hosted Sites build can show the interface, but it cannot reach Docker Desktop on this computer without a secure tunnel. Use the local URL for container control. A tunnel-backed remote node can be added later without changing the Docker agent API.

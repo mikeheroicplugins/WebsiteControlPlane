@@ -1,11 +1,12 @@
 'use client';
+/* eslint-disable @next/next/no-img-element -- authenticated local screenshots must bypass the image optimizer */
 
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, ArchiveRestore, ArrowLeft, ArrowRight, Boxes, Check, ChevronRight, CircleAlert,
-  CirclePlay, Container, Copy, Database, ExternalLink, GitBranch, GitCommit, Globe2, House,
-  Info, LogIn, Package, Play, Plus, RefreshCw, RotateCw, Search, Settings, ShieldCheck,
-  Sparkles, Square, Upload, Users, X,
+  Activity, ArchiveRestore, ArrowLeft, ArrowRight, Boxes, Camera, Check, ChevronRight, CircleAlert,
+  CirclePlay, Container, Copy, Database, ExternalLink, FileCode2, Gauge, GitCommit, Globe2, House,
+  Info, LogIn, Logs, Package, Play, Plus, RefreshCw, RotateCw, Search, ServerCog, Settings, ShieldCheck,
+  Sparkles, Square, Terminal, Upload, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -27,7 +28,10 @@ type Site = {
   repositoryUrl: string | null; repositoryBranch: string | null; sourceRevision: string | null;
   lovableBuildUrl: string | null;
   blueprintId: string | null; blueprintName: string | null; blueprintAppliedAt: string | null;
+  screenshot: { capturedAt: string; width: number; height: number } | null;
+  monitoring: { lastCheck: MonitoringCheck | null; uptimePercent: number | null; averageLatencyMs: number | null; checkCount: number };
 };
+type MonitoringCheck = { checkedAt: string; ok: boolean; statusCode: number | null; latencyMs: number | null; error: string | null };
 type Client = {
   id: string; name: string; company: string; email: string; phone: string; notes: string;
   siteCount: number; runningSiteCount: number; createdAt: string; updatedAt: string;
@@ -356,15 +360,46 @@ function SiteWorkspace({ site, clients, busy, onBack, onOperate, onSaveMetadata,
     <div className="site-tab-content">{site.error && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Last operation failed</strong><p>{site.error}</p></div></div>}{site.phase && <div className="provisioning-banner"><span className="spinner" /><div><strong>{site.phase}</strong><p>GeekHeros is applying the requested Docker state. This page refreshes automatically.</p></div></div>}{site.kind === 'wordpress' && inventoryError && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Live WordPress inventory unavailable</strong><p>{inventoryError}</p></div></div>}
       {tab === 'Overview' && <SiteOverview site={site} clients={clients} clientId={clientId} tags={tags} busy={isBusy} onClientId={setClientId} onTags={setTags} onSave={saveAssignment} />}
       {tab === 'Updates' && (site.kind === 'lovable' ? <LovableDeploymentsPanel site={site} disabled={!canOperate} onRun={run} /> : <UpdatesPanel site={site} inventory={inventory} loading={inventoryLoading} disabled={!canOperate} onRun={run} onRefresh={loadInventory} />)}
-      {tab === 'Backups' && <BackupsPanel site={site} backups={inventory?.backups || site.backups || []} disabled={!canOperate} onBackup={() => void run('backup')} />}
+      {tab === 'Backups' && <BackupsPanel site={site} backups={inventory?.backups || site.backups || []} disabled={!canOperate} onBackup={() => void run('backup')} onRestore={(backupId, restoreScope) => void run('restore-backup', { backupId, restoreScope })} />}
       {tab === 'Tools' && <ToolsPanel site={site} disabled={!canOperate} onRun={run} onLogin={() => void onLogin(site)} />}
     </div></div>;
 }
 
 function SiteOverview({ site, clients, clientId, tags, busy, onClientId, onTags, onSave }: { site: Site; clients: Client[]; clientId: string; tags: string; busy: boolean; onClientId: (value: string) => void; onTags: (value: string) => void; onSave: (event: FormEvent<HTMLFormElement>) => void }) {
   const isLovable = site.kind === 'lovable';
-  return <><div className="metric-grid"><MetricCard icon={Container} tone="green" label={isLovable ? 'Application container' : 'WordPress container'} value={site.status} detail={site.containerName} /><MetricCard icon={isLovable ? GitBranch : Database} tone="violet" label={isLovable ? 'Source branch' : 'Database container'} value={isLovable ? site.repositoryBranch || 'main' : 'MariaDB'} detail={isLovable ? shortRevision(site.sourceRevision) : site.databaseContainer} /><MetricCard icon={isLovable ? GitCommit : Package} tone="amber" label={isLovable ? 'Source changes' : 'Available updates'} value={String(site.updates)} detail={isLovable ? (site.updates ? 'Remote commits are ready to deploy' : 'Deployed revision is current') : `${site.updateCounts.plugins || 0} plugins · ${site.updateCounts.themes || 0} themes`} /><MetricCard icon={ArchiveRestore} tone="blue" label="Recovery points" value={String(site.backupCount)} detail={site.lastBackupAt ? `Last backup ${relativeTime(site.lastBackupAt)}` : 'No backups created'} /></div>
+  return <><SitePreview key={`${site.id}:${site.status}:${site.screenshot?.capturedAt || ''}`} site={site} /><div className="metric-grid"><MetricCard icon={Container} tone="green" label={isLovable ? 'Application container' : 'WordPress container'} value={site.status} detail={site.containerName} /><MetricCard icon={Gauge} tone="violet" label="Monitored uptime" value={site.monitoring.uptimePercent === null ? 'Collecting' : `${site.monitoring.uptimePercent}%`} detail={site.monitoring.lastCheck ? `${site.monitoring.averageLatencyMs || '—'} ms average · checked ${relativeTime(site.monitoring.lastCheck.checkedAt)}` : 'Checks run every 10 minutes'} /><MetricCard icon={isLovable ? GitCommit : Package} tone="amber" label={isLovable ? 'Source changes' : 'Available updates'} value={String(site.updates)} detail={isLovable ? (site.updates ? 'Remote commits are ready to deploy' : 'Deployed revision is current') : `${site.updateCounts.plugins || 0} plugins · ${site.updateCounts.themes || 0} themes`} /><MetricCard icon={ArchiveRestore} tone="blue" label="Recovery points" value={String(site.backupCount)} detail={site.lastBackupAt ? `Last backup ${relativeTime(site.lastBackupAt)}` : 'No backups created'} /></div>
     <div className="dashboard-grid"><section className="content-card span-two"><div className="card-title"><div><small>OWNERSHIP</small><h2>Client and tags</h2></div></div><form className="assignment-form" onSubmit={onSave}><label>Assigned client<select value={clientId} onChange={(event) => onClientId(event.target.value)}><option value="">Unassigned</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}{client.company ? ` — ${client.company}` : ''}</option>)}</select></label><label>Tags<input value={tags} onChange={(event) => onTags(event.target.value)} placeholder="production, managed, ecommerce" /><small>Separate tags with commas.</small></label><button className="primary-button" disabled={busy}>Save assignment</button></form></section><section className="content-card"><div className="card-title"><div><small>EDGE ROUTING</small><h2>Domain</h2></div></div><div className="domain-detail"><span><Globe2 aria-hidden="true" /></span><strong>{site.domain}</strong><p>Traefik routes this hostname to the {isLovable ? 'Lovable application' : 'WordPress'} container over port 80.</p><a href={site.siteUrl} target="_blank" rel="noreferrer">Open domain<ExternalLink aria-hidden="true" /></a>{site.directUrl && <a href={site.directUrl} target="_blank" rel="noreferrer">Local preview<ExternalLink aria-hidden="true" /></a>}</div></section></div></>;
+}
+
+function SitePreview({ site }: { site: Site }) {
+  const [revision, setRevision] = useState(site.screenshot?.capturedAt || 'initial');
+  const [loading, setLoading] = useState(site.status === 'Running');
+  const [error, setError] = useState<string | null>(null);
+  const [capturedAt, setCapturedAt] = useState(site.screenshot?.capturedAt || null);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setLoading(true);
+      setRevision(String(Date.now()));
+    }, 60 * 60 * 1000);
+    return () => window.clearInterval(interval);
+  }, [site.id]);
+
+  async function refreshScreenshot() {
+    setLoading(true); setError(null);
+    try {
+      const response = await fetch(`/api/sites/${encodeURIComponent(site.id)}/screenshot`, { method: 'POST' });
+      const result = await response.json() as { screenshot?: { capturedAt: string }; error?: string };
+      if (!response.ok || !result.screenshot) throw new Error(result.error || 'The site preview could not be refreshed.');
+      setCapturedAt(result.screenshot.capturedAt);
+      setRevision(result.screenshot.capturedAt);
+    } catch (failure) {
+      setLoading(false);
+      setError(messageFrom(failure, 'The site preview could not be refreshed.'));
+    }
+  }
+
+  return <section className="content-card site-preview-card"><div className="card-title"><div><small>LIVE FRONTEND</small><h2>Site preview</h2><p>{capturedAt ? `Captured ${relativeTime(capturedAt)} · refreshes every 60 minutes` : 'A 1:1 browser capture refreshes every 60 minutes.'}</p></div><div className="preview-actions"><a className="secondary-button link-button" href={site.directUrl || site.siteUrl} target="_blank" rel="noreferrer">Open site<ExternalLink aria-hidden="true" /></a><button className="secondary-button" disabled={site.status !== 'Running' || loading} onClick={() => void refreshScreenshot()}><RefreshCw aria-hidden="true" />Refresh</button></div></div>{site.status === 'Running' ? <div className="site-preview-frame">{loading && <div className="site-preview-loading"><span className="spinner" /><strong>Capturing the frontend…</strong></div>}<img key={revision} src={`/api/sites/${encodeURIComponent(site.id)}/screenshot?v=${encodeURIComponent(revision)}`} alt={`Current frontend of ${site.name}`} onLoad={() => { setLoading(false); setError(null); }} onError={() => { setLoading(false); setError('The frontend capture is unavailable. Confirm that Edge or Chrome is installed and the site is responding.'); }} />{error && <div className="site-preview-error"><CircleAlert aria-hidden="true" />{error}</div>}</div> : <div className="site-preview-offline"><Camera aria-hidden="true" /><strong>Start the site to capture its frontend.</strong></div>}</section>;
 }
 
 function LovableDeploymentsPanel({ site, disabled, onRun }: { site: Site; disabled: boolean; onRun: (type: string) => Promise<void> }) {
@@ -387,14 +422,100 @@ function PackageTable({ title, eyebrow, items, type, disabled, onRun }: { title:
   return <section className="content-card package-card"><div className="card-title"><div><small>{eyebrow}</small><h2>{title}</h2></div>{updates.length > 0 && <button className="secondary-button" disabled={disabled} onClick={() => void onRun(type === 'plugin' ? 'update-plugins' : 'update-themes', { packages: updates.map((item) => item.name) })}>Update all {updates.length}</button>}</div><div className="package-table"><div className="package-row package-header"><span>Package</span><span>Status</span><span>Version</span><span>Auto-update</span><span>Actions</span></div>{items.map((item) => <div className="package-row" key={`${type}:${item.name}`}><span><strong>{humanizeSlug(item.name)}</strong><small>{item.name}</small></span><span><i className={`package-status ${item.status}`} />{item.status}</span><span><strong>{item.version}</strong>{item.updateVersion && <small>→ {item.updateVersion}</small>}</span><span>{item.autoUpdate}</span><span className="row-actions">{item.update === 'available' && <button disabled={disabled} onClick={() => void onRun(type === 'plugin' ? 'update-plugins' : 'update-themes', { packages: [item.name] })}>Update</button>}{type === 'plugin' && item.status !== 'must-use' && <button disabled={disabled} onClick={() => void onRun(item.status === 'active' ? 'deactivate-plugin' : 'activate-plugin', { packages: [item.name] })}>{item.status === 'active' ? 'Deactivate' : 'Activate'}</button>}{type === 'theme' && item.status !== 'active' && <button disabled={disabled} onClick={() => void onRun('activate-theme', { packages: [item.name] })}>Activate</button>}</span></div>)}{!items.length && <Empty title={`No ${title.toLowerCase()} installed`} copy="WP-CLI returned an empty package list." />}</div></section>;
 }
 
-function BackupsPanel({ site, backups, disabled, onBackup }: { site: Site; backups: Backup[]; disabled: boolean; onBackup: () => void }) {
+function BackupsPanel({ site, backups, disabled, onBackup, onRestore }: { site: Site; backups: Backup[]; disabled: boolean; onBackup: () => void; onRestore: (backupId: string, scope: 'all' | 'files' | 'database') => void }) {
   const isLovable = site.kind === 'lovable';
-  return <section className="content-card"><div className="card-title"><div><small>LOCAL RECOVERY POINTS</small><h2>Backups</h2></div><button className="primary-button" disabled={disabled || site.status !== 'Running'} onClick={onBackup}>Create backup</button></div><p className="section-copy">{isLovable ? 'Each recovery point archives the exact Lovable source checkout used by the local build.' : 'Each recovery point contains a MariaDB export and an archive of the WordPress volume.'}</p><div className="backup-table"><div className="backup-row backup-header"><span>Created</span><span>{isLovable ? 'Source' : 'Database'}</span><span>Files</span></div>{backups.map((backup) => <div className="backup-row" key={backup.id}><span><strong>{new Date(backup.createdAt).toLocaleString()}</strong><small>{relativeTime(backup.createdAt)}</small></span><code>{isLovable ? backup.files[0] || '—' : backup.files.find((file) => file.endsWith('.sql')) || '—'}</code><code>{backup.files.find((file) => file.endsWith('.tar.gz')) || '—'}</code></div>)}{!backups.length && <Empty title="No backups yet" copy="Create a recovery point before maintenance or major content changes." />}</div></section>;
+  function restore(backup: Backup, scope: 'all' | 'files' | 'database') {
+    if (window.confirm(`Restore ${scope === 'all' ? 'files and database' : scope} from ${new Date(backup.createdAt).toLocaleString()}? GeekHeros will create a safety backup first.`)) onRestore(backup.id, scope);
+  }
+  return <section className="content-card"><div className="card-title"><div><small>LOCAL RECOVERY POINTS</small><h2>Backups</h2></div><button className="primary-button" disabled={disabled || site.status !== 'Running'} onClick={onBackup}>Create backup</button></div><p className="section-copy">{isLovable ? 'Each recovery point archives the exact Lovable source checkout used by the local build.' : 'Each recovery point contains a MariaDB export and an archive of the WordPress volume. A safety backup is created before every restore.'}</p><div className="backup-table"><div className="backup-row backup-header"><span>Created</span><span>{isLovable ? 'Source' : 'Database'}</span><span>Files</span>{!isLovable && <span>Restore</span>}</div>{backups.map((backup) => <div className="backup-row" key={backup.id}><span><strong>{new Date(backup.createdAt).toLocaleString()}</strong><small>{relativeTime(backup.createdAt)}</small></span><code>{isLovable ? backup.files[0] || '—' : backup.files.find((file) => file.endsWith('.sql')) || '—'}</code><code>{backup.files.find((file) => file.endsWith('.tar.gz')) || '—'}</code>{!isLovable && <span className="backup-restore-actions"><button disabled={disabled} onClick={() => restore(backup, 'all')}>All</button><button disabled={disabled} onClick={() => restore(backup, 'files')}>Files</button><button disabled={disabled} onClick={() => restore(backup, 'database')}>Database</button></span>}</div>)}{!backups.length && <Empty title="No backups yet" copy="Create a recovery point before maintenance or major content changes." />}</div></section>;
 }
 
+type DeveloperToolType = 'terminal' | 'database' | 'logs' | 'wp-cli' | 'files' | 'runtime';
+const developerTools: Array<{ type: DeveloperToolType; title: string; copy: string; icon: LucideIcon; wordpressOnly?: boolean }> = [
+  { type: 'terminal', title: 'Container terminal', copy: 'Audited command-line access scoped to the site container.', icon: Terminal },
+  { type: 'database', title: 'Database manager', copy: 'Query or intentionally update the isolated WordPress database.', icon: Database, wordpressOnly: true },
+  { type: 'logs', title: 'Log viewer', copy: 'Read timestamped web application and database container logs.', icon: Logs },
+  { type: 'wp-cli', title: 'WP-CLI', copy: 'Run audited WordPress commands in the managed environment.', icon: Terminal, wordpressOnly: true },
+  { type: 'files', title: 'Code editor', copy: 'Read and edit text source files safely inside wp-content.', icon: FileCode2, wordpressOnly: true },
+  { type: 'runtime', title: 'Web server', copy: 'Inspect container, network, ports and runtime resource limits.', icon: ServerCog },
+];
+
 function ToolsPanel({ site, disabled, onRun, onLogin }: { site: Site; disabled: boolean; onRun: (type: string, options?: Record<string, unknown>) => Promise<void>; onLogin: () => void }) {
+  const [developerTool, setDeveloperTool] = useState<DeveloperToolType | null>(null);
   const isLovable = site.kind === 'lovable';
-  return <><section className="content-card"><div className="card-title"><div><small>{isLovable ? 'LOVABLE & CONTAINER' : 'WORDPRESS & CONTAINER'}</small><h2>Site tools</h2></div></div><div className="operation-grid">{isLovable ? <><Operation icon={RefreshCw} title="Check source" copy="Compare the deployed commit with the configured Git branch." disabled={disabled} onClick={() => void onRun('refresh')} /><Operation icon={Upload} title="Deploy latest" copy="Back up the checkout, pull the branch, rebuild and replace the container." disabled={disabled} onClick={() => void onRun('redeploy')} /><Operation icon={ArchiveRestore} title="Create backup" copy="Archive the exact source checkout used for this build." disabled={disabled} onClick={() => void onRun('backup')} /><Operation icon={ShieldCheck} title="Verify source" copy="Confirm the repository branch and local package definition are readable." disabled={disabled} onClick={() => void onRun('scan')} /><Operation icon={RotateCw} title="Restart container" copy="Restart the Nginx application container without rebuilding." disabled={disabled} onClick={() => void onRun('restart')} />{site.lovableBuildUrl && <a className="operation-card" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><span><Sparkles aria-hidden="true" /></span><strong>Continue in Lovable</strong><small>Open the original Build with URL prompt for further generation.</small><em>Open Lovable<ExternalLink aria-hidden="true" /></em></a>}</> : <><Operation icon={RefreshCw} title="Refresh inventory" copy="Read live core, plugin, theme and PHP versions." disabled={disabled} onClick={() => void onRun('refresh')} /><Operation icon={Upload} title="Update everything" copy="Back up, then update WordPress core, all plugins and all themes." disabled={disabled} onClick={() => void onRun('update')} /><Operation icon={ArchiveRestore} title="Create backup" copy="Export MariaDB and archive the WordPress volume." disabled={disabled} onClick={() => void onRun('backup')} /><Operation icon={ShieldCheck} title="Verify checksums" copy="Validate WordPress core and available plugin checksums." disabled={disabled} onClick={() => void onRun('scan')} /><Operation icon={RotateCw} title="Restart containers" copy="Restart MariaDB and WordPress in dependency order." disabled={disabled} onClick={() => void onRun('restart')} /><Operation icon={LogIn} title="One-click WP Admin" copy="Issue a one-time, 60-second administrator session." disabled={disabled} onClick={onLogin} /></>}</div></section><section className="content-card tool-details"><div className="card-title"><div><small>RUNTIME DETAILS</small><h2>Container endpoints</h2></div></div><div className="definition-grid"><span><small>{isLovable ? 'Application' : 'WordPress'}</small><strong>{site.containerName}</strong></span><span><small>{isLovable ? 'Source branch' : 'MariaDB'}</small><strong>{isLovable ? site.repositoryBranch || 'main' : site.databaseContainer}</strong></span><span><small>Image</small><strong>{site.image}</strong></span><span><small>Container ID</small><strong>{site.containerId || '—'}</strong></span><span><small>Domain</small><strong>{site.siteUrl}</strong></span><span><small>Local preview</small><strong>{site.directUrl || '—'}</strong></span></div></section><section className="danger-zone"><div><strong>Remove site</strong><p>{isLovable ? 'Deletes the application container, built image, local source checkout and backups.' : 'Deletes both containers, their named volumes and local backups.'}</p></div><button disabled={disabled} onClick={() => void onRun('delete', { deleteData: true })}>Delete site and data</button></section></>;
+  return <><section className="content-card"><div className="card-title"><div><small>{isLovable ? 'LOVABLE & CONTAINER' : 'WORDPRESS & CONTAINER'}</small><h2>Site tools</h2></div></div><div className="operation-grid">{isLovable ? <><Operation icon={RefreshCw} title="Check source" copy="Compare the deployed commit with the configured Git branch." disabled={disabled} onClick={() => void onRun('refresh')} /><Operation icon={Upload} title="Deploy latest" copy="Back up the checkout, pull the branch, rebuild and replace the container." disabled={disabled} onClick={() => void onRun('redeploy')} /><Operation icon={ArchiveRestore} title="Create backup" copy="Archive the exact source checkout used for this build." disabled={disabled} onClick={() => void onRun('backup')} /><Operation icon={ShieldCheck} title="Verify source" copy="Confirm the repository branch and local package definition are readable." disabled={disabled} onClick={() => void onRun('scan')} /><Operation icon={RotateCw} title="Restart container" copy="Restart the Nginx application container without rebuilding." disabled={disabled} onClick={() => void onRun('restart')} />{site.lovableBuildUrl && <a className="operation-card" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><span><Sparkles aria-hidden="true" /></span><strong>Continue in Lovable</strong><small>Open the original Build with URL prompt for further generation.</small><em>Open Lovable<ExternalLink aria-hidden="true" /></em></a>}</> : <><Operation icon={RefreshCw} title="Refresh inventory" copy="Read live core, plugin, theme and PHP versions." disabled={disabled} onClick={() => void onRun('refresh')} /><Operation icon={Upload} title="Update everything" copy="Back up, then update WordPress core, all plugins and all themes." disabled={disabled} onClick={() => void onRun('update')} /><Operation icon={ArchiveRestore} title="Create backup" copy="Export MariaDB and archive the WordPress volume." disabled={disabled} onClick={() => void onRun('backup')} /><Operation icon={ShieldCheck} title="Verify checksums" copy="Validate WordPress core and available plugin checksums." disabled={disabled} onClick={() => void onRun('scan')} /><Operation icon={RotateCw} title="Restart containers" copy="Restart MariaDB and WordPress in dependency order." disabled={disabled} onClick={() => void onRun('restart')} /><Operation icon={LogIn} title="One-click WP Admin" copy="Issue a one-time, 60-second administrator session." disabled={disabled} onClick={onLogin} /></>}</div></section><section className="content-card developer-tools-card"><div className="card-title"><div><small>DEVELOPER ACCESS</small><h2>Developer tools</h2><p>Real, audited container tools modeled on the GetDollie site-management baseline.</p></div></div><div className="tool-grid">{developerTools.map(({ type, title, copy, icon: Icon, wordpressOnly }) => <button className="tool-card" key={type} disabled={disabled || (wordpressOnly && isLovable)} onClick={() => setDeveloperTool(type)}><span><Icon aria-hidden="true" /></span><strong>{title}</strong><small>{wordpressOnly && isLovable ? 'Available for managed WordPress sites.' : copy}</small><em>Open tool<ArrowRight aria-hidden="true" /></em></button>)}</div></section><section className="content-card tool-details"><div className="card-title"><div><small>RUNTIME DETAILS</small><h2>Container endpoints</h2></div></div><div className="definition-grid"><span><small>{isLovable ? 'Application' : 'WordPress'}</small><strong>{site.containerName}</strong></span><span><small>{isLovable ? 'Source branch' : 'MariaDB'}</small><strong>{isLovable ? site.repositoryBranch || 'main' : site.databaseContainer}</strong></span><span><small>Image</small><strong>{site.image}</strong></span><span><small>Container ID</small><strong>{site.containerId || '—'}</strong></span><span><small>Domain</small><strong>{site.siteUrl}</strong></span><span><small>Local preview</small><strong>{site.directUrl || '—'}</strong></span></div></section><section className="danger-zone"><div><strong>Remove site</strong><p>{isLovable ? 'Deletes the application container, built image, local source checkout and backups.' : 'Deletes both containers, their named volumes and local backups.'}</p></div><button disabled={disabled} onClick={() => void onRun('delete', { deleteData: true })}>Delete site and data</button></section>{developerTool && <DeveloperToolModal site={site} tool={developerTool} onClose={() => setDeveloperTool(null)} />}</>;
+}
+
+function parseCommandLine(value: string) {
+  return (value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []).map((part) => {
+    if ((part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"))) return part.slice(1, -1);
+    return part;
+  });
+}
+
+function DeveloperToolModal({ site, tool, onClose }: { site: Site; tool: DeveloperToolType; onClose: () => void }) {
+  const config = developerTools.find((entry) => entry.type === tool) || developerTools[0];
+  const [busy, setBusy] = useState(false);
+  const [output, setOutput] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [command, setCommand] = useState(tool === 'wp-cli' ? 'plugin list --format=table' : 'ls -la');
+  const [query, setQuery] = useState('SELECT option_name, option_value FROM wp_options LIMIT 20;');
+  const [allowWrites, setAllowWrites] = useState(false);
+  const [filePath, setFilePath] = useState('wp-content/themes/');
+  const [fileContent, setFileContent] = useState('');
+  const [fileOptions, setFileOptions] = useState<string[]>([]);
+
+  const showResult = useCallback((result: unknown) => setOutput(typeof result === 'string' ? result : JSON.stringify(result, null, 2)), []);
+  const requestTool = useCallback(async (path: string, init?: RequestInit) => {
+    setBusy(true); setError(null);
+    try {
+      const response = await fetch(path, init);
+      const payload = await response.json() as { result?: unknown; error?: string };
+      if (!response.ok) throw new Error(payload.error || 'The developer tool failed.');
+      showResult(payload.result ?? payload);
+      return payload.result as Record<string, unknown> | undefined;
+    } catch (failure) {
+      setError(messageFrom(failure, 'The developer tool failed.'));
+      return undefined;
+    } finally { setBusy(false); }
+  }, [showResult]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (tool === 'logs' || tool === 'runtime') void requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer?tool=${tool}`);
+      if (tool === 'files') void requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer?tool=files`).then((result) => {
+        const files = Array.isArray(result?.files) ? result.files.map(String) : [];
+        setFileOptions(files);
+        if (files[0]) setFilePath(files[0]);
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [requestTool, site.id, tool]);
+
+  async function runCommand() {
+    let args = parseCommandLine(command);
+    if (tool === 'wp-cli' && args[0] === 'wp') args = args.slice(1);
+    await requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool, args }) });
+  }
+  async function runDatabaseQuery() {
+    await requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'database', query, allowWrites }) });
+  }
+  async function loadFile() {
+    const result = await requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer?tool=file&path=${encodeURIComponent(filePath)}`);
+    if (result && typeof result.content === 'string') setFileContent(result.content);
+  }
+  async function saveFile() {
+    await requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'write-file', path: filePath, content: fileContent }) });
+  }
+
+  return <div className="modal-backdrop developer-modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal developer-modal" role="dialog" aria-modal="true" aria-labelledby="developer-tool-title"><div className="modal-head"><div><p className="eyebrow">AUDITED SITE ACCESS</p><h2 id="developer-tool-title">{config.title}</h2><p>{config.copy}</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><div className="developer-tool-body">
+    {(tool === 'terminal' || tool === 'wp-cli') && <div className="developer-command"><label>{tool === 'wp-cli' ? 'WP-CLI arguments' : 'Container command'}<input value={command} onChange={(event) => setCommand(event.target.value)} placeholder={tool === 'wp-cli' ? 'plugin list --format=table' : 'ls -la'} /></label><button className="primary-button" disabled={busy || !command.trim()} onClick={() => void runCommand()}>{busy ? 'Running…' : 'Run command'}</button><small>Commands are split into arguments and never passed through a host shell.</small></div>}
+    {tool === 'database' && <div className="developer-command"><label>SQL query<textarea value={query} onChange={(event) => setQuery(event.target.value)} rows={7} /></label><label className="developer-write-toggle"><input type="checkbox" checked={allowWrites} onChange={(event) => setAllowWrites(event.target.checked)} />Allow database-changing statements</label><button className="primary-button" disabled={busy || !query.trim()} onClick={() => void runDatabaseQuery()}>{busy ? 'Running…' : 'Run query'}</button></div>}
+    {tool === 'files' && <div className="developer-file-editor"><div><label>File inside wp-content<input list="site-file-options" value={filePath} onChange={(event) => setFilePath(event.target.value)} placeholder="wp-content/themes/my-theme/style.css" /><datalist id="site-file-options">{fileOptions.map((file) => <option value={file} key={file} />)}</datalist></label><button className="secondary-button" disabled={busy || !filePath.trim()} onClick={() => void loadFile()}>Load</button><button className="primary-button" disabled={busy || !filePath.trim()} onClick={() => void saveFile()}>Save</button></div><textarea value={fileContent} onChange={(event) => setFileContent(event.target.value)} rows={16} spellCheck={false} aria-label="File contents" /></div>}
+    {(tool === 'logs' || tool === 'runtime') && <button className="secondary-button developer-refresh" disabled={busy} onClick={() => void requestTool(`/api/sites/${encodeURIComponent(site.id)}/developer?tool=${tool}`)}><RefreshCw aria-hidden="true" />Refresh</button>}
+    {error && <p className="developer-tool-error" role="alert">{error}</p>}
+    {output && <pre className="developer-output"><code>{output}</code></pre>}
+  </div></section></div>;
 }
 
 function Operation({ icon: Icon, title, copy, disabled, onClick }: { icon: LucideIcon; title: string; copy: string; disabled: boolean; onClick: () => void }) { return <button className="operation-card" disabled={disabled} onClick={onClick}><span><Icon aria-hidden="true" /></span><strong>{title}</strong><small>{copy}</small><em>Run operation<ArrowRight aria-hidden="true" /></em></button>; }

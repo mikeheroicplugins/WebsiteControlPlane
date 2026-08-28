@@ -1,8 +1,8 @@
 import { createServer } from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -17,6 +17,7 @@ const stateFile = path.join(stateDir, 'state.json');
 const backupRoot = path.join(stateDir, 'backups');
 const sourceRoot = path.join(stateDir, 'sources');
 const blueprintRoot = path.join(stateDir, 'blueprints');
+const screenshotRoot = path.join(stateDir, 'screenshots');
 const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
 const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
 const authToken = process.env.GEEKHEROS_AGENT_TOKEN;
@@ -31,6 +32,9 @@ const localPreviewConfigMarker = 'GeekHeros local port preview';
 const lovableMcpUrl = new URL('https://mcp.lovable.dev');
 const lovableOAuthCallbackUrl = `http://127.0.0.1:${port}/lovable/oauth/callback`;
 const lovableOAuthStateMaxAge = 10 * 60 * 1000;
+const screenshotRefreshMs = 60 * 60 * 1000;
+const uptimeCheckIntervalMs = 10 * 60 * 1000;
+const screenshotCaptures = new Map();
 const localPreviewConfig = String.raw`/* ${localPreviewConfigMarker} */
 if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/', $_SERVER['HTTP_HOST'])) {
   define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
@@ -93,7 +97,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 6, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 7, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
 }
 
 async function readState() {
@@ -110,7 +114,7 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 6,
+      version: 7,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
@@ -484,6 +488,77 @@ async function dockerToFile(args, destination) {
       if (code === 0) resolve();
       else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
     });
+  });
+}
+
+async function dockerFromBuffer(args, contents, timeout = 120_000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      if (!settled) {
+        settled = true;
+        reject(new Error('Docker input operation timed out.'));
+      }
+    }, timeout);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+      else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
+    });
+    child.stdin.end(contents);
+  });
+}
+
+async function dockerFromFile(args, source, timeout = 600_000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const input = createReadStream(source);
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      if (!settled) {
+        settled = true;
+        reject(new Error('Docker file import timed out.'));
+      }
+    }, timeout);
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    input.on('error', (error) => {
+      child.kill();
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    child.on('error', (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
+    });
+    input.pipe(child.stdin);
   });
 }
 
@@ -1448,6 +1523,20 @@ function publicSite(site, inspect) {
     repositoryBranch: site.kind === 'lovable' ? site.repositoryBranch : null,
     sourceRevision: site.kind === 'lovable' ? site.sourceRevision || null : null,
     lovableBuildUrl: site.kind === 'lovable' ? site.lovableBuildUrl : null,
+    screenshot: site.screenshot ? { capturedAt: site.screenshot.capturedAt, width: site.screenshot.width, height: site.screenshot.height } : null,
+    monitoring: monitoringSummary(site),
+  };
+}
+
+function monitoringSummary(site) {
+  const checks = Array.isArray(site.monitoring?.checks) ? site.monitoring.checks : [];
+  const successful = checks.filter((check) => check.ok);
+  const latencyValues = successful.map((check) => Number(check.latencyMs)).filter(Number.isFinite);
+  return {
+    lastCheck: checks[0] || null,
+    uptimePercent: checks.length ? Number(((successful.length / checks.length) * 100).toFixed(2)) : null,
+    averageLatencyMs: latencyValues.length ? Math.round(latencyValues.reduce((sum, value) => sum + value, 0) / latencyValues.length) : null,
+    checkCount: checks.length,
   };
 }
 
@@ -1462,6 +1551,266 @@ async function requireSite(siteId) {
   const site = state.sites[siteId];
   if (!site) throw Object.assign(new Error('Site not found.'), { status: 404 });
   return site;
+}
+
+async function requireRunningSite(siteId, wordpressOnly = false) {
+  const site = await requireSite(siteId);
+  if (wordpressOnly && site.kind === 'lovable') throw Object.assign(new Error('This developer tool is only available for WordPress sites.'), { status: 409 });
+  const inspect = await inspectContainer(site.wpContainer);
+  if (!inspect?.State?.Running) throw Object.assign(new Error('Start the site before using this tool.'), { status: 409 });
+  return { site, inspect };
+}
+
+function screenshotPath(siteId) {
+  return path.join(screenshotRoot, `${siteId}.png`);
+}
+
+let browserExecutablePromise;
+async function findBrowserExecutable() {
+  browserExecutablePromise ||= (async () => {
+    const candidates = process.platform === 'win32' ? [
+      path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ] : process.platform === 'darwin' ? [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    ] : ['/usr/bin/google-chrome', '/usr/bin/microsoft-edge', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try { if ((await stat(candidate)).isFile()) return candidate; } catch {}
+    }
+    throw Object.assign(new Error('Install Microsoft Edge or Google Chrome to capture site previews.'), { status: 503 });
+  })();
+  return browserExecutablePromise;
+}
+
+async function captureSiteScreenshot(siteId, options = {}) {
+  const force = options.force === true;
+  const existing = screenshotCaptures.get(siteId);
+  if (existing) return existing;
+  const task = (async () => {
+    const { site, inspect } = await requireRunningSite(siteId);
+    const destination = screenshotPath(siteId);
+    if (!force) {
+      try {
+        const details = await stat(destination);
+        if (Date.now() - details.mtimeMs < screenshotRefreshMs) {
+          return { contents: await readFile(destination), capturedAt: site.screenshot?.capturedAt || details.mtime.toISOString(), width: 1440, height: 1000, fresh: true };
+        }
+      } catch {}
+    }
+    const portBinding = inspect.NetworkSettings?.Ports?.['80/tcp']?.[0]?.HostPort;
+    const targetUrl = portBinding ? `http://127.0.0.1:${portBinding}` : `http://${site.domain}`;
+    const browser = await findBrowserExecutable();
+    const profileDirectory = path.join(screenshotRoot, `.browser-${siteId}-${randomUUID()}`);
+    const temporary = path.join(screenshotRoot, `.${siteId}-${randomUUID()}.png`);
+    await mkdir(screenshotRoot, { recursive: true });
+    await mkdir(profileDirectory, { recursive: true });
+    try {
+      await execFileAsync(browser, [
+        '--headless=new', '--disable-gpu', '--disable-extensions', '--disable-background-networking', '--hide-scrollbars',
+        '--no-first-run', '--allow-insecure-localhost', '--force-device-scale-factor=1', '--window-size=1440,1000',
+        `--user-data-dir=${profileDirectory}`, `--screenshot=${temporary}`, '--virtual-time-budget=10000', targetUrl,
+      ], { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 45_000, windowsHide: true });
+      const contents = await readFile(temporary);
+      if (contents.length < 8 || contents.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') throw new Error('The browser did not produce a valid PNG preview.');
+      await rename(temporary, destination);
+      const capturedAt = new Date().toISOString();
+      await setSiteState(siteId, { screenshot: { capturedAt, width: 1440, height: 1000 } });
+      return { contents, capturedAt, width: 1440, height: 1000, fresh: true };
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      await rm(profileDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
+    }
+  })();
+  screenshotCaptures.set(siteId, task);
+  try { return await task; } finally { screenshotCaptures.delete(siteId); }
+}
+
+async function getSiteScreenshot(siteId, options = {}) {
+  return captureSiteScreenshot(siteId, options);
+}
+
+async function checkSiteUptime(siteId) {
+  const site = await requireSite(siteId);
+  const inspect = await inspectContainer(site.wpContainer);
+  const checkedAt = new Date().toISOString();
+  let check;
+  if (!inspect?.State?.Running) {
+    check = { checkedAt, ok: false, statusCode: null, latencyMs: null, error: 'Container is not running.' };
+  } else {
+    const portBinding = inspect.NetworkSettings?.Ports?.['80/tcp']?.[0]?.HostPort;
+    const targetUrl = portBinding ? `http://127.0.0.1:${portBinding}` : `http://${site.domain}`;
+    const started = performance.now();
+    try {
+      const response = await fetch(targetUrl, { redirect: 'follow', signal: AbortSignal.timeout(15_000) });
+      check = { checkedAt, ok: response.ok, statusCode: response.status, latencyMs: Math.max(1, Math.round(performance.now() - started)), error: response.ok ? null : `HTTP ${response.status}` };
+      await response.body?.cancel().catch(() => undefined);
+    } catch (error) {
+      check = { checkedAt, ok: false, statusCode: null, latencyMs: Math.max(1, Math.round(performance.now() - started)), error: error.message || 'Uptime check failed.' };
+    }
+  }
+  await updateState((state) => {
+    const current = state.sites[siteId];
+    if (!current) return;
+    current.monitoring ||= { checks: [] };
+    current.monitoring.checks = [check, ...(Array.isArray(current.monitoring.checks) ? current.monitoring.checks : [])].slice(0, 1008);
+  });
+  return check;
+}
+
+async function getSiteMonitoring(siteId, options = {}) {
+  if (options.refresh === true) await checkSiteUptime(siteId);
+  const site = await requireSite(siteId);
+  const checks = Array.isArray(site.monitoring?.checks) ? site.monitoring.checks : [];
+  return { ...monitoringSummary(site), checks };
+}
+
+async function refreshSiteCare() {
+  const state = await readState();
+  for (const site of Object.values(state.sites)) {
+    if (site.phase || site.status === 'Stopped') continue;
+    await checkSiteUptime(site.id).catch((error) => console.error(`Uptime check failed for ${site.name}:`, error.message));
+  }
+}
+
+async function refreshSiteScreenshots() {
+  const state = await readState();
+  for (const site of Object.values(state.sites)) {
+    if (site.phase || site.status === 'Stopped') continue;
+    await captureSiteScreenshot(site.id, { force: true }).catch((error) => console.error(`Screenshot capture failed for ${site.name}:`, error.message));
+  }
+}
+
+function validateDeveloperArguments(value, maximum = 50) {
+  if (!Array.isArray(value) || !value.length || value.length > maximum) throw Object.assign(new Error('Provide a non-empty command argument array.'), { status: 400 });
+  const args = value.map((item) => String(item));
+  if (args.some((item) => !item || item.length > 500 || /[\u0000\r\n]/.test(item))) throw Object.assign(new Error('One or more command arguments are invalid.'), { status: 400 });
+  return args;
+}
+
+async function getSiteLogs(siteId, options = {}) {
+  const { site } = await requireRunningSite(siteId);
+  const lines = Math.min(1000, Math.max(20, Number(options.lines) || 300));
+  const application = await docker(['logs', '--tail', String(lines), '--timestamps', site.wpContainer], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+  let database = null;
+  if (site.dbContainer) database = await docker(['logs', '--tail', String(Math.min(lines, 300)), '--timestamps', site.dbContainer], { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
+  return {
+    application: [application.stdout, application.stderr].filter(Boolean).join('\n'),
+    database: database ? [database.stdout, database.stderr].filter(Boolean).join('\n') : null,
+    readAt: new Date().toISOString(),
+  };
+}
+
+async function runSiteWpCli(siteId, command) {
+  const { site } = await requireRunningSite(siteId, true);
+  const args = validateDeveloperArguments(command);
+  const blocked = new Set(['eval', 'eval-file', 'shell']);
+  const primary = args.find((arg) => !arg.startsWith('-')) || '';
+  if (blocked.has(primary) || args.some((arg) => arg.startsWith('--require=') || arg.startsWith('--exec='))) {
+    throw Object.assign(new Error('That WP-CLI command is disabled in the audited console.'), { status: 403 });
+  }
+  const result = await runWp(site, args, { timeout: 600_000 });
+  await recordActivity({ siteId, siteName: site.name, type: 'developer.wp-cli', message: `An audited WP-CLI command ran for ${site.name}.` });
+  return { ...result, command: ['wp', ...args], ranAt: new Date().toISOString() };
+}
+
+function isReadOnlySql(query) {
+  const source = query.trim();
+  const mutating = /\b(?:ALTER|CALL|CREATE|DELETE|DO|DROP|GRANT|HANDLER|INSERT|LOAD|LOCK|RENAME|REPLACE|REVOKE|SET|TRUNCATE|UNLOCK|UPDATE)\b/i.test(source);
+  return !mutating && /^(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i.test(source);
+}
+
+async function querySiteDatabase(siteId, query, options = {}) {
+  const { site } = await requireRunningSite(siteId, true);
+  const sql = String(query || '').trim();
+  if (!sql || sql.length > 100_000 || /\u0000/.test(sql)) throw Object.assign(new Error('Enter a SQL query up to 100,000 characters.'), { status: 400 });
+  const readOnly = isReadOnlySql(sql);
+  if (!readOnly && options.allowWrites !== true) throw Object.assign(new Error('Set allowWrites to true before running a database-changing statement.'), { status: 409 });
+  if (/\b(?:INTO\s+OUTFILE|LOAD_FILE|LOAD\s+DATA)\b/i.test(sql)) throw Object.assign(new Error('Database filesystem operations are disabled.'), { status: 403 });
+  const result = await docker(['exec', '-e', `MYSQL_PWD=${site.secrets.dbRootPassword}`, site.dbContainer, 'mariadb', '-uroot', '--batch', '--raw', 'wordpress', '-e', sql], { timeout: 300_000, maxBuffer: 8 * 1024 * 1024 });
+  await recordActivity({ siteId, siteName: site.name, type: 'developer.database', message: `${readOnly ? 'A database query' : 'A database change'} ran for ${site.name}.` });
+  return { ...result, readOnly, ranAt: new Date().toISOString() };
+}
+
+const editableSiteFileExtensions = new Set(['.css', '.html', '.htm', '.js', '.json', '.md', '.php', '.txt', '.twig', '.xml', '.yml', '.yaml']);
+function scopedSiteFilePath(value) {
+  const source = String(value || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+  if (!source || source.length > 300 || /[\u0000-\u001f]/.test(source)) throw Object.assign(new Error('Enter a valid file path inside wp-content.'), { status: 400 });
+  const relative = path.posix.normalize(source.startsWith('wp-content/') ? source.slice('wp-content/'.length) : source);
+  if (!relative || relative === '.' || relative.startsWith('../') || relative.includes('/../')) throw Object.assign(new Error('The file must stay inside wp-content.'), { status: 400 });
+  if (relative.toLowerCase() === 'mu-plugins/geekheros-control-plane.php') throw Object.assign(new Error('The GeekHeros control-plane MU-plugin is protected.'), { status: 403 });
+  const extension = path.posix.extname(relative).toLowerCase();
+  if (!editableSiteFileExtensions.has(extension) && path.posix.basename(relative) !== '.htaccess') throw Object.assign(new Error('The code editor supports text and web source files only.'), { status: 400 });
+  return { relative, absolute: `/var/www/html/wp-content/${relative}` };
+}
+
+async function listSiteFiles(siteId, options = {}) {
+  const { site } = await requireRunningSite(siteId, true);
+  const limit = Math.min(500, Math.max(10, Number(options.limit) || 200));
+  const result = await docker(['exec', site.wpContainer, 'find', '/var/www/html/wp-content', '-maxdepth', '5', '-type', 'f'], { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
+  const files = result.stdout.split(/\r?\n/).filter(Boolean).map((file) => file.replace('/var/www/html/', '')).filter((file) => {
+    const extension = path.posix.extname(file).toLowerCase();
+    return editableSiteFileExtensions.has(extension) || path.posix.basename(file) === '.htaccess';
+  }).slice(0, limit);
+  return { files, truncated: files.length === limit, readAt: new Date().toISOString() };
+}
+
+async function readSiteFile(siteId, filePath) {
+  const { site } = await requireRunningSite(siteId, true);
+  const target = scopedSiteFilePath(filePath);
+  const result = await docker(['exec', site.wpContainer, 'base64', '-w', '0', target.absolute], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024 });
+  const contents = Buffer.from(result.stdout, 'base64');
+  if (contents.length > 1_000_000) throw Object.assign(new Error('The file is too large for the code editor.'), { status: 413 });
+  return { path: `wp-content/${target.relative}`, content: contents.toString('utf8'), size: contents.length, readAt: new Date().toISOString() };
+}
+
+async function writeSiteFile(siteId, filePath, content) {
+  const { site } = await requireRunningSite(siteId, true);
+  const target = scopedSiteFilePath(filePath);
+  const contents = Buffer.from(String(content ?? ''), 'utf8');
+  if (contents.length > 1_000_000) throw Object.assign(new Error('Code editor files may be up to 1 MB.'), { status: 413 });
+  await dockerFromBuffer(['exec', '-i', '--user', '33:33', site.wpContainer, 'sh', '-c', 'mkdir -p "$(dirname "$1")" && cat > "$1"', '--', target.absolute], contents, 120_000);
+  await recordActivity({ siteId, siteName: site.name, type: 'developer.file-write', message: `${target.relative} was updated for ${site.name}.` });
+  return { path: `wp-content/${target.relative}`, size: contents.length, savedAt: new Date().toISOString() };
+}
+
+async function runSiteTerminalCommand(siteId, command) {
+  const { site } = await requireRunningSite(siteId);
+  const args = validateDeveloperArguments(command, 30);
+  const executable = args.shift();
+  const allowed = new Set(['cat', 'df', 'du', 'find', 'grep', 'head', 'ls', 'php', 'pwd', 'stat', 'tail']);
+  if (!allowed.has(executable)) throw Object.assign(new Error(`The audited terminal does not allow ${executable}.`), { status: 403 });
+  if (args.some((arg) => arg.includes('\0') || arg === '..' || arg.startsWith('../') || arg.includes('/../'))) throw Object.assign(new Error('Terminal paths must stay inside the site workspace.'), { status: 400 });
+  const workingDirectory = site.kind === 'lovable' ? '/usr/share/nginx/html' : '/var/www/html';
+  if (args.some((arg) => arg.startsWith('/') && arg !== workingDirectory && !arg.startsWith(`${workingDirectory}/`))) throw Object.assign(new Error('Terminal paths must stay inside the site workspace.'), { status: 400 });
+  if (executable === 'find' && args.some((arg) => ['-delete', '-exec', '-execdir', '-fprint', '-fprintf', '-fls', '-ok', '-okdir'].includes(arg))) throw Object.assign(new Error('Mutating find actions are disabled in the audited terminal.'), { status: 403 });
+  if (executable === 'php' && args.some((arg) => !['-i', '--info', '-m', '--modules', '-v', '--version'].includes(arg))) throw Object.assign(new Error('The audited terminal limits PHP to version, module and configuration inspection.'), { status: 403 });
+  if (executable === 'tail' && args.some((arg) => arg === '-f' || arg === '--follow' || arg.startsWith('--follow='))) throw Object.assign(new Error('Follow mode is disabled; request a bounded log read instead.'), { status: 403 });
+  const result = await docker(['exec', '--workdir', workingDirectory, site.wpContainer, executable, ...args], { timeout: 120_000, maxBuffer: 8 * 1024 * 1024 });
+  await recordActivity({ siteId, siteName: site.name, type: 'developer.terminal', message: `An audited container command ran for ${site.name}.` });
+  return { ...result, command: [executable, ...args], workingDirectory, ranAt: new Date().toISOString() };
+}
+
+async function getSiteRuntime(siteId) {
+  const { site, inspect } = await requireRunningSite(siteId);
+  return {
+    container: site.wpContainer,
+    databaseContainer: site.dbContainer || null,
+    image: inspect.Config?.Image || site.image,
+    state: inspect.State?.Status || 'unknown',
+    startedAt: inspect.State?.StartedAt || null,
+    restartCount: Number(inspect.RestartCount || 0),
+    platform: inspect.Platform || null,
+    workingDirectory: inspect.Config?.WorkingDir || null,
+    network: site.network,
+    ports: inspect.NetworkSettings?.Ports || {},
+    resources: { memoryBytes: Number(inspect.HostConfig?.Memory || 0), nanoCpus: Number(inspect.HostConfig?.NanoCpus || 0) },
+    readAt: new Date().toISOString(),
+  };
 }
 
 async function updateSiteMetadata(siteId, input) {
@@ -1599,10 +1948,44 @@ async function createBackup(site) {
   return backup;
 }
 
+async function restoreBackup(site, backupId, scope = 'all') {
+  if (site.kind === 'lovable') throw Object.assign(new Error('Source restore is not yet available for Lovable builds; redeploy from Git instead.'), { status: 409 });
+  if (!['all', 'files', 'database'].includes(scope)) throw Object.assign(new Error('Choose all, files or database for the restore scope.'), { status: 400 });
+  const backup = (Array.isArray(site.backups) ? site.backups : []).find((entry) => entry.id === String(backupId || ''));
+  if (!backup) throw Object.assign(new Error('Backup not found.'), { status: 404 });
+  const siteBackupDir = path.join(backupRoot, site.id);
+  const databaseName = backup.files.find((file) => file.endsWith('-database.sql'));
+  const filesName = backup.files.find((file) => file.endsWith('-wordpress.tar.gz'));
+  if (backup.files.some((file) => path.basename(file) !== file)) throw new Error('The backup contains an invalid file reference.');
+  if ((scope === 'all' || scope === 'database') && !databaseName) throw new Error('This recovery point does not contain a database export.');
+  if ((scope === 'all' || scope === 'files') && !filesName) throw new Error('This recovery point does not contain a WordPress file archive.');
+  await createBackup(site);
+  await docker(['stop', '-t', '20', site.wpContainer]).catch((error) => { if (!/is not running/i.test(error.message)) throw error; });
+  try {
+    await docker(['start', site.dbContainer]).catch((error) => { if (!/is already running/i.test(error.message)) throw error; });
+    await waitForDatabase(site, 120_000);
+    if (scope === 'all' || scope === 'files') {
+      await docker([
+        'run', '--rm', '-v', `${site.wpVolume}:/target`, '-v', `${siteBackupDir}:/backups:ro`, 'alpine:latest',
+        'sh', '-c', 'find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf "/backups/$1" -C /target', '--', filesName,
+      ], { timeout: 600_000 });
+    }
+    if (scope === 'all' || scope === 'database') {
+      await dockerFromFile(['exec', '-i', '-e', `MYSQL_PWD=${site.secrets.dbRootPassword}`, site.dbContainer, 'mariadb', '-uroot', 'wordpress'], path.join(siteBackupDir, databaseName));
+    }
+  } finally {
+    await docker(['start', site.wpContainer]).catch(() => undefined);
+  }
+  await ensureLocalPreviewConfig(site);
+  await ensureControlPlaneMuPlugin(site);
+  await refreshVersions(site);
+  return { backupId: backup.id, scope, restoredAt: new Date().toISOString() };
+}
+
 async function runOperation(siteId, type, input = {}) {
   const site = await requireSite(siteId);
   const operation = String(type || '').replace(/^site\./, '');
-  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'update', 'redeploy', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan', 'delete'].includes(operation)) {
+  if (!['start', 'stop', 'restart', 'refresh', 'backup', 'restore-backup', 'update', 'redeploy', 'update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme', 'scan', 'delete'].includes(operation)) {
     throw Object.assign(new Error('Unsupported operation.'), { status: 400 });
   }
   if (site.phase) throw Object.assign(new Error(`The site is currently ${site.phase.toLowerCase()}.`), { status: 409 });
@@ -1619,6 +2002,7 @@ async function runOperation(siteId, type, input = {}) {
       if (site.kind === 'lovable') await docker(['image', 'rm', '-f', site.image]).catch(() => undefined);
     }
     await updateState((state) => { delete state.sites[site.id]; });
+    await rm(screenshotPath(site.id), { force: true }).catch(() => undefined);
     await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name} was removed${input.deleteData ? ' with its data' : '; volumes were preserved'}.` });
     return { deleted: true };
   }
@@ -1626,6 +2010,7 @@ async function runOperation(siteId, type, input = {}) {
   await setSiteState(site.id, { phase: `${operation[0].toUpperCase()}${operation.slice(1)} in progress`, error: null });
   try {
     if (site.kind === 'lovable') {
+      if (operation === 'restore-backup') throw Object.assign(new Error('Lovable builds are restored by redeploying their Git source.'), { status: 409 });
       if (['update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme'].includes(operation)) {
         throw Object.assign(new Error('WordPress package operations are not available for Lovable sites.'), { status: 409 });
       }
@@ -1667,6 +2052,8 @@ async function runOperation(siteId, type, input = {}) {
       await refreshVersions(site);
     } else if (operation === 'backup') {
       await createBackup(site);
+    } else if (operation === 'restore-backup') {
+      await restoreBackup(site, input.backupId, String(input.restoreScope || 'all'));
     } else if (operation === 'update') {
       await createBackup(site);
       await runWp(site, ['core', 'update'], { timeout: 600_000 });
@@ -1790,6 +2177,17 @@ function send(response, status, payload) {
   response.end(body);
 }
 
+function sendScreenshot(response, screenshot) {
+  response.writeHead(200, {
+    'content-type': 'image/png',
+    'content-length': screenshot.contents.length,
+    'cache-control': 'private, no-cache, must-revalidate',
+    'x-geekheros-captured-at': screenshot.capturedAt,
+    'x-content-type-options': 'nosniff',
+  });
+  response.end(screenshot.contents);
+}
+
 function sendMcpError(response, status, message) {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -1828,11 +2226,21 @@ async function readJson(request, maximumBytes = 1_000_000) {
 
 const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   getSystemInfo: () => systemInfo(false),
-  listActivity: async (limit) => (await readState()).activity.slice(0, limit),
+  listActivity: async ({ limit, siteId }) => (await readState()).activity.filter((entry) => !siteId || entry.siteId === siteId).slice(0, limit),
   listSites,
   launchSite: createSite,
   updateSiteMetadata,
   getSiteInventory,
+  getSiteScreenshot,
+  getSiteMonitoring,
+  getSiteLogs,
+  getSiteRuntime,
+  runSiteWpCli,
+  querySiteDatabase,
+  listSiteFiles,
+  readSiteFile,
+  writeSiteFile,
+  runSiteTerminalCommand,
   issueWordPressLogin: issueOneClickLogin,
   runSiteOperation: runOperation,
   listClients,
@@ -1900,6 +2308,33 @@ const server = createServer(async (request, response) => {
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
     const blueprintMatch = url.pathname.match(/^\/blueprints\/([^/]+)$/);
     if (blueprintMatch && request.method === 'DELETE') return send(response, 200, await deleteBlueprint(decodeURIComponent(blueprintMatch[1])));
+    const screenshotMatch = url.pathname.match(/^\/sites\/([^/]+)\/screenshot$/);
+    if (screenshotMatch && request.method === 'GET') return sendScreenshot(response, await getSiteScreenshot(decodeURIComponent(screenshotMatch[1])));
+    if (screenshotMatch && request.method === 'POST') {
+      const screenshot = await getSiteScreenshot(decodeURIComponent(screenshotMatch[1]), { force: true });
+      return send(response, 200, { screenshot: { capturedAt: screenshot.capturedAt, width: screenshot.width, height: screenshot.height } });
+    }
+    const monitoringMatch = url.pathname.match(/^\/sites\/([^/]+)\/monitoring$/);
+    if (monitoringMatch && request.method === 'GET') return send(response, 200, { monitoring: await getSiteMonitoring(decodeURIComponent(monitoringMatch[1]), { refresh: url.searchParams.get('refresh') === '1' }) });
+    const developerMatch = url.pathname.match(/^\/sites\/([^/]+)\/developer$/);
+    if (developerMatch && request.method === 'GET') {
+      const siteId = decodeURIComponent(developerMatch[1]);
+      const tool = url.searchParams.get('tool');
+      if (tool === 'logs') return send(response, 200, { result: await getSiteLogs(siteId, { lines: url.searchParams.get('lines') }) });
+      if (tool === 'runtime') return send(response, 200, { result: await getSiteRuntime(siteId) });
+      if (tool === 'files') return send(response, 200, { result: await listSiteFiles(siteId, { limit: url.searchParams.get('limit') }) });
+      if (tool === 'file') return send(response, 200, { result: await readSiteFile(siteId, url.searchParams.get('path')) });
+      throw Object.assign(new Error('Choose logs, runtime, files or file.'), { status: 400 });
+    }
+    if (developerMatch && request.method === 'POST') {
+      const siteId = decodeURIComponent(developerMatch[1]);
+      const body = await readJson(request, 5_000_000);
+      if (body.tool === 'wp-cli') return send(response, 200, { result: await runSiteWpCli(siteId, body.args) });
+      if (body.tool === 'database') return send(response, 200, { result: await querySiteDatabase(siteId, body.query, { allowWrites: body.allowWrites === true }) });
+      if (body.tool === 'write-file') return send(response, 200, { result: await writeSiteFile(siteId, body.path, body.content) });
+      if (body.tool === 'terminal') return send(response, 200, { result: await runSiteTerminalCommand(siteId, body.args) });
+      throw Object.assign(new Error('Choose wp-cli, database, write-file or terminal.'), { status: 400 });
+    }
     const siteMatch = url.pathname.match(/^\/sites\/([^/]+)$/);
     if (siteMatch && request.method === 'PATCH') return send(response, 200, { site: await updateSiteMetadata(decodeURIComponent(siteMatch[1]), await readJson(request)) });
     const inventoryMatch = url.pathname.match(/^\/sites\/([^/]+)\/inventory$/);
@@ -1940,6 +2375,10 @@ server.listen(port, host, async () => {
   } catch (error) {
     console.error('Unable to resume pending sites:', error.message);
   }
+  setTimeout(() => void refreshSiteCare(), 5_000).unref();
+  setTimeout(() => void refreshSiteScreenshots(), 15_000).unref();
+  setInterval(() => void refreshSiteCare(), uptimeCheckIntervalMs).unref();
+  setInterval(() => void refreshSiteScreenshots(), screenshotRefreshMs).unref();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
