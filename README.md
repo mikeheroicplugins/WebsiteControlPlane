@@ -33,17 +33,17 @@ Settings JSON supports four top-level fields: `options`, `plugins`, `themes`, an
 
 ## Lovable launches
 
-Connect Lovable from Settings using its OAuth-protected MCP service. The local GeekHeros agent stores the resulting token only in the ignored local state file and reads the authorized account and workspaces. Connect each finished Lovable project to GitHub or GitLab and paste that repository into GeekHeros for self-hosting.
+Connect Lovable from Settings using its OAuth-protected MCP service. The local GeekHeros agent stores the resulting token only in the ignored local state file and reads the authorized account and workspaces. A one-click launch creates the project in the selected workspace, waits for generation, imports its files through Lovable and deploys the result without requiring Git.
 
 GeekHeros then:
 
-- Clones the selected branch without placing repository credentials in the remote URL.
-- Builds the standard Lovable Vite application in a controlled Node.js 22 image.
-- Serves the generated `dist/` bundle from Nginx with React Router fallback support.
+- Creates or connects to the selected Lovable project and imports its current source revision.
+- Builds the application in a controlled Node.js 22 image.
+- Detects modern TanStack Start output and runs its Node server, while retaining an Nginx runtime for static Vite bundles.
 - Creates the same isolated Docker network, Traefik hostname route, resource limits and loopback preview used by WordPress sites.
-- Checks for remote commits, archives source recovery points and rebuilds the application on demand.
+- Checks for new Lovable revisions, archives source recovery points and rebuilds the application on demand.
 
-Private repositories can use an optional access token stored only in the ignored local `.geekheros/state.json` file. Optional frontend build variables must start with `VITE_`; they are compiled into the browser bundle and must not contain server secrets.
+Existing Git-synced Lovable sites remain supported, including private repositories with an optional access token stored only in the ignored local `.geekheros/state.json` file. Optional frontend build variables must start with `VITE_`; they are compiled into the browser bundle and must not contain server secrets.
 
 For immediate local testing, use a hostname such as `client.localhost`. For a public hostname, point its A record to the Docker host and forward ports 80 and 443 through the host firewall/router.
 
@@ -60,7 +60,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 - Open WP Admin using a 60-second, single-use login capability without exposing the administrator password.
 - Route domains to the correct container through Traefik.
 - Record completed and failed operations in the local activity log.
-- Connect a Lovable account, deploy Git-synced source, check for new commits and rebuild its container.
+- Connect a Lovable account, create and deploy projects directly, check for new revisions and rebuild their containers.
 
 ## One-click WP Admin
 

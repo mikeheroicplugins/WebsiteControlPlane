@@ -62,11 +62,13 @@ function createControlPlaneMcpServer(api) {
       adminEmail: z.string().optional(),
       adminPassword: z.string().optional().describe('Required for WordPress; minimum 12 characters.'),
       lovablePrompt: z.string().max(50_000).optional(),
+      sourceProvider: z.enum(['lovable', 'git']).default('lovable').describe('Use lovable for one-click project creation and direct source import, or git for an existing synced repository.'),
+      lovableWorkspaceId: z.string().max(200).optional().describe('Lovable workspace ID from get_lovable_connection. Required when multiple workspaces are available and sourceProvider is lovable.'),
       lovableProjectId: z.string().max(200).optional(),
       lovableProjectUrl: z.string().optional(),
       imageUrls: z.array(z.string().url()).max(10).optional(),
       htmlUrls: z.array(z.string().url()).max(10).optional(),
-      repositoryUrl: z.string().optional(),
+      repositoryUrl: z.string().optional().describe('Required only when sourceProvider is git.'),
       repositoryBranch: z.string().max(200).optional().describe('Optional Lovable Git branch. Omit it to detect the repository default branch automatically.'),
       repositoryToken: z.string().max(500).optional(),
       buildEnvironment: z.record(z.string(), z.string()).optional().describe('Lovable frontend VITE_ variables.'),
@@ -79,8 +81,14 @@ function createControlPlaneMcpServer(api) {
 
   register(server, 'update_site_metadata', {
     title: 'Update site metadata',
-    description: 'Assign or unassign a client and replace the site tags.',
-    inputSchema: z.object({ siteId: siteIdSchema, clientId: z.string().nullable().optional(), tags: z.array(z.string()).max(20).optional() }),
+    description: 'Assign or unassign a client, replace tags, or link a managed Lovable site to an existing Lovable project and workspace.',
+    inputSchema: z.object({
+      siteId: siteIdSchema,
+      clientId: z.string().nullable().optional(),
+      tags: z.array(z.string()).max(20).optional(),
+      lovableProjectId: z.string().min(1).max(200).optional(),
+      lovableWorkspaceId: z.string().min(1).max(200).optional(),
+    }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, ({ siteId, ...input }) => api.updateSiteMetadata(siteId, input));
 

@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -246,11 +246,16 @@ function createLovableClient(provider = createLovableOAuthProvider()) {
   return { client, transport };
 }
 
-function lovableToolPayload(result) {
+function lovableToolText(result) {
   const text = Array.isArray(result?.content)
     ? result.content.filter((item) => item?.type === 'text').map((item) => item.text).join('\n').trim()
     : '';
   if (result?.isError) throw new Error(text || 'Lovable returned an error.');
+  return text;
+}
+
+function lovableToolPayload(result) {
+  const text = lovableToolText(result);
   if (result?.structuredContent && typeof result.structuredContent === 'object') return result.structuredContent;
   if (text) {
     try { return JSON.parse(text); } catch { return { text }; }
@@ -422,13 +427,19 @@ async function disconnectLovable() {
 async function createLovableProject(input) {
   const initialMessage = String(input.initialMessage || '').trim();
   const workspaceId = String(input.workspaceId || '').trim();
+  const wait = input.wait === true;
   if (!initialMessage || initialMessage.length > 100_000) throw Object.assign(new Error('Enter a Lovable prompt up to 100,000 characters.'), { status: 400 });
   if (workspaceId.length > 200) throw Object.assign(new Error('Choose a valid Lovable workspace.'), { status: 400 });
   const created = await withLovableClient(async (client) => {
     const result = lovableToolPayload(await client.callTool({
       name: 'create_project',
-      arguments: { initial_message: initialMessage, ...(workspaceId ? { workspace_id: workspaceId } : {}), wait: false },
-    }));
+      arguments: {
+        initial_message: initialMessage,
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
+        wait,
+        ...(wait ? { timeout_seconds: 600 } : {}),
+      },
+    }, wait ? { timeout: 610_000, resetTimeoutOnProgress: true } : undefined));
     const projectId = String(deepValue(result, ['projectId', 'project_id']) || '');
     if (!projectId) throw new Error('Lovable needs a workspace selection before it can create this project.');
     let details = {};
@@ -439,6 +450,8 @@ async function createLovableProject(input) {
       editorUrl: String(deepValue(details, ['editor_url', 'editorUrl']) || deepValue(result, ['editor_url', 'editorUrl']) || ''),
       previewUrl: String(deepValue(details, ['preview_url', 'previewUrl']) || deepValue(result, ['preview_url', 'previewUrl']) || ''),
       messageId: String(deepValue(result, ['message_id', 'messageId']) || ''),
+      sourceRevision: String(deepValue(details, ['latest_commit_sha', 'latestCommitSha', 'commit_sha', 'commitSha']) || ''),
+      status: String(deepValue(details, ['status', 'build_status', 'buildStatus']) || deepValue(result, ['status']) || ''),
     };
   });
   return created;
@@ -454,10 +467,10 @@ async function docker(args, options = {}) {
     });
     return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
   } catch (error) {
-    const detail = String(error?.stderr || error?.stdout || error?.message || 'Docker command failed')
+    const rawDetail = String(error?.stderr || error?.stdout || error?.message || 'Docker command failed')
       .replace(/password[^\s]*/gi, 'password=[redacted]')
-      .trim()
-      .slice(0, 800);
+      .trim();
+    const detail = rawDetail.length > 2_400 ? `…${rawDetail.slice(-2_400)}` : rawDetail;
     const wrapped = new Error(detail || 'Docker command failed');
     wrapped.code = error?.code;
     throw wrapped;
@@ -654,8 +667,9 @@ function parseReferenceUrls(value, type) {
 }
 
 function validateRepositoryUrl(value) {
+  if (!String(value || '').trim()) return null;
   let repository;
-  try { repository = new URL(String(value || '').trim()); } catch { throw new Error('Enter the Git repository created from the Lovable project.'); }
+  try { repository = new URL(String(value).trim()); } catch { throw new Error('Enter a valid Git repository URL or leave it blank to use Lovable directly.'); }
   if (repository.protocol !== 'https:' || repository.username || repository.password || !['github.com', 'gitlab.com'].includes(repository.hostname.toLowerCase())) {
     throw new Error('Use a credential-free HTTPS GitHub or GitLab repository URL.');
   }
@@ -713,16 +727,20 @@ function validateSiteInput(input) {
     const html = parseReferenceUrls(input.htmlUrls, 'page');
     if (images.length + html.length > 10) throw new Error('Lovable supports up to 10 combined image and page references.');
     const repositoryUrl = validateRepositoryUrl(input.repositoryUrl);
+    const sourceProvider = input.sourceProvider === 'git' ? 'git' : 'lovable';
+    if (sourceProvider === 'git' && !repositoryUrl) throw new Error('Enter a Git repository URL when Git is the selected source.');
     const branch = String(input.repositoryBranch || '').trim();
     if (branch && (branch.length > 200 || branch.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch))) throw new Error('Enter a valid Git branch name or leave it blank to detect the repository default.');
     const repositoryToken = String(input.repositoryToken || '').trim();
     if (repositoryToken.length > 500) throw new Error('The repository access token is too long.');
     const lovableProjectId = String(input.lovableProjectId || '').trim();
     if (lovableProjectId.length > 200) throw new Error('The Lovable project ID is invalid.');
+    const lovableWorkspaceId = String(input.lovableWorkspaceId || '').trim();
+    if (lovableWorkspaceId.length > 200) throw new Error('The Lovable workspace ID is invalid.');
     const lovableProjectUrl = validateLovableProjectUrl(input.lovableProjectUrl);
     return {
-      name, domain, kind, pod, region: 'Local Docker', repositoryUrl, repositoryBranch: branch || null,
-      repositoryToken, lovablePrompt: prompt, lovableProjectId,
+      name, domain, kind, pod, region: 'Local Docker', sourceProvider, repositoryUrl, repositoryBranch: branch || null,
+      repositoryToken, lovablePrompt: prompt, lovableProjectId, lovableWorkspaceId,
       lovableBuildUrl: lovableProjectUrl || buildLovableUrl(prompt, images, html),
       lovableReferences: { images, html }, buildEnvironment: validateBuildEnvironment(input.buildEnvironment),
     };
@@ -1244,6 +1262,210 @@ function lovableSourceDirectory(site) {
   return path.join(sourceRoot, site.id);
 }
 
+async function replaceDirectory(incomingDirectory, destinationDirectory) {
+  await rm(destinationDirectory, { recursive: true, force: true });
+  let lastError;
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    try {
+      await rename(incomingDirectory, destinationDirectory);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!stateReplaceRetryCodes.has(error?.code) || attempt === 6) break;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
+    }
+  }
+  if (process.platform === 'win32' && stateReplaceRetryCodes.has(lastError?.code)) {
+    await mkdir(destinationDirectory, { recursive: true });
+    await cp(incomingDirectory, destinationDirectory, { recursive: true, force: true });
+    await rm(incomingDirectory, { recursive: true, force: true });
+    return;
+  }
+  throw lastError;
+}
+
+function lovableProjectPrompt(site) {
+  const sections = [site.lovablePrompt];
+  const images = Array.isArray(site.lovableReferences?.images) ? site.lovableReferences.images : [];
+  const pages = Array.isArray(site.lovableReferences?.html) ? site.lovableReferences.html : [];
+  if (images.length) sections.push(`Reference images:\n${images.map((url) => `- ${url}`).join('\n')}`);
+  if (pages.length) sections.push(`Reference pages:\n${pages.map((url) => `- ${url}`).join('\n')}`);
+  return sections.filter(Boolean).join('\n\n');
+}
+
+function normalizeLovableSourcePath(value) {
+  const raw = String(value || '').trim().replaceAll('\\', '/');
+  if (!raw || raw.endsWith('/')) return null;
+  const normalized = path.posix.normalize(raw).replace(/^\.\//, '');
+  const parts = normalized.split('/');
+  if (!normalized || normalized === '.' || normalized.startsWith('../') || path.posix.isAbsolute(normalized) || parts.includes('..')) {
+    throw new Error('Lovable returned an unsafe project file path.');
+  }
+  if (parts[0] === '.git' || parts[0] === 'node_modules') return null;
+  return normalized;
+}
+
+function lovableFileEntries(payload) {
+  const source = Array.isArray(payload?.files)
+    ? payload.files
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : [];
+  return source.flatMap((entry) => {
+    const type = typeof entry === 'object' && entry ? String(entry.type || entry.kind || '').toLowerCase() : '';
+    if (['directory', 'dir', 'tree', 'folder'].includes(type)) return [];
+    const filePath = normalizeLovableSourcePath(typeof entry === 'string' ? entry : entry?.path || entry?.file_path || entry?.filePath || entry?.name);
+    return filePath ? [filePath] : [];
+  });
+}
+
+function lovableNextCursor(payload) {
+  return String(payload?.pagination?.next_cursor || payload?.pagination?.nextCursor || payload?.next_cursor || payload?.nextCursor || '');
+}
+
+function lovableFileBuffer(result) {
+  const structured = result?.structuredContent && typeof result.structuredContent === 'object' ? result.structuredContent : null;
+  const encoded = structured ? deepValue(structured, ['content_base64', 'contentBase64', 'base64_content', 'base64Content']) : null;
+  if (typeof encoded === 'string' && encoded) return Buffer.from(encoded, 'base64');
+  const structuredContents = structured ? deepValue(structured, ['content', 'file_content', 'fileContent', 'text']) : null;
+  if (typeof structuredContents === 'string') {
+    const encoding = String(deepValue(structured, ['encoding']) || '').toLowerCase();
+    return Buffer.from(structuredContents, encoding === 'base64' ? 'base64' : 'utf8');
+  }
+
+  const text = lovableToolText(result);
+  try {
+    const parsed = JSON.parse(text);
+    const wrappedContents = deepValue(parsed, ['content', 'file_content', 'fileContent']);
+    if (typeof wrappedContents === 'string') {
+      const encoding = String(deepValue(parsed, ['encoding']) || '').toLowerCase();
+      return Buffer.from(wrappedContents, encoding === 'base64' ? 'base64' : 'utf8');
+    }
+  } catch {}
+  return Buffer.from(text, 'utf8');
+}
+
+async function lovableProjectSnapshot(client, projectId) {
+  const details = lovableToolPayload(await client.callTool({ name: 'get_project', arguments: { project_id: projectId } }));
+  let revision = String(deepValue(details, ['latest_commit_sha', 'latestCommitSha', 'commit_sha', 'commitSha']) || '');
+  if (!revision) {
+    try {
+      const edits = lovableToolPayload(await client.callTool({ name: 'list_edits', arguments: { project_id: projectId, limit: 1 } }));
+      revision = String(deepValue(edits, ['commit_sha', 'commitSha', 'sha']) || '');
+    } catch {}
+  }
+  return {
+    revision,
+    status: String(deepValue(details, ['status', 'build_status', 'buildStatus']) || '').toLowerCase(),
+    editorUrl: String(deepValue(details, ['editor_url', 'editorUrl']) || ''),
+    previewUrl: String(deepValue(details, ['preview_url', 'previewUrl']) || ''),
+  };
+}
+
+async function ensureLovableProject(site) {
+  if (site.lovableProjectId) return { id: site.lovableProjectId };
+  let workspaceId = site.lovableWorkspaceId || '';
+  if (!workspaceId) {
+    const integration = lovableIntegration(await readState());
+    const workspaces = Array.isArray(integration.profile?.workspaces) ? integration.profile.workspaces : [];
+    if (workspaces.length === 1 || (!site.sourceProvider && workspaces.length)) workspaceId = workspaces[0].id;
+  }
+  await setSiteState(site.id, { phase: 'Creating project in Lovable' });
+  const project = await createLovableProject({ initialMessage: lovableProjectPrompt(site), workspaceId, wait: false });
+  await setSiteState(site.id, {
+    lovableProjectId: project.id,
+    lovableWorkspaceId: workspaceId || null,
+    lovableBuildUrl: project.editorUrl || site.lovableBuildUrl,
+    lovablePreviewUrl: project.previewUrl || null,
+    sourceProvider: 'lovable',
+  });
+  return project;
+}
+
+async function materializeLovableProjectSource(site) {
+  const project = await ensureLovableProject(site);
+  const sourceDirectory = lovableSourceDirectory(site);
+  const incomingDirectory = `${sourceDirectory}.incoming-${randomBytes(5).toString('hex')}`;
+  await setSiteState(site.id, { phase: 'Downloading Lovable source' });
+  await mkdir(incomingDirectory, { recursive: true });
+  try {
+    const result = await withLovableClient(async (client) => {
+      const startedAt = Date.now();
+      let snapshot;
+      let entries = [];
+      do {
+        snapshot = await lovableProjectSnapshot(client, project.id);
+        const failed = ['error', 'failed', 'cancelled', 'canceled'].includes(snapshot.status);
+        const generating = ['pending', 'queued', 'creating', 'generating', 'building', 'processing', 'running', 'in_progress', 'in-progress'].includes(snapshot.status);
+        if (failed) throw new Error('Lovable could not finish generating the project. Open the project in Lovable for details, then retry.');
+        const seen = new Set();
+        let cursor = '';
+        let listError = null;
+        try {
+          for (let page = 0; page < 25; page += 1) {
+            const payload = lovableToolPayload(await client.callTool({
+              name: 'list_files',
+              arguments: { project_id: project.id, limit: 100, ...(snapshot.revision ? { ref: snapshot.revision } : {}), ...(cursor ? { cursor } : {}) },
+            }));
+            for (const filePath of lovableFileEntries(payload)) seen.add(filePath);
+            const nextCursor = lovableNextCursor(payload);
+            if (!nextCursor || nextCursor === cursor) break;
+            cursor = nextCursor;
+          }
+        } catch (error) {
+          listError = error;
+        }
+        entries = [...seen].sort((left, right) => left.localeCompare(right));
+        if (entries.length && !generating) break;
+        if (Date.now() - startedAt >= 600_000) {
+          const detail = listError?.message ? ` Lovable last reported: ${listError.message}` : '';
+          throw new Error(`Lovable did not finish generating source files within 10 minutes. Open the project in Lovable, then retry the deployment.${detail}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      } while (true);
+
+      if (entries.length > 2_500) throw new Error('The Lovable project contains too many files to import safely.');
+      const digest = createHash('sha256');
+      let totalBytes = 0;
+      for (let offset = 0; offset < entries.length; offset += 6) {
+        const batch = entries.slice(offset, offset + 6);
+        const files = await Promise.all(batch.map(async (filePath) => {
+          const response = await client.callTool({
+            name: 'read_file',
+            arguments: { project_id: project.id, path: filePath, ...(snapshot.revision ? { ref: snapshot.revision } : {}) },
+          });
+          const contents = lovableFileBuffer(response);
+          if (contents.length > 10 * 1024 * 1024) throw new Error(`The Lovable source file "${filePath}" is too large to import safely.`);
+          return { filePath, contents };
+        }));
+        for (const file of files) {
+          totalBytes += file.contents.length;
+          if (totalBytes > 100 * 1024 * 1024) throw new Error('The Lovable project source is larger than the 100 MB import limit.');
+          const destination = path.join(incomingDirectory, ...file.filePath.split('/'));
+          await mkdir(path.dirname(destination), { recursive: true });
+          await writeFile(destination, file.contents);
+          digest.update(file.filePath).update('\0').update(file.contents).update('\0');
+        }
+      }
+      return { snapshot, revision: snapshot.revision || digest.digest('hex') };
+    });
+
+    await replaceDirectory(incomingDirectory, sourceDirectory);
+    await setSiteState(site.id, {
+      sourceProvider: 'lovable',
+      lovableBuildUrl: result.snapshot.editorUrl || site.lovableBuildUrl,
+      lovablePreviewUrl: result.snapshot.previewUrl || null,
+      repositoryBranch: null,
+    });
+    return { sourceDirectory, revision: result.revision };
+  } catch (error) {
+    await rm(incomingDirectory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 function lovableRepositoryArgs(site) {
   const args = [];
   const repositoryToken = site.secrets?.repositoryToken || '';
@@ -1251,24 +1473,48 @@ function lovableRepositoryArgs(site) {
   return { args, repositoryToken };
 }
 
-async function resolveLovableRepositoryBranch(site) {
+async function inspectLovableRepository(site) {
   const { args, repositoryToken } = lovableRepositoryArgs(site);
   args.push('ls-remote', '--symref', site.repositoryUrl, 'HEAD', 'refs/heads/*');
   const result = await git(args, { secret: repositoryToken, timeout: 120_000 });
-  const references = parseRemoteReferences(result.stdout);
+  return parseRemoteReferences(result.stdout);
+}
+
+async function resolveLovableRepositoryBranch(site) {
+  const references = await inspectLovableRepository(site);
   const repositoryBranch = selectRemoteBranch(references, site.repositoryBranch);
-  if (repositoryBranch !== site.repositoryBranch) await setSiteState(site.id, { repositoryBranch });
+  if (repositoryBranch !== site.repositoryBranch || site.sourceProvider !== 'git') await setSiteState(site.id, { repositoryBranch, sourceProvider: 'git' });
   return { repositoryBranch, references };
 }
 
 async function prepareLovableSource(site) {
-  const sourceDirectory = lovableSourceDirectory(site);
-  const { repositoryBranch } = await resolveLovableRepositoryBranch(site);
   await mkdir(sourceRoot, { recursive: true });
-  await rm(sourceDirectory, { recursive: true, force: true });
-  const { args: cloneArgs, repositoryToken } = lovableRepositoryArgs(site);
-  cloneArgs.push('clone', '--depth', '1', '--branch', repositoryBranch, '--single-branch', site.repositoryUrl, sourceDirectory);
-  await git(cloneArgs, { secret: repositoryToken, timeout: 600_000 });
+  let sourceDirectory;
+  let revision;
+  const directLovableSource = site.sourceProvider === 'lovable' || !site.repositoryUrl;
+  if (directLovableSource) {
+    ({ sourceDirectory, revision } = await materializeLovableProjectSource(site));
+  } else {
+    const references = await inspectLovableRepository(site);
+    if (!site.sourceProvider && references.branches.size === 0) {
+      ({ sourceDirectory, revision } = await materializeLovableProjectSource(site));
+    } else {
+      const repositoryBranch = selectRemoteBranch(references, site.repositoryBranch);
+      sourceDirectory = lovableSourceDirectory(site);
+      const incomingDirectory = `${sourceDirectory}.incoming-${randomBytes(5).toString('hex')}`;
+      const { args: cloneArgs, repositoryToken } = lovableRepositoryArgs(site);
+      cloneArgs.push('clone', '--depth', '1', '--branch', repositoryBranch, '--single-branch', site.repositoryUrl, incomingDirectory);
+      try {
+        await git(cloneArgs, { secret: repositoryToken, timeout: 600_000 });
+        revision = (await git(['-C', incomingDirectory, 'rev-parse', 'HEAD'], { timeout: 30_000 })).stdout;
+        await replaceDirectory(incomingDirectory, sourceDirectory);
+        await setSiteState(site.id, { repositoryBranch, sourceProvider: 'git' });
+      } catch (error) {
+        await rm(incomingDirectory, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }
+    }
+  }
 
   let packageDefinition;
   try { packageDefinition = JSON.parse(await readFile(path.join(sourceDirectory, 'package.json'), 'utf8')); } catch {
@@ -1278,22 +1524,42 @@ async function prepareLovableSource(site) {
 
   const buildKeys = Object.keys(site.buildEnvironment || {});
   const environmentLines = buildKeys.flatMap((key) => [`ARG ${key}`, `ENV ${key}=\${${key}}`]);
-  const dockerfile = [
+  const packageDependencies = { ...(packageDefinition.dependencies || {}), ...(packageDefinition.devDependencies || {}) };
+  const usesTanStackStart = Boolean(packageDependencies['@tanstack/react-start']);
+  const buildEnvironmentLines = usesTanStackStart ? ['ENV NITRO_PRESET=node-server'] : [];
+  const buildStage = [
     'FROM node:22-alpine AS build',
     'WORKDIR /app',
     'COPY package*.json ./',
     'RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi',
     'COPY . .',
     ...environmentLines,
+    ...buildEnvironmentLines,
     'RUN npm run build',
     '',
-    'FROM nginx:1.27-alpine',
-    'COPY --from=build /app/dist /usr/share/nginx/html',
-    'COPY .geekheros-nginx.conf /etc/nginx/conf.d/default.conf',
-    'EXPOSE 80',
-    'HEALTHCHECK --interval=10s --timeout=3s --retries=6 CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1',
-    '',
-  ].join('\n');
+  ];
+  const runtimeStage = usesTanStackStart
+    ? [
+      'FROM node:22-alpine',
+      'WORKDIR /app',
+      'COPY --from=build /app/.output ./.output',
+      'ENV NODE_ENV=production',
+      'ENV HOST=0.0.0.0',
+      'ENV PORT=80',
+      'EXPOSE 80',
+      'HEALTHCHECK --interval=10s --timeout=3s --retries=6 CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1',
+      'CMD ["node", ".output/server/index.mjs"]',
+      '',
+    ]
+    : [
+      'FROM nginx:1.27-alpine',
+      'COPY --from=build /app/dist /usr/share/nginx/html',
+      'COPY .geekheros-nginx.conf /etc/nginx/conf.d/default.conf',
+      'EXPOSE 80',
+      'HEALTHCHECK --interval=10s --timeout=3s --retries=6 CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1',
+      '',
+    ];
+  const dockerfile = [...buildStage, ...runtimeStage].join('\n');
   const nginx = [
     'server {',
     '  listen 80;',
@@ -1306,9 +1572,8 @@ async function prepareLovableSource(site) {
     '',
   ].join('\n');
   await writeFile(path.join(sourceDirectory, '.geekheros.Dockerfile'), dockerfile, 'utf8');
-  await writeFile(path.join(sourceDirectory, '.geekheros.Dockerfile.dockerignore'), ['.git', 'node_modules', 'dist', '.env*', '*.log', ''].join('\n'), 'utf8');
+  await writeFile(path.join(sourceDirectory, '.geekheros.Dockerfile.dockerignore'), ['.git', 'node_modules', 'dist', '.output', '.env*', '*.log', ''].join('\n'), 'utf8');
   await writeFile(path.join(sourceDirectory, '.geekheros-nginx.conf'), nginx, 'utf8');
-  const revision = (await git(['-C', sourceDirectory, 'rev-parse', 'HEAD'], { timeout: 30_000 })).stdout;
   return { sourceDirectory, revision };
 }
 
@@ -1345,7 +1610,7 @@ async function ensureLovableContainer(site, recreate = false) {
 }
 
 async function deployLovableSite(site, recreate = false) {
-  await setSiteState(site.id, { phase: 'Cloning Lovable source', error: null });
+  await setSiteState(site.id, { phase: 'Preparing Lovable source', error: null });
   const revision = await buildLovableImage(site);
   await setSiteState(site.id, { phase: 'Starting Lovable build' });
   await ensureLovableContainer(site, recreate);
@@ -1358,6 +1623,19 @@ async function deployLovableSite(site, recreate = false) {
 }
 
 async function refreshLovableSourceStatus(site) {
+  if (site.sourceProvider === 'lovable' || site.lovableProjectId) {
+    if (!site.lovableProjectId) throw new Error('Deploy this site once to create its Lovable project before checking for source changes.');
+    const snapshot = await withLovableClient((client) => lovableProjectSnapshot(client, site.lovableProjectId));
+    const remoteRevision = snapshot.revision || null;
+    if (!remoteRevision) throw new Error('Lovable has not produced the project’s first source revision yet.');
+    const updates = site.sourceRevision && site.sourceRevision !== remoteRevision ? 1 : 0;
+    await setSiteState(site.id, {
+      sourceProvider: 'lovable', remoteRevision, updates, lastScannedAt: new Date().toISOString(),
+      lovableBuildUrl: snapshot.editorUrl || site.lovableBuildUrl,
+      lovablePreviewUrl: snapshot.previewUrl || site.lovablePreviewUrl || null,
+    });
+    return { remoteRevision, updates };
+  }
   const { repositoryBranch, references } = await resolveLovableRepositoryBranch(site);
   const remoteRevision = references.branches.get(repositoryBranch) || null;
   if (!remoteRevision) throw new Error(`The configured Lovable repository branch "${repositoryBranch}" could not be found.`);
@@ -1481,6 +1759,21 @@ async function createSite(input) {
   try { values = validateSiteInput(input); } catch (error) { throw Object.assign(error, { status: Number(error?.status) || 400 }); }
   const state = await readState();
   if (Object.values(state.sites).some((site) => site.domain === values.domain)) throw new Error('That domain is already managed by GeekHeros.');
+  if (values.kind === 'lovable' && values.sourceProvider === 'lovable') {
+    const integration = lovableIntegration(state);
+    if (!integration.tokens) throw Object.assign(new Error('Connect Lovable in Settings before launching directly from Lovable.'), { status: 409 });
+    const workspaces = Array.isArray(integration.profile?.workspaces) ? integration.profile.workspaces : [];
+    if (!values.lovableProjectId && !workspaces.length) {
+      throw Object.assign(new Error('The connected Lovable account does not expose a workspace where GeekHeros can create this project.'), { status: 409 });
+    }
+    if (!values.lovableProjectId && !values.lovableWorkspaceId && workspaces.length === 1) values.lovableWorkspaceId = workspaces[0].id;
+    if (!values.lovableProjectId && !values.lovableWorkspaceId && workspaces.length > 1) {
+      throw Object.assign(new Error('Choose the Lovable workspace where GeekHeros should create this project.'), { status: 400 });
+    }
+    if (values.lovableWorkspaceId && !workspaces.some((workspace) => workspace.id === values.lovableWorkspaceId)) {
+      throw Object.assign(new Error('The selected Lovable workspace is no longer available. Refresh the connection and choose another workspace.'), { status: 400 });
+    }
+  }
   const blueprint = values.kind === 'wordpress' && values.blueprintId ? state.blueprints[values.blueprintId] : null;
   if (values.kind === 'wordpress' && values.blueprintId && !blueprint) throw Object.assign(new Error('The selected WordPress blueprint no longer exists.'), { status: 400 });
   const clientId = input.clientId ? String(input.clientId) : null;
@@ -1539,7 +1832,10 @@ function publicSite(site, inspect) {
     lastScannedAt: site.lastScannedAt || null, updateCounts: site.updateCounts || { core: 0, plugins: 0, themes: 0 },
     repositoryUrl: site.kind === 'lovable' ? site.repositoryUrl : null,
     repositoryBranch: site.kind === 'lovable' ? site.repositoryBranch : null,
+    sourceProvider: site.kind === 'lovable' ? site.sourceProvider || (site.lovableProjectId ? 'lovable' : 'git') : null,
     sourceRevision: site.kind === 'lovable' ? site.sourceRevision || null : null,
+    lovableProjectId: site.kind === 'lovable' ? site.lovableProjectId || null : null,
+    lovableWorkspaceId: site.kind === 'lovable' ? site.lovableWorkspaceId || null : null,
     lovableBuildUrl: site.kind === 'lovable' ? site.lovableBuildUrl : null,
     screenshot: site.screenshot ? { capturedAt: site.screenshot.capturedAt, width: site.screenshot.width, height: site.screenshot.height } : null,
     monitoring: monitoringSummary(site),
@@ -1797,13 +2093,13 @@ async function writeSiteFile(siteId, filePath, content) {
 }
 
 async function runSiteTerminalCommand(siteId, command) {
-  const { site } = await requireRunningSite(siteId);
+  const { site, inspect } = await requireRunningSite(siteId);
   const args = validateDeveloperArguments(command, 30);
   const executable = args.shift();
   const allowed = new Set(['cat', 'df', 'du', 'find', 'grep', 'head', 'ls', 'php', 'pwd', 'stat', 'tail']);
   if (!allowed.has(executable)) throw Object.assign(new Error(`The audited terminal does not allow ${executable}.`), { status: 403 });
   if (args.some((arg) => arg.includes('\0') || arg === '..' || arg.startsWith('../') || arg.includes('/../'))) throw Object.assign(new Error('Terminal paths must stay inside the site workspace.'), { status: 400 });
-  const workingDirectory = site.kind === 'lovable' ? '/usr/share/nginx/html' : '/var/www/html';
+  const workingDirectory = site.kind === 'lovable' ? inspect.Config?.WorkingDir || '/usr/share/nginx/html' : '/var/www/html';
   if (args.some((arg) => arg.startsWith('/') && arg !== workingDirectory && !arg.startsWith(`${workingDirectory}/`))) throw Object.assign(new Error('Terminal paths must stay inside the site workspace.'), { status: 400 });
   if (executable === 'find' && args.some((arg) => ['-delete', '-exec', '-execdir', '-fprint', '-fprintf', '-fls', '-ok', '-okdir'].includes(arg))) throw Object.assign(new Error('Mutating find actions are disabled in the audited terminal.'), { status: 403 });
   if (executable === 'php' && args.some((arg) => !['-i', '--info', '-m', '--modules', '-v', '--version'].includes(arg))) throw Object.assign(new Error('The audited terminal limits PHP to version, module and configuration inspection.'), { status: 403 });
@@ -1842,9 +2138,21 @@ async function updateSiteMetadata(siteId, input) {
     patch.clientId = clientId;
   }
   if (Object.hasOwn(input, 'tags')) patch.tags = validateTags(input.tags);
+  if (site.kind === 'lovable' && Object.hasOwn(input, 'lovableProjectId')) {
+    const lovableProjectId = String(input.lovableProjectId || '').trim();
+    if (!lovableProjectId || lovableProjectId.length > 200) throw new Error('Enter a valid Lovable project ID.');
+    patch.lovableProjectId = lovableProjectId;
+    patch.sourceProvider = 'lovable';
+  }
+  if (site.kind === 'lovable' && Object.hasOwn(input, 'lovableWorkspaceId')) {
+    const lovableWorkspaceId = String(input.lovableWorkspaceId || '').trim();
+    const workspaces = lovableIntegration(state).profile?.workspaces || [];
+    if (!lovableWorkspaceId || !workspaces.some((workspace) => workspace.id === lovableWorkspaceId)) throw new Error('Choose an available Lovable workspace.');
+    patch.lovableWorkspaceId = lovableWorkspaceId;
+  }
   await setSiteState(siteId, patch);
   const current = await requireSite(siteId);
-  await recordActivity({ siteId, siteName: site.name, type: 'metadata', message: `${site.name} client and tags were updated.` });
+  await recordActivity({ siteId, siteName: site.name, type: 'metadata', message: `${site.name} settings were updated.` });
   return publicSite(current, await inspectContainer(current.wpContainer));
 }
 
@@ -1967,7 +2275,7 @@ async function createBackup(site) {
 }
 
 async function restoreBackup(site, backupId, scope = 'all') {
-  if (site.kind === 'lovable') throw Object.assign(new Error('Source restore is not yet available for Lovable builds; redeploy from Git instead.'), { status: 409 });
+  if (site.kind === 'lovable') throw Object.assign(new Error('Source restore is not yet available for Lovable builds; redeploy the current source instead.'), { status: 409 });
   if (!['all', 'files', 'database'].includes(scope)) throw Object.assign(new Error('Choose all, files or database for the restore scope.'), { status: 400 });
   const backup = (Array.isArray(site.backups) ? site.backups : []).find((entry) => entry.id === String(backupId || ''));
   if (!backup) throw Object.assign(new Error('Backup not found.'), { status: 404 });
@@ -2028,7 +2336,7 @@ async function runOperation(siteId, type, input = {}) {
   await setSiteState(site.id, { phase: `${operation[0].toUpperCase()}${operation.slice(1)} in progress`, error: null });
   try {
     if (site.kind === 'lovable') {
-      if (operation === 'restore-backup') throw Object.assign(new Error('Lovable builds are restored by redeploying their Git source.'), { status: 409 });
+      if (operation === 'restore-backup') throw Object.assign(new Error('Lovable builds are restored by redeploying their current source.'), { status: 409 });
       if (['update-core', 'update-plugins', 'update-themes', 'activate-plugin', 'deactivate-plugin', 'activate-theme'].includes(operation)) {
         throw Object.assign(new Error('WordPress package operations are not available for Lovable sites.'), { status: 409 });
       }
