@@ -67,7 +67,7 @@ function createControlPlaneMcpServer(api) {
       imageUrls: z.array(z.string().url()).max(10).optional(),
       htmlUrls: z.array(z.string().url()).max(10).optional(),
       repositoryUrl: z.string().optional(),
-      repositoryBranch: z.string().default('main'),
+      repositoryBranch: z.string().max(200).optional().describe('Optional Lovable Git branch. Omit it to detect the repository default branch automatically.'),
       repositoryToken: z.string().max(500).optional(),
       buildEnvironment: z.record(z.string(), z.string()).optional().describe('Lovable frontend VITE_ variables.'),
     }),

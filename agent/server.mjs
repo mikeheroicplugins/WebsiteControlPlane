@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { toNodeHandler } from '@modelcontextprotocol/node';
+import { parseRemoteReferences, selectRemoteBranch } from './git-remote.mjs';
 import { controlPlaneMcpToolCount, createControlPlaneMcpHandler } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -712,15 +713,15 @@ function validateSiteInput(input) {
     const html = parseReferenceUrls(input.htmlUrls, 'page');
     if (images.length + html.length > 10) throw new Error('Lovable supports up to 10 combined image and page references.');
     const repositoryUrl = validateRepositoryUrl(input.repositoryUrl);
-    const branch = String(input.repositoryBranch || 'main').trim();
-    if (!branch || branch.length > 200 || branch.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) throw new Error('Enter a valid Git branch name.');
+    const branch = String(input.repositoryBranch || '').trim();
+    if (branch && (branch.length > 200 || branch.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch))) throw new Error('Enter a valid Git branch name or leave it blank to detect the repository default.');
     const repositoryToken = String(input.repositoryToken || '').trim();
     if (repositoryToken.length > 500) throw new Error('The repository access token is too long.');
     const lovableProjectId = String(input.lovableProjectId || '').trim();
     if (lovableProjectId.length > 200) throw new Error('The Lovable project ID is invalid.');
     const lovableProjectUrl = validateLovableProjectUrl(input.lovableProjectUrl);
     return {
-      name, domain, kind, pod, region: 'Local Docker', repositoryUrl, repositoryBranch: branch,
+      name, domain, kind, pod, region: 'Local Docker', repositoryUrl, repositoryBranch: branch || null,
       repositoryToken, lovablePrompt: prompt, lovableProjectId,
       lovableBuildUrl: lovableProjectUrl || buildLovableUrl(prompt, images, html),
       lovableReferences: { images, html }, buildEnvironment: validateBuildEnvironment(input.buildEnvironment),
@@ -1243,14 +1244,30 @@ function lovableSourceDirectory(site) {
   return path.join(sourceRoot, site.id);
 }
 
+function lovableRepositoryArgs(site) {
+  const args = [];
+  const repositoryToken = site.secrets?.repositoryToken || '';
+  if (repositoryToken) args.push('-c', `http.extraHeader=Authorization: Bearer ${repositoryToken}`);
+  return { args, repositoryToken };
+}
+
+async function resolveLovableRepositoryBranch(site) {
+  const { args, repositoryToken } = lovableRepositoryArgs(site);
+  args.push('ls-remote', '--symref', site.repositoryUrl, 'HEAD', 'refs/heads/*');
+  const result = await git(args, { secret: repositoryToken, timeout: 120_000 });
+  const references = parseRemoteReferences(result.stdout);
+  const repositoryBranch = selectRemoteBranch(references, site.repositoryBranch);
+  if (repositoryBranch !== site.repositoryBranch) await setSiteState(site.id, { repositoryBranch });
+  return { repositoryBranch, references };
+}
+
 async function prepareLovableSource(site) {
   const sourceDirectory = lovableSourceDirectory(site);
+  const { repositoryBranch } = await resolveLovableRepositoryBranch(site);
   await mkdir(sourceRoot, { recursive: true });
   await rm(sourceDirectory, { recursive: true, force: true });
-  const cloneArgs = [];
-  const repositoryToken = site.secrets?.repositoryToken || '';
-  if (repositoryToken) cloneArgs.push('-c', `http.extraHeader=Authorization: Bearer ${repositoryToken}`);
-  cloneArgs.push('clone', '--depth', '1', '--branch', site.repositoryBranch || 'main', '--single-branch', site.repositoryUrl, sourceDirectory);
+  const { args: cloneArgs, repositoryToken } = lovableRepositoryArgs(site);
+  cloneArgs.push('clone', '--depth', '1', '--branch', repositoryBranch, '--single-branch', site.repositoryUrl, sourceDirectory);
   await git(cloneArgs, { secret: repositoryToken, timeout: 600_000 });
 
   let packageDefinition;
@@ -1341,15 +1358,11 @@ async function deployLovableSite(site, recreate = false) {
 }
 
 async function refreshLovableSourceStatus(site) {
-  const repositoryToken = site.secrets?.repositoryToken || '';
-  const args = [];
-  if (repositoryToken) args.push('-c', `http.extraHeader=Authorization: Bearer ${repositoryToken}`);
-  args.push('ls-remote', '--heads', site.repositoryUrl, `refs/heads/${site.repositoryBranch || 'main'}`);
-  const result = await git(args, { secret: repositoryToken, timeout: 120_000 });
-  const remoteRevision = result.stdout.split(/\s+/)[0] || null;
-  if (!remoteRevision) throw new Error('The configured Lovable repository branch could not be found.');
+  const { repositoryBranch, references } = await resolveLovableRepositoryBranch(site);
+  const remoteRevision = references.branches.get(repositoryBranch) || null;
+  if (!remoteRevision) throw new Error(`The configured Lovable repository branch "${repositoryBranch}" could not be found.`);
   const updates = site.sourceRevision && site.sourceRevision !== remoteRevision ? 1 : 0;
-  await setSiteState(site.id, { remoteRevision, updates, lastScannedAt: new Date().toISOString() });
+  await setSiteState(site.id, { repositoryBranch, remoteRevision, updates, lastScannedAt: new Date().toISOString() });
   return { remoteRevision, updates };
 }
 
@@ -2030,7 +2043,7 @@ async function runOperation(siteId, type, input = {}) {
       } else if (operation === 'backup') {
         await createBackup(site);
       } else if (operation === 'update' || operation === 'redeploy') {
-        await createBackup(site);
+        if (site.sourceRevision) await createBackup(site);
         await deployLovableSite(site, true);
       } else if (operation === 'scan') {
         await refreshLovableSourceStatus(site);
