@@ -103,7 +103,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 7, sites: {}, clients: {}, blueprints: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 8, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
 }
 
 async function readState() {
@@ -120,10 +120,11 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 7,
+      version: 8,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
+      agents: parsed.agents || {},
       activity: parsed.activity || [],
       integrations: {
         ...base.integrations,
@@ -2432,6 +2433,237 @@ async function runOperation(siteId, type, input = {}) {
   }
 }
 
+const mcpAgentConnectedWindowMs = 2 * 60 * 1000;
+const mcpAgentIdleWindowMs = 30 * 60 * 1000;
+
+function cleanMcpTelemetryText(value, maximum = 240) {
+  return String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maximum);
+}
+
+function mcpAgentIdentity(request) {
+  const ip = cleanMcpTelemetryText(request.socket?.remoteAddress || 'unknown', 80).replace(/^::ffff:/, '');
+  const userAgent = cleanMcpTelemetryText(request.headers['user-agent'] || 'Unknown MCP client');
+  const fingerprint = createHash('sha256').update(`${ip}\0${userAgent}`).digest('hex').slice(0, 12);
+  const sessionHeader = cleanMcpTelemetryText(request.headers['mcp-session-id'] || '', 500);
+  const sessionIdHash = sessionHeader ? createHash('sha256').update(sessionHeader).digest('hex').slice(0, 12) : null;
+  const local = ip === '127.0.0.1' || ip === '::1';
+  const platform = /windows/i.test(userAgent) ? 'Windows'
+    : /macintosh|mac os/i.test(userAgent) ? 'macOS'
+      : /linux/i.test(userAgent) ? 'Linux'
+        : /node|undici/i.test(userAgent) ? 'Node.js'
+          : 'Unknown';
+  return {
+    id: `agent_${fingerprint}`,
+    ip,
+    local,
+    platform,
+    userAgent,
+    origin: cleanMcpTelemetryText(request.headers.origin || '', 240) || null,
+    remotePort: Number(request.socket?.remotePort || 0) || null,
+    sessionIdHash,
+    transport: 'Streamable HTTP',
+  };
+}
+
+function mcpAgentConnectionStatus(agent, now = Date.now()) {
+  if (agent.revokedAt) return 'Removed';
+  if (agent.restartRequestedAt) return 'Restarting';
+  if (!agent.lastSeenAt) return 'Offline';
+  const age = now - new Date(agent.lastSeenAt).getTime();
+  if (age <= mcpAgentConnectedWindowMs) return 'Connected';
+  if (age <= mcpAgentIdleWindowMs) return 'Idle';
+  return 'Offline';
+}
+
+function publicMcpAgent(agent) {
+  const name = agent.clientTitle || agent.clientName || cleanMcpTelemetryText(agent.userAgent).split(/[ /]/)[0] || 'MCP agent';
+  return {
+    id: agent.id,
+    name,
+    clientName: agent.clientName || null,
+    clientTitle: agent.clientTitle || null,
+    clientVersion: agent.clientVersion || null,
+    protocolVersion: agent.protocolVersion || null,
+    capabilities: Array.isArray(agent.capabilities) ? agent.capabilities : [],
+    ip: agent.ip,
+    local: agent.local === true,
+    platform: agent.platform || 'Unknown',
+    userAgent: agent.userAgent,
+    origin: agent.origin || null,
+    remotePort: agent.remotePort || null,
+    sessionIdHash: agent.sessionIdHash || null,
+    transport: agent.transport || 'Streamable HTTP',
+    status: mcpAgentConnectionStatus(agent),
+    firstSeenAt: agent.firstSeenAt,
+    connectedAt: agent.connectedAt || agent.firstSeenAt,
+    lastSeenAt: agent.lastSeenAt || null,
+    lastMethod: agent.lastMethod || null,
+    lastTool: agent.lastTool || null,
+    requestCount: Number(agent.requestCount || 0),
+    toolCallCount: Number(agent.toolCallCount || 0),
+    errorCount: Number(agent.errorCount || 0),
+    deniedCount: Number(agent.deniedCount || 0),
+    restartCount: Number(agent.restartCount || 0),
+    lastResponseStatus: Number(agent.lastResponseStatus || 0) || null,
+    lastLatencyMs: Number(agent.lastLatencyMs || 0) || null,
+    averageLatencyMs: Number(agent.averageLatencyMs || 0) || null,
+    restartRequestedAt: agent.restartRequestedAt || null,
+    revokedAt: agent.revokedAt || null,
+  };
+}
+
+async function listMcpAgents() {
+  const state = await readState();
+  return Object.values(state.agents || {}).map(publicMcpAgent).sort((left, right) => {
+    const statusOrder = { Connected: 0, Restarting: 1, Idle: 2, Offline: 3, Removed: 4 };
+    return (statusOrder[left.status] ?? 9) - (statusOrder[right.status] ?? 9)
+      || String(right.lastSeenAt || right.firstSeenAt).localeCompare(String(left.lastSeenAt || left.firstSeenAt));
+  });
+}
+
+async function manageMcpAgent(agentId, action) {
+  const id = String(agentId || '');
+  const operation = String(action || '');
+  if (!/^agent_[a-f0-9]{12}$/.test(id)) throw Object.assign(new Error('Choose a valid MCP agent.'), { status: 400 });
+  if (!['restart', 'remove', 'restore', 'forget'].includes(operation)) throw Object.assign(new Error('Choose restart, remove, restore or forget.'), { status: 400 });
+  const result = await updateState((state) => {
+    state.agents ||= {};
+    const agent = state.agents[id];
+    if (!agent) throw Object.assign(new Error('MCP agent not found.'), { status: 404 });
+    const now = new Date().toISOString();
+    if (operation === 'forget') {
+      if (!agent.revokedAt) throw Object.assign(new Error('Remove the agent before forgetting its telemetry record.'), { status: 409 });
+      delete state.agents[id];
+      return { forgotten: true, agent: publicMcpAgent(agent) };
+    }
+    if (operation === 'restart') {
+      if (agent.revokedAt) throw Object.assign(new Error('Restore this agent before restarting its connection tracking.'), { status: 409 });
+      agent.restartRequestedAt = now;
+      agent.lastSeenAt = null;
+      agent.restartCount = Number(agent.restartCount || 0) + 1;
+    } else if (operation === 'remove') {
+      agent.revokedAt = now;
+      agent.restartRequestedAt = null;
+    } else if (operation === 'restore') {
+      agent.revokedAt = null;
+      agent.restartRequestedAt = null;
+      agent.lastSeenAt = null;
+      agent.connectedAt = null;
+    }
+    agent.updatedAt = now;
+    return { forgotten: false, agent: publicMcpAgent(agent) };
+  });
+  const label = result.agent.name || result.agent.id;
+  const messages = {
+    restart: `${label}: MCP connection tracking was restarted.`,
+    remove: `${label}: MCP access was removed.`,
+    restore: `${label}: MCP access was restored.`,
+    forget: `${label}: MCP telemetry was forgotten.`,
+  };
+  await recordActivity({ siteId: id, siteName: label, type: `agent.${operation}`, message: messages[operation] });
+  return result.forgotten ? { forgotten: true, agentId: id } : { agent: result.agent };
+}
+
+async function recordMcpAgentRequest(identity, requestTelemetry) {
+  await updateState((state) => {
+    state.agents ||= {};
+    const now = new Date().toISOString();
+    const existing = state.agents[identity.id] || {};
+    const agent = state.agents[identity.id] = {
+      ...existing,
+      ...identity,
+      id: identity.id,
+      firstSeenAt: existing.firstSeenAt || now,
+      connectedAt: existing.connectedAt || now,
+      lastSeenAt: now,
+      updatedAt: now,
+      requestCount: Number(existing.requestCount || 0) + 1,
+    };
+    if (requestTelemetry.clientInfo) {
+      agent.clientName = cleanMcpTelemetryText(requestTelemetry.clientInfo.name, 120) || null;
+      agent.clientTitle = cleanMcpTelemetryText(requestTelemetry.clientInfo.title, 160) || null;
+      agent.clientVersion = cleanMcpTelemetryText(requestTelemetry.clientInfo.version, 80) || null;
+    }
+    if (requestTelemetry.protocolVersion) agent.protocolVersion = cleanMcpTelemetryText(requestTelemetry.protocolVersion, 80);
+    if (requestTelemetry.capabilities) agent.capabilities = Object.keys(requestTelemetry.capabilities).map((value) => cleanMcpTelemetryText(value, 80)).filter(Boolean).slice(0, 20);
+    if (requestTelemetry.method) agent.lastMethod = cleanMcpTelemetryText(requestTelemetry.method, 120);
+    if (requestTelemetry.tool) {
+      agent.lastTool = cleanMcpTelemetryText(requestTelemetry.tool, 120);
+      agent.toolCallCount = Number(existing.toolCallCount || 0) + 1;
+    }
+    if (agent.restartRequestedAt && !agent.revokedAt) {
+      agent.restartRequestedAt = null;
+      agent.connectedAt = now;
+    }
+  });
+}
+
+async function recordMcpAgentResponse(agentId, status, latencyMs) {
+  await updateState((state) => {
+    const agent = state.agents?.[agentId];
+    if (!agent) return;
+    const samples = Number(agent.latencySamples || 0);
+    const latency = Math.max(0, Math.round(latencyMs));
+    agent.lastResponseStatus = Number(status || 0) || null;
+    agent.lastLatencyMs = latency;
+    agent.averageLatencyMs = Math.round(((Number(agent.averageLatencyMs || 0) * samples) + latency) / (samples + 1));
+    agent.latencySamples = samples + 1;
+    if (Number(status || 0) >= 400) agent.errorCount = Number(agent.errorCount || 0) + 1;
+    agent.updatedAt = new Date().toISOString();
+  });
+}
+
+async function recordMcpAgentDenied(identity) {
+  await updateState((state) => {
+    const agent = state.agents?.[identity.id];
+    if (!agent) return;
+    agent.deniedCount = Number(agent.deniedCount || 0) + 1;
+    agent.lastDeniedAt = new Date().toISOString();
+    agent.updatedAt = agent.lastDeniedAt;
+  });
+}
+
+function observeMcpRequest(request, response, identity) {
+  const startedAt = performance.now();
+  const chunks = [];
+  let capturedBytes = 0;
+  let truncated = false;
+  request.on('data', (chunk) => {
+    if (truncated) return;
+    capturedBytes += chunk.length;
+    if (capturedBytes > 128 * 1024) {
+      truncated = true;
+      chunks.length = 0;
+      return;
+    }
+    chunks.push(Buffer.from(chunk));
+  });
+  request.once('end', () => {
+    let requestTelemetry = { method: request.method || null };
+    if (!truncated && chunks.length) {
+      try {
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const messages = Array.isArray(payload) ? payload : [payload];
+        const initialize = messages.find((message) => message?.method === 'initialize');
+        const toolCall = messages.find((message) => message?.method === 'tools/call');
+        const message = toolCall || initialize || messages.find((entry) => entry?.method);
+        requestTelemetry = {
+          method: cleanMcpTelemetryText(message?.method || request.method, 120),
+          tool: cleanMcpTelemetryText(toolCall?.params?.name || '', 120) || null,
+          clientInfo: initialize?.params?.clientInfo || null,
+          protocolVersion: initialize?.params?.protocolVersion || null,
+          capabilities: initialize?.params?.capabilities || null,
+        };
+      } catch {}
+    }
+    void recordMcpAgentRequest(identity, requestTelemetry).catch((error) => console.error('Unable to record MCP agent request:', error.message));
+  });
+  const recordResponse = () => void recordMcpAgentResponse(identity.id, response.statusCode, performance.now() - startedAt)
+    .catch((error) => console.error('Unable to record MCP agent response:', error.message));
+  response.once('finish', recordResponse);
+  response.once('close', () => { if (!response.writableFinished) recordResponse(); });
+}
+
 function mcpConnectionConfiguration(token) {
   const connectionHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
   const url = `http://${connectionHost}:${port}/mcp`;
@@ -2589,6 +2821,8 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   listBlueprints,
   createBlueprint,
   deleteBlueprint,
+  listMcpAgents,
+  manageMcpAgent,
   getLovableConnection,
   startLovableConnection,
   disconnectLovable,
@@ -2631,6 +2865,13 @@ const server = createServer(async (request, response) => {
       if (contentLength > 105_000_000) return sendMcpError(response, 413, 'MCP request body is too large.');
       const expected = await ensureMcpToken();
       if (!secureTokenMatches(expected, bearerToken(request))) return sendMcpError(response, 401, 'MCP authentication failed.');
+      const identity = mcpAgentIdentity(request);
+      const registeredAgent = (await readState()).agents?.[identity.id];
+      if (registeredAgent?.revokedAt) {
+        await recordMcpAgentDenied(identity);
+        return sendMcpError(response, 403, 'This MCP agent was removed in GeekHeros. Restore it from the Agents page before reconnecting.');
+      }
+      observeMcpRequest(request, response, identity);
       return handleMcpRequest(request, response);
     } catch (error) {
       console.error('MCP endpoint failed:', error.message);
@@ -2650,6 +2891,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/blueprints') return send(response, 200, { blueprints: await listBlueprints() });
     if (request.method === 'POST' && url.pathname === '/blueprints') return send(response, 201, { blueprint: await createBlueprint(await readJson(request, 105_000_000)) });
+    if (request.method === 'GET' && url.pathname === '/agents') return send(response, 200, { agents: await listMcpAgents() });
     if (request.method === 'GET' && url.pathname === '/clients') return send(response, 200, { clients: await listClients() });
     if (request.method === 'POST' && url.pathname === '/clients') return send(response, 201, { client: await createClient(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/activity') {
@@ -2661,6 +2903,11 @@ const server = createServer(async (request, response) => {
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
     const blueprintMatch = url.pathname.match(/^\/blueprints\/([^/]+)$/);
     if (blueprintMatch && request.method === 'DELETE') return send(response, 200, await deleteBlueprint(decodeURIComponent(blueprintMatch[1])));
+    const agentActionMatch = url.pathname.match(/^\/agents\/([^/]+)\/actions$/);
+    if (agentActionMatch && request.method === 'POST') {
+      const body = await readJson(request);
+      return send(response, 200, await manageMcpAgent(decodeURIComponent(agentActionMatch[1]), body.action));
+    }
     const screenshotMatch = url.pathname.match(/^\/sites\/([^/]+)\/screenshot$/);
     if (screenshotMatch && request.method === 'GET') return sendScreenshot(response, await getSiteScreenshot(decodeURIComponent(screenshotMatch[1])));
     if (screenshotMatch && request.method === 'POST') {

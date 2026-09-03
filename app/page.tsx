@@ -3,14 +3,14 @@
 
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, ArchiveRestore, ArrowLeft, ArrowRight, Boxes, Camera, Check, ChevronDown, ChevronRight, CircleAlert,
-  CirclePlay, Container, Copy, Database, ExternalLink, FileCode2, Gauge, GitCommit, Globe2, House,
-  Info, LogIn, Logs, Package, Play, Plus, RefreshCw, RotateCw, Search, ServerCog, Settings, ShieldCheck,
-  Sparkles, Square, Terminal, Upload, Users, X,
+  Activity, ArchiveRestore, ArrowLeft, ArrowRight, Bot, Boxes, Camera, Check, ChevronDown, ChevronRight, CircleAlert,
+  CirclePlay, Clock3, Container, Copy, Database, ExternalLink, FileCode2, Gauge, GitCommit, Globe2, House,
+  Info, LogIn, Logs, Package, Play, Plus, Radio, RefreshCw, RotateCcw, RotateCw, Search, ServerCog, Settings,
+  ShieldCheck, ShieldOff, Sparkles, Square, Terminal, Trash2, Undo2, Upload, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
-type View = 'Overview' | 'Sites' | 'Clients' | 'Blueprints' | 'Activity' | 'Settings';
+type View = 'Overview' | 'Sites' | 'Clients' | 'Blueprints' | 'Agents' | 'Activity' | 'Settings';
 type Filter = 'All' | 'Running' | 'Attention';
 type SiteTab = 'Overview' | 'Updates' | 'Backups' | 'Tools';
 type SiteKind = 'wordpress' | 'lovable';
@@ -74,10 +74,21 @@ type Blueprint = {
 };
 type BlueprintUpload = { id: string; file: File; kind: BlueprintFileKind; destination: string };
 type BlueprintInput = { name: string; description: string; plugins: string[]; themes: string[]; files: Array<{ name: string; kind: BlueprintFileKind; destination: string; content: string }> };
+type McpAgent = {
+  id: string; name: string; clientName: string | null; clientTitle: string | null; clientVersion: string | null;
+  protocolVersion: string | null; capabilities: string[]; ip: string; local: boolean; platform: string;
+  userAgent: string; origin: string | null; remotePort: number | null; sessionIdHash: string | null; transport: string;
+  status: 'Connected' | 'Idle' | 'Offline' | 'Restarting' | 'Removed'; firstSeenAt: string; connectedAt: string;
+  lastSeenAt: string | null; lastMethod: string | null; lastTool: string | null; requestCount: number;
+  toolCallCount: number; errorCount: number; deniedCount: number; restartCount: number;
+  lastResponseStatus: number | null; lastLatencyMs: number | null; averageLatencyMs: number | null;
+  restartRequestedAt: string | null; revokedAt: string | null;
+};
 
 const nav: Array<{ view: View; icon: LucideIcon }> = [
   { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Clients', icon: Users },
   { view: 'Blueprints', icon: Boxes },
+  { view: 'Agents', icon: Bot },
   { view: 'Activity', icon: Activity }, { view: 'Settings', icon: Settings },
 ];
 
@@ -108,6 +119,7 @@ export default function Home() {
   const [sites, setSites] = useState<Site[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
+  const [agents, setAgents] = useState<McpAgent[]>([]);
   const [system, setSystem] = useState<SystemInfo>({ connected: false });
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -126,21 +138,24 @@ export default function Home() {
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [systemResponse, sitesResponse, clientsResponse, blueprintsResponse, activityResponse] = await Promise.all([
+      const [systemResponse, sitesResponse, clientsResponse, blueprintsResponse, agentsResponse, activityResponse] = await Promise.all([
         apiFetch('/api/system', { cache: 'no-store' }), apiFetch('/api/sites', { cache: 'no-store' }),
         apiFetch('/api/clients', { cache: 'no-store' }), apiFetch('/api/blueprints', { cache: 'no-store' }),
+        apiFetch('/api/agents', { cache: 'no-store' }),
         apiFetch('/api/activity', { cache: 'no-store' }),
       ]);
-      const [systemData, sitesData, clientsData, blueprintsData, activityData] = await Promise.all([
+      const [systemData, sitesData, clientsData, blueprintsData, agentsData, activityData] = await Promise.all([
         systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
         sitesResponse.json().catch(() => ({ sites: [] })), clientsResponse.json().catch(() => ({ clients: [] })),
         blueprintsResponse.json().catch(() => ({ blueprints: [] })),
+        agentsResponse.json().catch(() => ({ agents: [] })),
         activityResponse.json().catch(() => ({ activity: [] })),
-      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { clients?: Client[] }, { blueprints?: Blueprint[] }, { activity?: ActivityEntry[] }];
+      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { clients?: Client[] }, { blueprints?: Blueprint[] }, { agents?: McpAgent[] }, { activity?: ActivityEntry[] }];
       setSystem(systemData);
       if (sitesResponse.ok) setSites(sitesData.sites || []);
       if (clientsResponse.ok) setClients(clientsData.clients || []);
       if (blueprintsResponse.ok) setBlueprints(blueprintsData.blueprints || []);
+      if (agentsResponse.ok) setAgents(agentsData.agents || []);
       if (activityResponse.ok) setActivity(activityData.activity || []);
       setError(systemResponse.ok ? null : systemData.error || sitesData.error || 'Docker Desktop agent is offline.');
     } catch {
@@ -175,6 +190,7 @@ export default function Home() {
   }), [clientNames, filter, query, sites]);
   const visibleClients = useMemo(() => clients.filter((client) => `${client.name} ${client.company} ${client.email} ${client.phone}`.toLowerCase().includes(query.toLowerCase())), [clients, query]);
   const visibleBlueprints = useMemo(() => blueprints.filter((blueprint) => `${blueprint.name} ${blueprint.description} ${blueprint.plugins.map((plugin) => plugin.slug).join(' ')} ${blueprint.themes.map((theme) => theme.slug).join(' ')} ${blueprint.files.map((file) => file.name).join(' ')}`.toLowerCase().includes(query.toLowerCase())), [blueprints, query]);
+  const visibleAgents = useMemo(() => agents.filter((agent) => `${agent.name} ${agent.clientName || ''} ${agent.clientVersion || ''} ${agent.ip} ${agent.platform} ${agent.userAgent} ${agent.lastTool || ''}`.toLowerCase().includes(query.toLowerCase())), [agents, query]);
 
   function navigate(next: View) { setView(next); setSelectedId(null); }
   function openLaunch() { setPreferredBlueprintId(null); setLaunchMode('choose'); }
@@ -240,6 +256,22 @@ export default function Home() {
     finally { setBusy(null); }
   }
 
+  async function manageAgent(agent: McpAgent, action: 'restart' | 'remove' | 'restore' | 'forget') {
+    if (action === 'remove' && !window.confirm(`Remove MCP access for ${agent.name}? Requests from this client fingerprint will be denied until you restore it.`)) return;
+    if (action === 'forget' && !window.confirm(`Permanently forget the telemetry record for ${agent.name}? It can reappear only after access is restored and it reconnects.`)) return;
+    setBusy(`agent:${agent.id}:${action}`);
+    try {
+      const response = await apiFetch(`/api/agents/${encodeURIComponent(agent.id)}/actions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action }),
+      });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || `The agent ${action} action failed.`);
+      const messages = { restart: 'Connection tracking restarted. The next request will appear as a fresh connection.', remove: 'MCP access removed.', restore: 'MCP access restored. The agent can reconnect.', forget: 'Agent telemetry forgotten.' };
+      setToast(`${agent.name}: ${messages[action]}`); await refresh(true);
+    } catch (failure) { setToast(messageFrom(failure, `The agent ${action} action failed.`)); }
+    finally { setBusy(null); }
+  }
+
   async function operate(site: Site, type: string, options: Record<string, unknown> = {}) {
     if (type === 'delete' && !window.confirm(`Delete ${site.name}, its containers, volumes and local backups? This cannot be undone.`)) return false;
     setBusy(`${site.id}:${type}`);
@@ -295,18 +327,19 @@ export default function Home() {
     <aside className="sidebar">
       <button className="brand" onClick={() => navigate('Overview')}><span className="brand-mark">G</span><span>GeekHeros</span></button>
       <div className="workspace-switcher static-workspace"><span className="workspace-avatar">DK</span><span className="workspace-copy"><strong>Docker Desktop</strong><small>{system.connected ? 'Local node connected' : 'Agent offline'}</small></span><span className={`connection-light ${system.connected ? 'online' : ''}`} /></div>
-      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}</button>)}</nav>
+      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}{item.view === 'Agents' && <em>{agents.filter((agent) => agent.status === 'Connected').length}</em>}</button>)}</nav>
       <div className="node-card"><div className="node-card-head"><span>Managed fleet</span><strong>{system.runningSites || 0}/{system.managedSites || 0}</strong></div><div className="capacity-track"><span style={{ width: `${system.managedSites ? Math.round(((system.runningSites || 0) / system.managedSites) * 100) : 0}%` }} /></div><small>{system.cpuCount || 0} CPU · {formatBytes(system.memoryBytes || 0)} memory</small></div>
       <div className="sidebar-user"><span className="user-avatar">GH</span><span className="workspace-copy"><strong>Local administrator</strong><small>Docker access enabled</small></span></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, clients and blueprints" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
+      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, clients, blueprints and agents" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
       {error && <div className="connection-banner"><span><CircleAlert aria-hidden="true" /></span><div><strong>Docker control is unavailable</strong><p>{error}</p></div><button onClick={() => void refresh()}>Retry connection</button></div>}
       {selected ? <SiteWorkspace key={selected.id} site={selected} clients={clients} busy={busy} onBack={() => setSelectedId(null)} onOperate={operate} onSaveMetadata={saveMetadata} onLogin={oneClickLogin} /> : <div className="page-content">
         {view === 'Overview' && <Overview sites={sites} clients={clients} system={system} activity={activity} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
         {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
+        {view === 'Agents' && <AgentsView agents={visibleAgents} allAgents={agents} busy={busy} onManage={manageAgent} onRefresh={() => void refresh(true)} />}
         {view === 'Activity' && <ActivityView entries={activity} />}
         {view === 'Settings' && <SettingsView system={system} onToast={setToast} />}
       </div>}
@@ -560,6 +593,19 @@ function DeveloperToolModal({ site, tool, onClose }: { site: Site; tool: Develop
 }
 
 function Operation({ icon: Icon, title, copy, disabled, onClick }: { icon: LucideIcon; title: string; copy: string; disabled: boolean; onClick: () => void }) { return <button className="operation-card" disabled={disabled} onClick={onClick}><span><Icon aria-hidden="true" /></span><strong>{title}</strong><small>{copy}</small><em>Run operation<ArrowRight aria-hidden="true" /></em></button>; }
+function AgentsView({ agents, allAgents, busy, onManage, onRefresh }: { agents: McpAgent[]; allAgents: McpAgent[]; busy: string | null; onManage: (agent: McpAgent, action: 'restart' | 'remove' | 'restore' | 'forget') => Promise<void>; onRefresh: () => void }) {
+  const connected = allAgents.filter((agent) => agent.status === 'Connected').length;
+  const removed = allAgents.filter((agent) => agent.status === 'Removed').length;
+  const requests = allAgents.reduce((sum, agent) => sum + agent.requestCount, 0);
+  return <><PageHeading eyebrow="MCP CONNECTIONS" title="Agents" description="See every MCP client observed by this control plane and manage its server-side access." actions={<button className="secondary-button" onClick={onRefresh}><RefreshCw aria-hidden="true" />Refresh telemetry</button>} />
+    <div className="metric-grid compact-metrics"><MetricCard icon={Radio} tone="green" label="Connected" value={String(connected)} detail="Seen in the last two minutes" /><MetricCard icon={Clock3} tone="blue" label="Known agents" value={String(allAgents.length)} detail="Unique client and IP fingerprints" /><MetricCard icon={Activity} tone="violet" label="MCP requests" value={String(requests)} detail="Authenticated requests observed" /><MetricCard icon={ShieldOff} tone="amber" label="Removed" value={String(removed)} detail="Client fingerprints currently denied" /></div>
+    <div className="agent-telemetry-note"><Radio aria-hidden="true" /><p><strong>Connection status is request-based.</strong> MCP uses HTTP, so “Connected” means the client contacted this server within two minutes. GeekHeros stores identity and performance telemetry only—never authorization headers, tool arguments or prompt contents.</p></div>
+    <section className="fleet-panel agent-panel"><div className="agent-row agent-header"><span>Agent</span><span>Status</span><span>Network</span><span>Usage</span><span>Last activity</span><span>Management</span></div>{agents.map((agent) => {
+      const actionBusy = Boolean(busy?.startsWith(`agent:${agent.id}:`));
+      return <article className="agent-row" key={agent.id}><div className="agent-identity"><span className="agent-avatar"><Bot aria-hidden="true" /></span><span><strong>{agent.name}</strong><small>{agent.clientVersion ? `Version ${agent.clientVersion}` : agent.clientName || 'Unidentified MCP client'}</small></span></div><span className={`agent-status ${agent.status.toLowerCase()}`}><i />{agent.status}</span><span className="agent-network"><strong>{agent.ip}</strong><small>{agent.local ? 'Local loopback' : agent.platform}{agent.remotePort ? ` · port ${agent.remotePort}` : ''}</small></span><span className="agent-usage"><strong>{agent.toolCallCount} tool call{agent.toolCallCount === 1 ? '' : 's'}</strong><small>{agent.requestCount} request{agent.requestCount === 1 ? '' : 's'} · {agent.errorCount} error{agent.errorCount === 1 ? '' : 's'}</small></span><span className="agent-last-seen"><strong>{agent.lastTool || agent.lastMethod || 'Handshake only'}</strong><small>{agent.lastSeenAt ? relativeTime(agent.lastSeenAt) : agent.restartRequestedAt ? 'Waiting to reconnect' : agent.revokedAt ? `Removed ${relativeTime(agent.revokedAt)}` : 'Not currently connected'}</small></span><span className="agent-actions">{agent.status === 'Removed' ? <><button disabled={actionBusy} onClick={() => void onManage(agent, 'restore')}><Undo2 aria-hidden="true" />Restore</button><button className="quiet-danger" disabled={actionBusy} onClick={() => void onManage(agent, 'forget')}><Trash2 aria-hidden="true" />Forget</button></> : <><button disabled={actionBusy || agent.status === 'Restarting'} onClick={() => void onManage(agent, 'restart')}><RotateCcw aria-hidden="true" />Restart</button><button className="quiet-danger" disabled={actionBusy} onClick={() => void onManage(agent, 'remove')}><ShieldOff aria-hidden="true" />Remove</button></>}</span><details className="agent-telemetry"><summary>View telemetry</summary><div><span><small>Client</small><strong>{agent.clientTitle || agent.clientName || agent.name}</strong></span><span><small>Transport</small><strong>{agent.transport}</strong></span><span><small>MCP protocol</small><strong>{agent.protocolVersion || 'Not reported'}</strong></span><span><small>Platform</small><strong>{agent.platform}</strong></span><span><small>Average latency</small><strong>{agent.averageLatencyMs == null ? '—' : `${agent.averageLatencyMs} ms`}</strong></span><span><small>Last response</small><strong>{agent.lastResponseStatus || '—'}</strong></span><span><small>First observed</small><strong>{new Date(agent.firstSeenAt).toLocaleString()}</strong></span><span><small>Restarts</small><strong>{agent.restartCount}</strong></span><span className="agent-user-agent"><small>User agent</small><code>{agent.userAgent}</code></span><span className="agent-capabilities"><small>Client capabilities</small><strong>{agent.capabilities.length ? agent.capabilities.join(' · ') : 'None reported'}</strong></span></div></details></article>;
+    })}{!agents.length && <Empty title="No MCP agents observed" copy="Agents appear here after they authenticate and make their first MCP request." />}</section></>;
+}
+
 function ActivityView({ entries }: { entries: ActivityEntry[] }) { return <><PageHeading eyebrow="AUDIT LOG" title="Activity" description="Completed and failed operations reported by the local Docker agent." /><section className="content-card"><ActivityList entries={entries} /></section></>; }
 function ActivityList({ entries }: { entries: ActivityEntry[] }) { if (!entries.length) return <Empty title="No operations recorded" copy="Container launches and lifecycle actions will appear here." />; return <div className="timeline live-timeline">{entries.map((entry) => <div key={entry.id}><span className={`activity-dot ${entry.state === 'failed' ? 'red' : 'green'}`} /><span><strong>{entry.message}</strong><small>{entry.siteName} · {entry.type}</small></span><time>{relativeTime(entry.createdAt)}</time></div>)}</div>; }
 

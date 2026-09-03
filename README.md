@@ -61,6 +61,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 - Route domains to the correct container through Traefik.
 - Record completed and failed operations in the local activity log.
 - Connect a Lovable account, create and deploy projects directly, check for new revisions and rebuild their containers.
+- Track authenticated MCP agents by client identity and IP, inspect request telemetry, restart connection tracking, and remove or restore per-client access.
 
 ## One-click WP Admin
 
@@ -72,7 +73,7 @@ Local state, Lovable source checkouts and backups live under `.geekheros/` and a
 
 Managed site details include a real browser-rendered frontend capture that refreshes every 60 minutes, 10-minute uptime checks, safety-backed restore operations, container logs, an audited terminal and WP-CLI console, database queries, a scoped `wp-content` code editor, and runtime inspection. Microsoft Edge or Google Chrome is required on the agent machine for frontend captures.
 
-Every dashboard capability is also part of the authenticated MCP server. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
+Every dashboard capability is also part of the authenticated MCP server. The Agents page records authenticated MCP client metadata, network origin, recency, tool usage and response timing without storing authorization headers, tool arguments or prompts. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
 
 ## Hosted dashboard connection
 

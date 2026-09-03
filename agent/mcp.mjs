@@ -1,11 +1,12 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 31;
+export const controlPlaneMcpToolCount = 33;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
 const blueprintIdSchema = z.string().min(1).describe('Blueprint ID returned by list_blueprints.');
+const agentIdSchema = z.string().min(1).describe('MCP agent ID returned by list_agents.');
 const packageNamesSchema = z.array(z.string().min(1)).max(100).optional();
 
 function mcpResult(result) {
@@ -268,6 +269,22 @@ function createControlPlaneMcpServer(api) {
     inputSchema: z.object({ blueprintId: blueprintIdSchema }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   }, ({ blueprintId }) => api.deleteBlueprint(blueprintId));
+
+  register(server, 'list_agents', {
+    title: 'List MCP agents',
+    description: 'List MCP clients that connected to this control plane, including connection status, IP address, client identity and request telemetry.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listMcpAgents());
+
+  register(server, 'manage_agent', {
+    title: 'Manage MCP agent',
+    description: 'Restart server-side connection tracking, remove or restore MCP access for a client fingerprint, or forget a removed telemetry record.',
+    inputSchema: z.object({
+      agentId: agentIdSchema,
+      action: z.enum(['restart', 'remove', 'restore', 'forget']),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ agentId, action }) => api.manageMcpAgent(agentId, action));
 
   register(server, 'get_lovable_connection', {
     title: 'Get Lovable connection',
