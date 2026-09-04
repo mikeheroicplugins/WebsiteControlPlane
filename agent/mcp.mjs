@@ -1,9 +1,9 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 33;
+export const controlPlaneMcpToolCount = 36;
 
-const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites.');
+const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
 const blueprintIdSchema = z.string().min(1).describe('Blueprint ID returned by list_blueprints.');
 const agentIdSchema = z.string().min(1).describe('MCP agent ID returned by list_agents.');
@@ -44,7 +44,7 @@ function createControlPlaneMcpServer(api) {
 
   register(server, 'list_sites', {
     title: 'List sites',
-    description: 'List every managed WordPress and Lovable site with live container state.',
+    description: 'List every production WordPress and Lovable site with live container state. Use list_staging_sites for staging environments.',
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, () => api.listSites());
 
@@ -79,6 +79,35 @@ function createControlPlaneMcpServer(api) {
     ...input,
     buildEnvironment: Object.entries(input.buildEnvironment || {}).map(([key, value]) => `${key}=${value}`).join('\n'),
   }));
+
+  register(server, 'list_staging_sites', {
+    title: 'List WordPress staging sites',
+    description: 'List isolated WordPress staging environments, their linked production sites, sync state and live container status.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listStagingSites());
+
+  register(server, 'create_staging_site', {
+    title: 'Create WordPress staging site',
+    description: 'Clone a production WordPress site into isolated containers, volumes, database and hostname with crawler blocking and outbound email suppression.',
+    inputSchema: z.object({
+      productionSiteId: siteIdSchema,
+      name: z.string().min(1).max(80).optional(),
+      domain: z.string().min(1).max(253).optional().describe('Defaults to staging.<production-domain>.'),
+      pod: z.enum(['Micro', 'Standard', 'Performance', 'Power']).optional().describe('Defaults to the production site profile.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, (input) => api.createStagingSite(input));
+
+  register(server, 'manage_staging_site', {
+    title: 'Manage WordPress staging site',
+    description: 'Refresh staging from production, promote staging to production, or delete staging. Sync and promotion create a safety recovery point before replacing data.',
+    inputSchema: z.object({
+      stagingSiteId: siteIdSchema.describe('Staging site ID returned by list_staging_sites.'),
+      action: z.enum(['sync', 'promote', 'delete']),
+      scope: z.enum(['all', 'files', 'database']).default('all').describe('Files, database, or both. Ignored for delete.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ stagingSiteId, action, scope }) => api.manageStagingSite(stagingSiteId, action, { scope }));
 
   register(server, 'update_site_metadata', {
     title: 'Update site metadata',

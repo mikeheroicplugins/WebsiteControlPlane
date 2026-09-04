@@ -93,6 +93,21 @@ add_filter( 'show_advanced_plugins', function ( $show, $type ) {
     return 'mustuse' === $type ? false : $show;
 }, 10, 2 );
 `;
+const stagingGuardMuPlugin = String.raw`<?php
+/**
+ * Plugin Name: GeekHeros Staging Guard
+ * Description: Keeps a GeekHeros staging site private from crawlers and suppresses outbound email.
+ * Version: 1.0.0
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'pre_option_blog_public', '__return_zero', PHP_INT_MAX );
+add_filter( 'pre_wp_mail', '__return_false', PHP_INT_MAX );
+add_action( 'send_headers', function () {
+    header( 'X-Robots-Tag: noindex, nofollow, noarchive', true );
+} );
+`;
 
 if (!authToken || authToken.length < 24) {
   console.error('GEEKHEROS_AGENT_TOKEN must be set to a random value of at least 24 characters.');
@@ -103,7 +118,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 8, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 9, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
 }
 
 async function readState() {
@@ -113,6 +128,8 @@ async function readState() {
     const sites = Object.fromEntries(Object.entries(parsed.sites || {}).map(([id, site]) => [id, {
       ...site,
       kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
+      environment: site.environment === 'staging' ? 'staging' : 'production',
+      productionSiteId: site.environment === 'staging' ? site.productionSiteId || null : null,
       clientId: site.clientId || null,
       tags: Array.isArray(site.tags) ? site.tags : [],
     }]));
@@ -120,7 +137,7 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 8,
+      version: 9,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
@@ -653,6 +670,14 @@ function normalizeDomain(value) {
   return value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '');
 }
 
+function validateManagedDomain(value) {
+  const domain = normalizeDomain(String(value || ''));
+  if (!domain || domain.length > 253 || !/^(?=.{1,253}$)(localhost|([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,62})$/.test(domain)) {
+    throw new Error('Enter a valid hostname, such as client.example.com or client.localhost.');
+  }
+  return domain;
+}
+
 function parseReferenceUrls(value, type) {
   const values = (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/))
     .map((item) => String(item || '').trim()).filter(Boolean);
@@ -714,13 +739,10 @@ function validateBuildEnvironment(value) {
 
 function validateSiteInput(input) {
   const name = String(input.name || '').trim();
-  const domain = normalizeDomain(String(input.domain || ''));
+  const domain = validateManagedDomain(input.domain);
   const kind = input.kind === 'lovable' ? 'lovable' : 'wordpress';
   const pod = ['Micro', 'Standard', 'Performance', 'Power'].includes(input.pod) ? input.pod : 'Standard';
   if (!name || name.length > 80) throw new Error('Enter a site name up to 80 characters.');
-  if (!domain || domain.length > 253 || !/^(?=.{1,253}$)(localhost|([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,62})$/.test(domain)) {
-    throw new Error('Enter a valid hostname, such as client.example.com or client.localhost.');
-  }
   if (kind === 'lovable') {
     const prompt = String(input.lovablePrompt || '').trim();
     if (!prompt || prompt.length > 50_000) throw new Error('Enter a Lovable prompt up to 50,000 characters.');
@@ -1203,6 +1225,7 @@ async function ensureWordPressContainer(site) {
     '--label', managedLabel, '--label', 'com.geekheros.role=wordpress',
     '--label', `com.geekheros.site.id=${site.id}`, '--label', `com.geekheros.site.name=${site.name}`,
     '--label', `com.geekheros.site.domain=${site.domain}`, '--label', `com.geekheros.site.pod=${site.pod}`,
+    '--label', `com.geekheros.site.environment=${site.environment === 'staging' ? 'staging' : 'production'}`,
     '--label', 'traefik.enable=true',
     '--label', `traefik.http.routers.${router}.rule=Host(\`${site.domain}\`)`,
     '--label', `traefik.http.routers.${router}.entrypoints=web`,
@@ -1244,6 +1267,24 @@ async function ensureControlPlaneMuPlugin(site) {
     'if (!is_dir($directory) && !mkdir($directory, 0755, true)) { fwrite(STDERR, "Unable to create the MU-plugin directory.\\n"); exit(1); }',
     '$current=is_file($path) ? file_get_contents($path) : false;',
     'if ($current !== $contents && file_put_contents($path, $contents, LOCK_EX) === false) { fwrite(STDERR, "Unable to install the GeekHeros MU-plugin.\\n"); exit(1); }',
+    'chmod($path, 0644);',
+  ].join('');
+  await docker(['exec', site.wpContainer, 'php', '-r', php], { timeout: 30_000 });
+}
+
+async function ensureStagingGuard(site) {
+  const pathInContainer = '/var/www/html/wp-content/mu-plugins/geekheros-staging.php';
+  if (site.environment !== 'staging') {
+    await docker(['exec', site.wpContainer, 'rm', '-f', pathInContainer], { timeout: 30_000 }).catch(() => undefined);
+    return;
+  }
+  const encodedPlugin = Buffer.from(stagingGuardMuPlugin, 'utf8').toString('base64');
+  const php = [
+    '$directory="/var/www/html/wp-content/mu-plugins";',
+    `$path="${pathInContainer}";`,
+    `$contents=base64_decode("${encodedPlugin}");`,
+    'if (!is_dir($directory) && !mkdir($directory, 0755, true)) { fwrite(STDERR, "Unable to create the staging guard directory.\\n"); exit(1); }',
+    'if (file_put_contents($path, $contents, LOCK_EX) === false) { fwrite(STDERR, "Unable to install the staging guard.\\n"); exit(1); }',
     'chmod($path, 0644);',
   ].join('');
   await docker(['exec', site.wpContainer, 'php', '-r', php], { timeout: 30_000 });
@@ -1802,6 +1843,201 @@ async function createSite(input) {
   return publicSite(site, null);
 }
 
+function suggestedStagingDomain(domain) {
+  return `staging.${String(domain || '').replace(/^staging\./, '')}`;
+}
+
+function stagingScope(value) {
+  const scope = String(value || 'all');
+  if (!['all', 'files', 'database'].includes(scope)) throw Object.assign(new Error('Choose all, files or database.'), { status: 400 });
+  return scope;
+}
+
+async function createStagingSite(input) {
+  const productionSiteId = String(input.productionSiteId || '');
+  const state = await readState();
+  const production = state.sites[productionSiteId];
+  if (!production) throw Object.assign(new Error('Production site not found.'), { status: 404 });
+  if (production.kind === 'lovable' || production.environment === 'staging') throw Object.assign(new Error('Staging is available only for production WordPress sites.'), { status: 409 });
+  if (production.phase) throw Object.assign(new Error(`The production site is currently ${production.phase.toLowerCase()}.`), { status: 409 });
+  if (Object.values(state.sites).some((site) => site.environment === 'staging' && site.productionSiteId === productionSiteId)) {
+    throw Object.assign(new Error('This WordPress site already has a staging environment.'), { status: 409 });
+  }
+  const name = String(input.name || `${production.name} Staging`).trim();
+  if (!name || name.length > 80) throw Object.assign(new Error('Enter a staging name up to 80 characters.'), { status: 400 });
+  let domain;
+  try { domain = validateManagedDomain(input.domain || suggestedStagingDomain(production.domain)); } catch (error) { throw Object.assign(error, { status: 400 }); }
+  if (Object.values(state.sites).some((site) => site.domain === domain)) throw Object.assign(new Error('That staging domain is already managed by GeekHeros.'), { status: 409 });
+  const pod = ['Micro', 'Standard', 'Performance', 'Power'].includes(input.pod) ? input.pod : production.pod;
+  const id = `site_${randomBytes(6).toString('hex')}`;
+  const namespace = `gh-${slugify(domain)}-${id.slice(-4)}`;
+  const now = new Date().toISOString();
+  const site = {
+    id, name, domain, kind: 'wordpress', environment: 'staging', productionSiteId, pod, region: 'Local Docker',
+    namespace, clientId: production.clientId || null, tags: [...new Set(['staging', ...(production.tags || [])])].slice(0, 20),
+    adminUser: production.adminUser, adminEmail: production.adminEmail,
+    network: `${namespace}-net`, dbContainer: `${namespace}-db`, wpContainer: `${namespace}-wp`,
+    dbVolume: `${namespace}-db`, wpVolume: `${namespace}-wp`, image: wordpressImage,
+    status: 'Provisioning', phase: 'Queued', error: null, wpVersion: production.wpVersion || '—',
+    phpVersion: production.phpVersion || '—', updates: 0, backups: [], lastSyncedAt: null, lastPromotedAt: null,
+    createdAt: now, updatedAt: now,
+    secrets: { dbPassword: production.secrets.dbPassword, dbRootPassword: randomBytes(32).toString('base64url') },
+  };
+  await updateState((next) => { next.sites[id] = site; });
+  void provisionStagingSite(id);
+  return publicSite(site, null);
+}
+
+async function prepareDatabaseForTransfer(site) {
+  const inspect = await inspectContainer(site.dbContainer);
+  if (!inspect) throw new Error(`${site.name}'s database container is unavailable.`);
+  const wasRunning = inspect.State?.Running === true;
+  if (!wasRunning) await docker(['start', site.dbContainer]);
+  await waitForDatabase(site, 120_000);
+  return wasRunning;
+}
+
+async function copyWordPressSite(source, target, options = {}) {
+  const scope = stagingScope(options.scope);
+  const safetyBackup = options.safetyBackup !== false;
+  const transferDirectory = path.join(stateDir, 'transfers');
+  const databaseFile = path.join(transferDirectory, `${randomUUID()}-database.sql`);
+  let sourceDatabaseWasRunning = true;
+  let targetWasRunning = false;
+  let recoveryPoint = null;
+  await mkdir(transferDirectory, { recursive: true });
+  try {
+    if (scope === 'all' || scope === 'database') sourceDatabaseWasRunning = await prepareDatabaseForTransfer(source);
+    if (safetyBackup || scope === 'all' || scope === 'database') await prepareDatabaseForTransfer(target);
+    const targetInspect = await inspectContainer(target.wpContainer);
+    if (!targetInspect) throw new Error(`${target.name}'s WordPress container is unavailable.`);
+    targetWasRunning = targetInspect.State?.Running === true;
+    if (safetyBackup) recoveryPoint = await createBackup(target);
+    if (targetWasRunning) await docker(['stop', '-t', '20', target.wpContainer]);
+
+    if (scope === 'all' || scope === 'files') {
+      await docker([
+        'run', '--rm', '-v', `${source.wpVolume}:/source:ro`, '-v', `${target.wpVolume}:/target`, 'alpine:latest',
+        'sh', '-c', 'find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && cd /source && tar -cf - . | tar -xf - -C /target',
+      ], { timeout: 600_000 });
+    }
+    if (scope === 'all' || scope === 'database') {
+      await dockerToFile([
+        'exec', '-e', `MYSQL_PWD=${source.secrets.dbRootPassword}`, source.dbContainer,
+        'mariadb-dump', '-uroot', '--single-transaction', '--quick', '--skip-lock-tables', 'wordpress',
+      ], databaseFile);
+      await docker([
+        'exec', '-e', `MYSQL_PWD=${target.secrets.dbRootPassword}`, target.dbContainer,
+        'mariadb', '-uroot', '-e', 'DROP DATABASE IF EXISTS wordpress; CREATE DATABASE wordpress CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+      ], { timeout: 120_000 });
+      await dockerFromFile(['exec', '-i', '-e', `MYSQL_PWD=${target.secrets.dbRootPassword}`, target.dbContainer, 'mariadb', '-uroot', 'wordpress'], databaseFile);
+    }
+
+    await docker(['start', target.wpContainer]).catch((error) => { if (!/is already running/i.test(error.message)) throw error; });
+    await waitForWordPressFiles(target, 120_000);
+    await ensureLocalPreviewConfig(target);
+    await ensureControlPlaneMuPlugin(target);
+    await ensureStagingGuard(target);
+    if (scope === 'all' || scope === 'database') {
+      const targetUrl = `http://${target.domain}`;
+      for (const sourceUrl of [`http://${source.domain}`, `https://${source.domain}`]) {
+        await runWp(target, ['search-replace', sourceUrl, targetUrl, '--all-tables', '--precise', '--recurse-objects', '--skip-columns=guid'], { timeout: 600_000 });
+      }
+      await runWp(target, ['option', 'update', 'home', targetUrl], { timeout: 90_000 });
+      await runWp(target, ['option', 'update', 'siteurl', targetUrl], { timeout: 90_000 });
+    }
+    if (target.environment === 'staging') await runWp(target, ['option', 'update', 'blog_public', '0'], { timeout: 90_000 });
+    await runWp(target, ['rewrite', 'flush', '--hard'], { timeout: 120_000 });
+    await runWp(target, ['cache', 'flush'], { timeout: 90_000 }).catch(() => undefined);
+    await rm(screenshotPath(target.id), { force: true }).catch(() => undefined);
+    return { recoveryPoint };
+  } catch (error) {
+    if (recoveryPoint) {
+      try {
+        await restoreBackup(await requireSite(target.id), recoveryPoint.id, 'all');
+      } catch (rollbackError) {
+        error.message = `${error.message || 'The copy failed.'} Automatic rollback also failed: ${rollbackError.message || 'unknown rollback error'}`;
+      }
+    }
+    throw error;
+  } finally {
+    await rm(databaseFile, { force: true }).catch(() => undefined);
+    const targetInspect = await inspectContainer(target.wpContainer).catch(() => null);
+    if (targetInspect && !targetInspect.State?.Running) await docker(['start', target.wpContainer]).catch(() => undefined);
+    if (!sourceDatabaseWasRunning) await docker(['stop', '-t', '20', source.dbContainer]).catch(() => undefined);
+  }
+}
+
+async function provisionStagingSite(siteId) {
+  const state = await readState();
+  const site = state.sites[siteId];
+  const production = site ? state.sites[site.productionSiteId] : null;
+  if (!site) return;
+  try {
+    if (!production || production.kind === 'lovable' || production.environment === 'staging') throw new Error('The linked production WordPress site is unavailable.');
+    await setSiteState(siteId, { phase: 'Preparing isolated staging containers', error: null });
+    await ensureEdge();
+    await ensureNetwork(site.network, [managedLabel, `com.geekheros.site.id=${site.id}`, 'com.geekheros.site.environment=staging']);
+    await ensureVolume(site.dbVolume, site.id);
+    await ensureVolume(site.wpVolume, site.id);
+    await ensureDatabaseContainer(site);
+    await waitForDatabase(site);
+    await ensureWordPressContainer(site);
+    const directPort = await getDirectPort(site.wpContainer);
+    await waitForWordPressFiles(site);
+    await setSiteState(siteId, { phase: 'Cloning production files and database', directPort });
+    await copyWordPressSite(production, site, { safetyBackup: false, scope: 'all' });
+    const completedAt = new Date().toISOString();
+    await setSiteState(siteId, { phase: null, status: 'Running', error: null, directPort, lastSyncedAt: completedAt, syncSourceUpdatedAt: production.updatedAt });
+    await refreshVersions({ ...site, directPort });
+    await recordActivity({ siteId, siteName: site.name, type: 'staging.create', message: `${site.name} was cloned from ${production.name}.` });
+  } catch (error) {
+    await setSiteState(siteId, { phase: null, status: 'Error', error: error.message || 'Staging provisioning failed.' });
+    await recordActivity({ siteId, siteName: site.name, type: 'staging.create', state: 'failed', message: error.message || 'Staging provisioning failed.' });
+  }
+}
+
+async function manageStagingSite(stagingSiteId, action, input = {}) {
+  const operation = String(action || '');
+  if (!['sync', 'promote', 'delete'].includes(operation)) throw Object.assign(new Error('Choose sync, promote or delete.'), { status: 400 });
+  const staging = await requireSite(stagingSiteId);
+  if (staging.kind === 'lovable' || staging.environment !== 'staging') throw Object.assign(new Error('Choose a WordPress staging environment.'), { status: 409 });
+  if (operation === 'delete') return runOperation(staging.id, 'delete', { deleteData: true });
+  const production = await requireSite(staging.productionSiteId);
+  if (production.kind === 'lovable' || production.environment === 'staging') throw Object.assign(new Error('The linked production WordPress site is unavailable.'), { status: 409 });
+  if (staging.phase || production.phase) throw Object.assign(new Error('Wait for the current site operation to finish.'), { status: 409 });
+  const scope = stagingScope(input.scope);
+  const source = operation === 'sync' ? production : staging;
+  const target = operation === 'sync' ? staging : production;
+  const stagingPhase = operation === 'sync' ? 'Syncing from production' : 'Promoting to production';
+  const productionPhase = operation === 'sync' ? 'Copying to staging' : 'Receiving staging changes';
+  await setSiteState(staging.id, { phase: stagingPhase, error: null });
+  await setSiteState(production.id, { phase: productionPhase, error: null });
+  try {
+    const copyResult = await copyWordPressSite(source, target, { safetyBackup: true, scope });
+    await refreshVersions(target);
+    const completedAt = new Date().toISOString();
+    if (operation === 'sync') {
+      await setSiteState(staging.id, { phase: null, status: 'Running', error: null, lastSyncedAt: completedAt, syncSourceUpdatedAt: production.updatedAt });
+      await setSiteState(production.id, { phase: null, error: null });
+    } else {
+      await setSiteState(staging.id, { phase: null, status: 'Running', error: null, lastPromotedAt: completedAt });
+      await setSiteState(production.id, { phase: null, status: 'Running', error: null, lastPromotedAt: completedAt });
+    }
+    const message = operation === 'sync'
+      ? `${staging.name} was refreshed from ${production.name}; a staging recovery point was created first.`
+      : `${staging.name} was promoted to ${production.name}; a production recovery point was created first.`;
+    await recordActivity({ siteId: staging.id, siteName: staging.name, type: `staging.${operation}`, message });
+    const current = await requireSite(staging.id);
+    return { staging: publicSite(current, await inspectContainer(current.wpContainer)), scope, completedAt, recoveryPointId: copyResult.recoveryPoint?.id || null };
+  } catch (error) {
+    await setSiteState(staging.id, { phase: null, error: error.message || `Staging ${operation} failed.` });
+    await setSiteState(production.id, { phase: null });
+    await recordActivity({ siteId: staging.id, siteName: staging.name, type: `staging.${operation}`, state: 'failed', message: error.message || `Staging ${operation} failed.` });
+    throw error;
+  }
+}
+
 function durationSince(iso) {
   const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s`;
@@ -1818,6 +2054,11 @@ function publicSite(site, inspect) {
   return {
     id: site.id, name: site.name, domain: site.domain, status, phase: site.phase || null, error: site.error || null,
     kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
+    environment: site.environment === 'staging' ? 'staging' : 'production',
+    productionSiteId: site.environment === 'staging' ? site.productionSiteId || null : null,
+    lastSyncedAt: site.environment === 'staging' ? site.lastSyncedAt || null : null,
+    lastPromotedAt: site.lastPromotedAt || null,
+    syncSourceUpdatedAt: site.environment === 'staging' ? site.syncSourceUpdatedAt || null : null,
     clientId: site.clientId || null, tags: Array.isArray(site.tags) ? site.tags : [],
     blueprintId: site.kind === 'wordpress' ? site.blueprintId || null : null,
     blueprintName: site.kind === 'wordpress' ? site.blueprintName || null : null,
@@ -1857,7 +2098,15 @@ function monitoringSummary(site) {
 
 async function listSites() {
   const state = await readState();
-  const sites = await Promise.all(Object.values(state.sites).map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
+  const productionSites = Object.values(state.sites).filter((site) => site.environment !== 'staging');
+  const sites = await Promise.all(productionSites.map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
+  return sites.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+async function listStagingSites() {
+  const state = await readState();
+  const stagingSites = Object.values(state.sites).filter((site) => site.environment === 'staging');
+  const sites = await Promise.all(stagingSites.map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
   return sites.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
@@ -2175,7 +2424,8 @@ function publicClient(client, sites) {
 
 async function listClients() {
   const state = await readState();
-  const sites = await Promise.all(Object.values(state.sites).map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
+  const productionSites = Object.values(state.sites).filter((site) => site.environment !== 'staging');
+  const sites = await Promise.all(productionSites.map(async (site) => publicSite(site, await inspectContainer(site.wpContainer))));
   return Object.values(state.clients)
     .map((client) => publicClient(client, sites))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -2305,6 +2555,7 @@ async function restoreBackup(site, backupId, scope = 'all') {
   }
   await ensureLocalPreviewConfig(site);
   await ensureControlPlaneMuPlugin(site);
+  await ensureStagingGuard(site);
   await refreshVersions(site);
   return { backupId: backup.id, scope, restoredAt: new Date().toISOString() };
 }
@@ -2318,6 +2569,11 @@ async function runOperation(siteId, type, input = {}) {
   if (site.phase) throw Object.assign(new Error(`The site is currently ${site.phase.toLowerCase()}.`), { status: 409 });
 
   if (operation === 'delete') {
+    if (site.environment !== 'staging') {
+      const state = await readState();
+      const linkedStaging = Object.values(state.sites).find((entry) => entry.environment === 'staging' && entry.productionSiteId === site.id);
+      if (linkedStaging) throw Object.assign(new Error(`Delete the ${linkedStaging.name} staging environment before removing its production site.`), { status: 409 });
+    }
     await docker(['rm', '-f', site.wpContainer]).catch((error) => { if (!/No such/i.test(error.message)) throw error; });
     if (site.dbContainer) await docker(['rm', '-f', site.dbContainer]).catch((error) => { if (!/No such/i.test(error.message)) throw error; });
     await docker(['network', 'rm', site.network]).catch(() => undefined);
@@ -2419,6 +2675,7 @@ async function runOperation(siteId, type, input = {}) {
     if (operation === 'start' || operation === 'restart') {
       await ensureLocalPreviewConfig(site);
       await ensureControlPlaneMuPlugin(site);
+      await ensureStagingGuard(site);
     }
     const nextStatus = operation === 'stop' ? 'Stopped' : 'Running';
     await setSiteState(site.id, { phase: null, status: nextStatus, error: null });
@@ -2688,6 +2945,8 @@ async function systemInfo(includeMcpConnection = false) {
   const info = JSON.parse(stdout);
   const edge = await inspectContainer(edgeContainer);
   const sites = await listSites();
+  const stagingSites = await listStagingSites();
+  const allSites = [...sites, ...stagingSites];
   const result = {
     connected: true,
     dockerVersion: info.ServerVersion,
@@ -2696,10 +2955,12 @@ async function systemInfo(includeMcpConnection = false) {
     memoryBytes: info.MemTotal,
     totalContainers: info.Containers,
     runningContainers: info.ContainersRunning,
-    managedSites: sites.length,
-    runningSites: sites.filter((site) => site.status === 'Running').length,
-    provisioningSites: sites.filter((site) => site.status === 'Provisioning').length,
-    attentionSites: sites.filter((site) => ['Error', 'Attention'].includes(site.status)).length,
+    managedSites: allSites.length,
+    productionSites: sites.length,
+    stagingSites: stagingSites.length,
+    runningSites: allSites.filter((site) => site.status === 'Running').length,
+    provisioningSites: allSites.filter((site) => site.status === 'Provisioning').length,
+    attentionSites: allSites.filter((site) => ['Error', 'Attention'].includes(site.status)).length,
     edge: { installed: Boolean(edge), running: Boolean(edge?.State?.Running), container: edgeContainer, httpPort: 80, httpsPort: 443 },
     agent: { host, port },
   };
@@ -2799,7 +3060,10 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   getSystemInfo: () => systemInfo(false),
   listActivity: async ({ limit, siteId }) => (await readState()).activity.filter((entry) => !siteId || entry.siteId === siteId).slice(0, limit),
   listSites,
+  listStagingSites,
   launchSite: createSite,
+  createStagingSite,
+  manageStagingSite,
   updateSiteMetadata,
   getSiteInventory,
   getSiteScreenshot,
@@ -2889,6 +3153,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/lovable/projects') return send(response, 201, { project: await createLovableProject(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/sites') return send(response, 200, { sites: await listSites() });
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
+    if (request.method === 'GET' && url.pathname === '/staging') return send(response, 200, { staging: await listStagingSites() });
+    if (request.method === 'POST' && url.pathname === '/staging') return send(response, 202, { staging: await createStagingSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/blueprints') return send(response, 200, { blueprints: await listBlueprints() });
     if (request.method === 'POST' && url.pathname === '/blueprints') return send(response, 201, { blueprint: await createBlueprint(await readJson(request, 105_000_000)) });
     if (request.method === 'GET' && url.pathname === '/agents') return send(response, 200, { agents: await listMcpAgents() });
@@ -2907,6 +3173,11 @@ const server = createServer(async (request, response) => {
     if (agentActionMatch && request.method === 'POST') {
       const body = await readJson(request);
       return send(response, 200, await manageMcpAgent(decodeURIComponent(agentActionMatch[1]), body.action));
+    }
+    const stagingActionMatch = url.pathname.match(/^\/staging\/([^/]+)\/actions$/);
+    if (stagingActionMatch && request.method === 'POST') {
+      const body = await readJson(request);
+      return send(response, 200, await manageStagingSite(decodeURIComponent(stagingActionMatch[1]), body.action, body));
     }
     const screenshotMatch = url.pathname.match(/^\/sites\/([^/]+)\/screenshot$/);
     if (screenshotMatch && request.method === 'GET') return sendScreenshot(response, await getSiteScreenshot(decodeURIComponent(screenshotMatch[1])));

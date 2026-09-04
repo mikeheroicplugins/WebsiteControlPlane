@@ -4,13 +4,13 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity, ArchiveRestore, ArrowLeft, ArrowRight, Bot, Boxes, Camera, Check, ChevronDown, ChevronRight, CircleAlert,
-  CirclePlay, Clock3, Container, Copy, Database, ExternalLink, FileCode2, Gauge, GitCommit, Globe2, House,
-  Info, LogIn, Logs, Package, Play, Plus, Radio, RefreshCw, RotateCcw, RotateCw, Search, ServerCog, Settings,
-  ShieldCheck, ShieldOff, Sparkles, Square, Terminal, Trash2, Undo2, Upload, Users, X,
+  CirclePlay, Clock3, Container, Copy, Database, Download, ExternalLink, FileCode2, FlaskConical, Gauge, GitCommit,
+  Globe2, House, Info, LogIn, Logs, Package, Play, Plus, Radio, RefreshCw, Rocket, RotateCcw, RotateCw, Search,
+  ServerCog, Settings, ShieldCheck, ShieldOff, Sparkles, Square, Terminal, Trash2, Undo2, Upload, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
-type View = 'Overview' | 'Sites' | 'Clients' | 'Blueprints' | 'Agents' | 'Activity' | 'Settings';
+type View = 'Overview' | 'Sites' | 'Staging' | 'Clients' | 'Blueprints' | 'Agents' | 'Activity' | 'Settings';
 type Filter = 'All' | 'Running' | 'Attention';
 type SiteTab = 'Overview' | 'Updates' | 'Backups' | 'Tools';
 type SiteKind = 'wordpress' | 'lovable';
@@ -29,6 +29,8 @@ type Site = {
   sourceProvider: 'lovable' | 'git' | null; lovableProjectId: string | null; lovableWorkspaceId: string | null;
   lovableBuildUrl: string | null;
   blueprintId: string | null; blueprintName: string | null; blueprintAppliedAt: string | null;
+  environment: 'production' | 'staging'; productionSiteId: string | null; lastSyncedAt: string | null;
+  lastPromotedAt: string | null; syncSourceUpdatedAt: string | null;
   screenshot: { capturedAt: string; width: number; height: number } | null;
   monitoring: { lastCheck: MonitoringCheck | null; uptimePercent: number | null; averageLatencyMs: number | null; checkCount: number };
 };
@@ -48,7 +50,7 @@ type Inventory = {
 type SystemInfo = {
   connected: boolean; dockerVersion?: string; operatingSystem?: string; cpuCount?: number; memoryBytes?: number;
   totalContainers?: number; runningContainers?: number; managedSites?: number; runningSites?: number;
-  provisioningSites?: number; attentionSites?: number;
+  provisioningSites?: number; attentionSites?: number; productionSites?: number; stagingSites?: number;
   edge?: { installed: boolean; running: boolean; container: string; httpPort: number; httpsPort: number };
   agent?: { host: string; port: number }; error?: string;
   mcp?: { enabled: boolean; url: string; toolCount: number; config: Record<string, unknown> };
@@ -85,8 +87,8 @@ type McpAgent = {
   restartRequestedAt: string | null; revokedAt: string | null;
 };
 
-const nav: Array<{ view: View; icon: LucideIcon }> = [
-  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Clients', icon: Users },
+const nav: Array<{ view: View; icon: LucideIcon; subnav?: boolean }> = [
+  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Staging', icon: FlaskConical, subnav: true }, { view: 'Clients', icon: Users },
   { view: 'Blueprints', icon: Boxes },
   { view: 'Agents', icon: Bot },
   { view: 'Activity', icon: Activity }, { view: 'Settings', icon: Settings },
@@ -117,6 +119,7 @@ function apiFetch(path: string, init: RequestInit = {}) {
 export default function Home() {
   const [view, setView] = useState<View>('Sites');
   const [sites, setSites] = useState<Site[]>([]);
+  const [stagingSites, setStagingSites] = useState<Site[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
   const [agents, setAgents] = useState<McpAgent[]>([]);
@@ -128,6 +131,7 @@ export default function Home() {
   const [launchMode, setLaunchMode] = useState<LaunchMode>(null);
   const [clientOpen, setClientOpen] = useState(false);
   const [blueprintOpen, setBlueprintOpen] = useState(false);
+  const [stagingOpen, setStagingOpen] = useState(false);
   const [preferredBlueprintId, setPreferredBlueprintId] = useState<string | null>(null);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [loading, setLoading] = useState(true);
@@ -138,21 +142,24 @@ export default function Home() {
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [systemResponse, sitesResponse, clientsResponse, blueprintsResponse, agentsResponse, activityResponse] = await Promise.all([
+      const [systemResponse, sitesResponse, stagingResponse, clientsResponse, blueprintsResponse, agentsResponse, activityResponse] = await Promise.all([
         apiFetch('/api/system', { cache: 'no-store' }), apiFetch('/api/sites', { cache: 'no-store' }),
+        apiFetch('/api/staging', { cache: 'no-store' }),
         apiFetch('/api/clients', { cache: 'no-store' }), apiFetch('/api/blueprints', { cache: 'no-store' }),
         apiFetch('/api/agents', { cache: 'no-store' }),
         apiFetch('/api/activity', { cache: 'no-store' }),
       ]);
-      const [systemData, sitesData, clientsData, blueprintsData, agentsData, activityData] = await Promise.all([
+      const [systemData, sitesData, stagingData, clientsData, blueprintsData, agentsData, activityData] = await Promise.all([
         systemResponse.json().catch(() => ({ connected: false, error: 'Unable to read Docker status.' })),
-        sitesResponse.json().catch(() => ({ sites: [] })), clientsResponse.json().catch(() => ({ clients: [] })),
+        sitesResponse.json().catch(() => ({ sites: [] })), stagingResponse.json().catch(() => ({ staging: [] })),
+        clientsResponse.json().catch(() => ({ clients: [] })),
         blueprintsResponse.json().catch(() => ({ blueprints: [] })),
         agentsResponse.json().catch(() => ({ agents: [] })),
         activityResponse.json().catch(() => ({ activity: [] })),
-      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { clients?: Client[] }, { blueprints?: Blueprint[] }, { agents?: McpAgent[] }, { activity?: ActivityEntry[] }];
+      ]) as [SystemInfo, { sites?: Site[]; error?: string }, { staging?: Site[] }, { clients?: Client[] }, { blueprints?: Blueprint[] }, { agents?: McpAgent[] }, { activity?: ActivityEntry[] }];
       setSystem(systemData);
       if (sitesResponse.ok) setSites(sitesData.sites || []);
+      if (stagingResponse.ok) setStagingSites(stagingData.staging || []);
       if (clientsResponse.ok) setClients(clientsData.clients || []);
       if (blueprintsResponse.ok) setBlueprints(blueprintsData.blueprints || []);
       if (agentsResponse.ok) setAgents(agentsData.agents || []);
@@ -172,22 +179,23 @@ export default function Home() {
     return () => window.cancelAnimationFrame(frame);
   }, [refresh]);
   useEffect(() => {
-    const interval = window.setInterval(() => void refresh(true), sites.some((site) => site.status === 'Provisioning') ? 3000 : 10000);
+    const interval = window.setInterval(() => void refresh(true), [...sites, ...stagingSites].some((site) => site.status === 'Provisioning') ? 3000 : 10000);
     return () => window.clearInterval(interval);
-  }, [refresh, sites]);
+  }, [refresh, sites, stagingSites]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 4800);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  const selected = sites.find((site) => site.id === selectedId) || null;
+  const selected = [...sites, ...stagingSites].find((site) => site.id === selectedId) || null;
   const clientNames = useMemo(() => new Map(clients.map((client) => [client.id, client.name])), [clients]);
   const visibleSites = useMemo(() => sites.filter((site) => {
     const searchMatch = `${site.name} ${site.domain} ${site.kind} ${site.containerName} ${site.repositoryUrl || ''} ${site.repositoryBranch || ''} ${site.tags.join(' ')} ${site.clientId ? clientNames.get(site.clientId) || '' : ''}`.toLowerCase().includes(query.toLowerCase());
     const filterMatch = filter === 'All' || (filter === 'Running' ? site.status === 'Running' : site.status !== 'Running' || Boolean(site.error));
     return searchMatch && filterMatch;
   }), [clientNames, filter, query, sites]);
+  const visibleStagingSites = useMemo(() => stagingSites.filter((site) => `${site.name} ${site.domain} ${site.containerName} ${site.tags.join(' ')} ${site.productionSiteId ? sites.find((production) => production.id === site.productionSiteId)?.name || '' : ''}`.toLowerCase().includes(query.toLowerCase())), [query, sites, stagingSites]);
   const visibleClients = useMemo(() => clients.filter((client) => `${client.name} ${client.company} ${client.email} ${client.phone}`.toLowerCase().includes(query.toLowerCase())), [clients, query]);
   const visibleBlueprints = useMemo(() => blueprints.filter((blueprint) => `${blueprint.name} ${blueprint.description} ${blueprint.plugins.map((plugin) => plugin.slug).join(' ')} ${blueprint.themes.map((theme) => theme.slug).join(' ')} ${blueprint.files.map((file) => file.name).join(' ')}`.toLowerCase().includes(query.toLowerCase())), [blueprints, query]);
   const visibleAgents = useMemo(() => agents.filter((agent) => `${agent.name} ${agent.clientName || ''} ${agent.clientVersion || ''} ${agent.ip} ${agent.platform} ${agent.userAgent} ${agent.lastTool || ''}`.toLowerCase().includes(query.toLowerCase())), [agents, query]);
@@ -230,6 +238,38 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || 'The client could not be removed.');
       setToast(`${client.name} was removed. Sites were kept.`); await refresh(true);
     } catch (failure) { setToast(messageFrom(failure, 'The client could not be removed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function createStaging(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy('staging:create');
+    const body = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      const response = await apiFetch('/api/staging', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const result = await response.json() as { staging?: Site; error?: string };
+      if (!response.ok || !result.staging) throw new Error(result.error || 'The staging environment could not be created.');
+      setStagingOpen(false); setView('Staging'); setSelectedId(result.staging.id);
+      setToast(`${result.staging.name} is cloning production into isolated containers.`); await refresh(true);
+    } catch (failure) { setToast(messageFrom(failure, 'The staging environment could not be created.')); }
+    finally { setBusy(null); }
+  }
+
+  async function manageStaging(site: Site, action: 'sync' | 'promote' | 'delete') {
+    const production = sites.find((entry) => entry.id === site.productionSiteId);
+    if (action === 'sync' && !window.confirm(`Refresh ${site.name} from ${production?.name || 'production'}? A staging recovery point will be created, then staging files and database will be replaced.`)) return;
+    if (action === 'promote' && !window.confirm(`Push all staging files and database changes to ${production?.name || 'production'}? GeekHeros will create a production recovery point first.`)) return;
+    if (action === 'delete' && !window.confirm(`Delete ${site.name}, including its isolated containers, volumes and backups? Production will not be changed.`)) return;
+    setBusy(`staging:${site.id}:${action}`);
+    try {
+      const response = await apiFetch(`/api/staging/${encodeURIComponent(site.id)}/actions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action, scope: 'all' }),
+      });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || `Staging ${action} failed.`);
+      if (action === 'delete') setSelectedId(null);
+      const message = action === 'sync' ? 'refreshed from production' : action === 'promote' ? 'promoted to production' : 'deleted';
+      setToast(`${site.name} was ${message}.`); await refresh(true);
+    } catch (failure) { setToast(messageFrom(failure, `Staging ${action} failed.`)); }
     finally { setBusy(null); }
   }
 
@@ -327,16 +367,17 @@ export default function Home() {
     <aside className="sidebar">
       <button className="brand" onClick={() => navigate('Overview')}><span className="brand-mark">G</span><span>GeekHeros</span></button>
       <div className="workspace-switcher static-workspace"><span className="workspace-avatar">DK</span><span className="workspace-copy"><strong>Docker Desktop</strong><small>{system.connected ? 'Local node connected' : 'Agent offline'}</small></span><span className={`connection-light ${system.connected ? 'online' : ''}`} /></div>
-      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}{item.view === 'Agents' && <em>{agents.filter((agent) => agent.status === 'Connected').length}</em>}</button>)}</nav>
+      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${item.subnav ? 'subnav' : ''} ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Staging' && <em>{stagingSites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}{item.view === 'Agents' && <em>{agents.filter((agent) => agent.status === 'Connected').length}</em>}</button>)}</nav>
       <div className="node-card"><div className="node-card-head"><span>Managed fleet</span><strong>{system.runningSites || 0}/{system.managedSites || 0}</strong></div><div className="capacity-track"><span style={{ width: `${system.managedSites ? Math.round(((system.runningSites || 0) / system.managedSites) * 100) : 0}%` }} /></div><small>{system.cpuCount || 0} CPU · {formatBytes(system.memoryBytes || 0)} memory</small></div>
       <div className="sidebar-user"><span className="user-avatar">GH</span><span className="workspace-copy"><strong>Local administrator</strong><small>Docker access enabled</small></span></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, clients, blueprints and agents" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
+      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, staging, clients, blueprints and agents" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
       {error && <div className="connection-banner"><span><CircleAlert aria-hidden="true" /></span><div><strong>Docker control is unavailable</strong><p>{error}</p></div><button onClick={() => void refresh()}>Retry connection</button></div>}
       {selected ? <SiteWorkspace key={selected.id} site={selected} clients={clients} busy={busy} onBack={() => setSelectedId(null)} onOperate={operate} onSaveMetadata={saveMetadata} onLogin={oneClickLogin} /> : <div className="page-content">
         {view === 'Overview' && <Overview sites={sites} clients={clients} system={system} activity={activity} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={openLaunch} onOpen={setSelectedId} />}
+        {view === 'Staging' && <StagingView stagingSites={visibleStagingSites} productionSites={sites} busy={busy} onCreate={() => setStagingOpen(true)} onManage={manageStaging} onLogin={oneClickLogin} onOpen={setSelectedId} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
         {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
         {view === 'Agents' && <AgentsView agents={visibleAgents} allAgents={agents} busy={busy} onManage={manageAgent} onRefresh={() => void refresh(true)} />}
@@ -349,6 +390,7 @@ export default function Home() {
     {launchMode === 'lovable' && <LovableLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onOpenSettings={() => { setLaunchMode(null); navigate('Settings'); }} onSubmit={createSite} />}
     {clientOpen && <ClientModal client={editingClient} busy={busy === 'client:save'} onClose={() => { setClientOpen(false); setEditingClient(null); }} onSubmit={createClient} />}
     {blueprintOpen && <BlueprintModal busy={busy === 'blueprint:create'} onClose={() => setBlueprintOpen(false)} onSubmit={createBlueprint} />}
+    {stagingOpen && <CreateStagingModal productionSites={sites.filter((site) => site.kind === 'wordpress' && !stagingSites.some((staging) => staging.productionSiteId === site.id))} busy={busy === 'staging:create'} onClose={() => setStagingOpen(false)} onSubmit={createStaging} />}
     {toast && <div className="toast" role="status"><span><Check aria-hidden="true" /></span>{toast}<button onClick={() => setToast(null)} aria-label="Dismiss notification"><X aria-hidden="true" /></button></div>}
   </main>;
 }
@@ -370,6 +412,20 @@ function SitesView({ sites, clients, total, loading, query, onQuery, filter, onF
   return <><PageHeading eyebrow="DOCKER FLEET" title="Sites" description="Every row maps to a real WordPress or Lovable Docker workload." actions={<button className="primary-button" onClick={onLaunch}><Plus aria-hidden="true" />Launch site</button>} />
     <div className="metric-grid compact-metrics"><MetricCard icon={CirclePlay} tone="green" label="Running" value={String(sites.filter((site) => site.status === 'Running').length)} detail="Containers currently serving traffic" /><MetricCard icon={CircleAlert} tone="amber" label="Needs attention" value={String(sites.filter((site) => site.status !== 'Running').length)} detail="Stopped, provisioning or failed" /><MetricCard icon={Package} tone="violet" label="Updates found" value={String(sites.reduce((sum, site) => sum + site.updates, 0))} detail="WordPress packages and Lovable source" /><MetricCard icon={ArchiveRestore} tone="blue" label="Local backups" value={String(sites.reduce((sum, site) => sum + site.backupCount, 0))} detail="Stored outside application source" /></div>
     <section className="fleet-panel"><div className="panel-toolbar"><div className="filter-tabs">{(['All', 'Running', 'Attention'] as const).map((item) => <button key={item} className={filter === item ? 'selected' : ''} onClick={() => onFilter(item)}>{item}</button>)}</div><label className="table-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Search sites, clients or tags" /></label></div><div className="site-table" role="table"><div className="site-row table-header"><span>Site</span><span>Status</span><span>Client & tags</span><span>Workload</span><span>Uptime</span><span /></div>{sites.map((site) => <button className="site-row" key={site.id} onClick={() => onOpen(site.id)}><div className="site-cell"><span className="site-avatar">{initials(site.name)}</span><span><strong>{site.name}</strong><small>{site.domain}</small></span></div><Status site={site} /><span className="stacked"><strong>{site.clientId ? clientNames.get(site.clientId) || 'Unassigned' : 'Unassigned'}</strong><small>{site.tags.length ? site.tags.join(' · ') : 'No tags'}</small></span><span className="stacked"><strong>{site.kind === 'lovable' ? 'Lovable build' : site.wp === '—' ? 'Installing WordPress' : `WP ${site.wp}`}</strong><small>{site.kind === 'lovable' ? (site.sourceProvider === 'lovable' ? 'Direct Lovable source' : `${site.repositoryBranch || 'Auto-detect'} branch`) : `${site.updates} update${site.updates === 1 ? '' : 's'}`}</small></span><span className="uptime-cell"><strong>{site.uptime}</strong></span><span className="more-button"><ChevronRight aria-hidden="true" /></span></button>)}{!sites.length && <Empty title={loading ? 'Reading Docker Desktop…' : 'No managed sites yet'} copy={loading ? 'Live container state will appear here.' : 'Launch a WordPress or Lovable workload into Docker Desktop.'} />}</div><footer className="panel-footer"><span>Showing {sites.length} of {total} managed sites</span><span>Docker state refreshes automatically</span></footer></section></>;
+}
+
+function StagingView({ stagingSites, productionSites, busy, onCreate, onManage, onLogin, onOpen }: { stagingSites: Site[]; productionSites: Site[]; busy: string | null; onCreate: () => void; onManage: (site: Site, action: 'sync' | 'promote' | 'delete') => Promise<void>; onLogin: (site: Site) => Promise<void>; onOpen: (id: string) => void }) {
+  const running = stagingSites.filter((site) => site.status === 'Running').length;
+  const backups = stagingSites.reduce((sum, site) => sum + site.backupCount, 0);
+  const latestSync = stagingSites.map((site) => site.lastSyncedAt).filter(Boolean).sort().at(-1) || null;
+  return <><PageHeading eyebrow="WORDPRESS WORKFLOW" title="Staging" description="Safely test WordPress changes in isolated Docker environments before pushing them to production." actions={<button className="primary-button" onClick={onCreate}><Plus aria-hidden="true" />Create staging</button>} />
+    <div className="metric-grid compact-metrics"><MetricCard icon={FlaskConical} tone="violet" label="Staging sites" value={String(stagingSites.length)} detail={`${productionSites.filter((site) => site.kind === 'wordpress').length} production WordPress site${productionSites.filter((site) => site.kind === 'wordpress').length === 1 ? '' : 's'}`} /><MetricCard icon={CirclePlay} tone="green" label="Running" value={String(running)} detail="Isolated environments available now" /><MetricCard icon={ArchiveRestore} tone="blue" label="Recovery points" value={String(backups)} detail="Staging backups stored locally" /><MetricCard icon={Clock3} tone="amber" label="Latest refresh" value={latestSync ? relativeTime(latestSync) : '—'} detail="Production copied into staging" /></div>
+    <div className="staging-safety-note"><ShieldCheck aria-hidden="true" /><p><strong>Safe by default.</strong> Each staging site uses separate containers, database and volumes. Search engines are blocked, outbound email is suppressed, URLs are rewritten automatically, and every sync or promotion creates a recovery point first.</p></div>
+    <section className="staging-grid">{stagingSites.map((site) => {
+      const production = productionSites.find((entry) => entry.id === site.productionSiteId);
+      const actionBusy = Boolean(busy?.includes(site.id)) || site.status === 'Provisioning';
+      return <article className="staging-card" key={site.id}><div className="staging-card-head"><span className="staging-icon"><FlaskConical aria-hidden="true" /></span><div><small>STAGING ENVIRONMENT</small><h2>{site.name}</h2><a href={site.siteUrl} target="_blank" rel="noreferrer">{site.domain}<ExternalLink aria-hidden="true" /></a></div><Status site={site} /></div><div className="staging-route"><span><small>Production</small><strong>{production?.name || 'Missing production site'}</strong><em>{production?.domain || 'Unavailable'}</em></span><ArrowRight aria-hidden="true" /><span><small>Staging</small><strong>{site.name}</strong><em>{site.domain}</em></span></div>{site.error && <div className="staging-card-error"><CircleAlert aria-hidden="true" />{site.error}</div>}<div className="staging-meta"><span><small>Last production sync</small><strong>{site.lastSyncedAt ? relativeTime(site.lastSyncedAt) : 'Still cloning'}</strong></span><span><small>Last promotion</small><strong>{site.lastPromotedAt ? relativeTime(site.lastPromotedAt) : 'Never pushed live'}</strong></span><span><small>Recovery points</small><strong>{site.backupCount}</strong></span><span><small>Runtime</small><strong>WP {site.wp} · PHP {site.php}</strong></span></div><div className="staging-actions"><button className="secondary-button" disabled={actionBusy || !production} onClick={() => void onManage(site, 'sync')}><Download aria-hidden="true" />Sync from production</button><button className="primary-button" disabled={actionBusy || !production} onClick={() => void onManage(site, 'promote')}><Rocket aria-hidden="true" />Push to production</button><button className="secondary-button compact-action" disabled={actionBusy || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />WP Admin</button><button className="secondary-button compact-action" onClick={() => onOpen(site.id)}><ServerCog aria-hidden="true" />Manage</button><button className="staging-delete" disabled={actionBusy} onClick={() => void onManage(site, 'delete')} aria-label={`Delete ${site.name}`} title="Delete staging"><Trash2 aria-hidden="true" /></button></div></article>;
+    })}{!stagingSites.length && <div className="staging-empty"><span><FlaskConical aria-hidden="true" /></span><h2>No staging environments yet</h2><p>Clone a production WordPress site to test plugins, themes, content and configuration without touching the live site.</p><button className="primary-button" onClick={onCreate} disabled={!productionSites.some((site) => site.kind === 'wordpress')}><Plus aria-hidden="true" />Create your first staging site</button>{!productionSites.some((site) => site.kind === 'wordpress') && <small>Launch a production WordPress site first.</small>}</div>}</section></>;
 }
 
 function ClientsView({ clients, sites, busy, onAdd, onEdit, onDelete, onOpenSite }: { clients: Client[]; sites: Site[]; busy: string | null; onAdd: () => void; onEdit: (client: Client) => void; onDelete: (client: Client) => void; onOpenSite: (id: string) => void }) {
@@ -421,7 +477,7 @@ function SiteWorkspace({ site, clients, busy, onBack, onOperate, onSaveMetadata,
   async function run(type: string, options: Record<string, unknown> = {}) { if (await onOperate(site, type, options)) await loadInventory(); }
   async function saveAssignment(event: FormEvent<HTMLFormElement>) { event.preventDefault(); await onSaveMetadata(site, clientId || null, tags.split(',').map((tag) => tag.trim()).filter(Boolean)); }
 
-  return <div className="site-workspace"><div className="site-hero"><div className="site-hero-toolbar"><button className="back-button" onClick={onBack}><ArrowLeft aria-hidden="true" />All sites</button><span>{site.kind === 'lovable' ? 'Lovable application' : 'Managed WordPress site'}</span></div><div className="site-profile-band"><SiteThumbnail key={`${site.id}:${site.status}:${site.screenshot?.capturedAt || ''}`} site={site} /><div className="site-profile-content"><div className="site-profile-top"><div className="site-profile-heading"><h1>{site.name}</h1><a href={site.siteUrl} target="_blank" rel="noreferrer"><Globe2 aria-hidden="true" />{site.domain}<ExternalLink aria-hidden="true" /></a></div><div className="site-actions">{site.kind === 'wordpress' ? <button className="primary-button site-login-button" disabled={!canOperate || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />One-click WP Admin</button> : site.lovableBuildUrl && <a className="primary-button link-button site-login-button" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open in Lovable</a>}<details className="site-action-menu"><summary><ServerCog aria-hidden="true" />Actions<ChevronDown aria-hidden="true" /></summary><div>{site.status === 'Stopped' ? <button disabled={!canOperate} onClick={() => void run('start')}><Play aria-hidden="true" />Start site</button> : <button disabled={!canOperate} onClick={() => void run('stop')}><Square aria-hidden="true" />Stop site</button>}<button disabled={!canOperate} onClick={() => void run('restart')}><RotateCw aria-hidden="true" />Restart site</button><button disabled={!canOperate} onClick={() => void run('refresh')}><RefreshCw aria-hidden="true" />Refresh site state</button><a href={site.directUrl || site.siteUrl} target="_blank" rel="noreferrer"><ExternalLink aria-hidden="true" />Open frontend</a></div></details></div></div><div className="site-profile-bottom"><div className="site-profile-labels"><Status site={site} /><span className="profile-badge">{site.pod}</span>{site.blueprintName && <span className="profile-badge blueprint">{site.blueprintName}</span>}<span className="client-badge"><Users aria-hidden="true" />{clientName}</span>{site.tags.map((tag) => <span className="tag-badge" key={tag}>{tag}</span>)}</div><div className="runtime-badges">{site.kind === 'wordpress' ? <><span><strong>WP</strong>{site.wp}</span><span><strong>PHP</strong>{site.php}</span></> : <><span><strong>{site.sourceProvider === 'lovable' ? 'Source' : 'Git'}</strong>{site.sourceProvider === 'lovable' ? 'Lovable' : site.repositoryBranch || 'Auto'}</span><span><strong>Rev</strong>{shortRevision(site.sourceRevision)}</span></>}</div></div></div></div><nav className="site-tabs" aria-label="Site management">{tabs.map(({ id, label, icon: Icon }) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon aria-hidden="true" />{label}{id === 'Updates' && site.updates > 0 && <em>{site.updates}</em>}</button>)}</nav></div>
+  return <div className="site-workspace"><div className="site-hero"><div className="site-hero-toolbar"><button className="back-button" onClick={onBack}><ArrowLeft aria-hidden="true" />{site.environment === 'staging' ? 'Staging' : 'All sites'}</button><span>{site.kind === 'lovable' ? 'Lovable application' : site.environment === 'staging' ? 'Isolated WordPress staging environment' : 'Managed WordPress site'}</span></div><div className="site-profile-band"><SiteThumbnail key={`${site.id}:${site.status}:${site.screenshot?.capturedAt || ''}`} site={site} /><div className="site-profile-content"><div className="site-profile-top"><div className="site-profile-heading"><h1>{site.name}</h1><a href={site.siteUrl} target="_blank" rel="noreferrer"><Globe2 aria-hidden="true" />{site.domain}<ExternalLink aria-hidden="true" /></a></div><div className="site-actions">{site.kind === 'wordpress' ? <button className="primary-button site-login-button" disabled={!canOperate || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />One-click WP Admin</button> : site.lovableBuildUrl && <a className="primary-button link-button site-login-button" href={site.lovableBuildUrl} target="_blank" rel="noreferrer"><Sparkles aria-hidden="true" />Open in Lovable</a>}<details className="site-action-menu"><summary><ServerCog aria-hidden="true" />Actions<ChevronDown aria-hidden="true" /></summary><div>{site.status === 'Stopped' ? <button disabled={!canOperate} onClick={() => void run('start')}><Play aria-hidden="true" />Start site</button> : <button disabled={!canOperate} onClick={() => void run('stop')}><Square aria-hidden="true" />Stop site</button>}<button disabled={!canOperate} onClick={() => void run('restart')}><RotateCw aria-hidden="true" />Restart site</button><button disabled={!canOperate} onClick={() => void run('refresh')}><RefreshCw aria-hidden="true" />Refresh site state</button><a href={site.directUrl || site.siteUrl} target="_blank" rel="noreferrer"><ExternalLink aria-hidden="true" />Open frontend</a></div></details></div></div><div className="site-profile-bottom"><div className="site-profile-labels"><Status site={site} />{site.environment === 'staging' && <span className="profile-badge staging"><FlaskConical aria-hidden="true" />Staging</span>}<span className="profile-badge">{site.pod}</span>{site.blueprintName && <span className="profile-badge blueprint">{site.blueprintName}</span>}<span className="client-badge"><Users aria-hidden="true" />{clientName}</span>{site.tags.map((tag) => <span className="tag-badge" key={tag}>{tag}</span>)}</div><div className="runtime-badges">{site.kind === 'wordpress' ? <><span><strong>WP</strong>{site.wp}</span><span><strong>PHP</strong>{site.php}</span></> : <><span><strong>{site.sourceProvider === 'lovable' ? 'Source' : 'Git'}</strong>{site.sourceProvider === 'lovable' ? 'Lovable' : site.repositoryBranch || 'Auto'}</span><span><strong>Rev</strong>{shortRevision(site.sourceRevision)}</span></>}</div></div></div></div><nav className="site-tabs" aria-label="Site management">{tabs.map(({ id, label, icon: Icon }) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}><Icon aria-hidden="true" />{label}{id === 'Updates' && site.updates > 0 && <em>{site.updates}</em>}</button>)}</nav></div>
     <div className="site-tab-content">{site.error && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Last operation failed</strong><p>{site.error}</p></div></div>}{site.phase && <div className="provisioning-banner"><span className="spinner" /><div><strong>{site.phase}</strong><p>GeekHeros is applying the requested Docker state. This page refreshes automatically.</p></div></div>}{site.kind === 'wordpress' && inventoryError && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Live WordPress inventory unavailable</strong><p>{inventoryError}</p></div></div>}
       {tab === 'Overview' && <SiteOverview site={site} clients={clients} clientId={clientId} tags={tags} busy={isBusy} onClientId={setClientId} onTags={setTags} onSave={saveAssignment} />}
       {tab === 'Updates' && (site.kind === 'lovable' ? <LovableDeploymentsPanel site={site} disabled={!canOperate} onRun={run} /> : <UpdatesPanel site={site} inventory={inventory} loading={inventoryLoading} disabled={!canOperate} onRun={run} onRefresh={loadInventory} />)}
@@ -844,6 +900,20 @@ function BlueprintModal({ busy, onClose, onSubmit }: { busy: boolean; onClose: (
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !locked) onClose(); }}><section className="modal blueprint-modal" role="dialog" aria-modal="true" aria-labelledby="blueprint-modal-title"><div className="modal-head"><div><p className="eyebrow">WORDPRESS STARTER</p><h2 id="blueprint-modal-title">Add blueprint</h2><p>Bundle the packages and configuration that turn a clean WordPress install into your standard starting point.</p></div><button onClick={onClose} disabled={locked} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={submit}><div className="form-grid"><label>Blueprint name<input name="name" required maxLength={100} placeholder="Agency marketing starter" autoFocus /></label><label>Description<input name="description" maxLength={500} placeholder="SEO, forms, security and base pages" /></label><label>WordPress.org plugin slugs<textarea name="plugins" rows={4} placeholder={'wordpress-seo\nwordfence\nwpforms-lite'} /><small>For WordPress.org catalog plugins only. Do not add a slug for a plugin ZIP uploaded below.</small></label><label>WordPress.org theme slugs<textarea name="themes" rows={4} placeholder="astra" /><small>For WordPress.org catalog themes only. Do not add a slug for a theme ZIP uploaded below.</small></label><label className="full-field blueprint-upload"><span>Blueprint files</span><input type="file" multiple onChange={(event) => { addFiles(event.target.files); event.target.value = ''; }} /><small>Add plugin or theme ZIPs, settings JSON, WordPress export XML, must-use plugin PHP, or any file that belongs under wp-content.</small></label><div className="full-field blueprint-upload-list">{uploads.map((upload) => <div className="blueprint-upload-row" key={upload.id}><span><strong>{upload.file.name}</strong><small>{formatBytes(upload.file.size)}</small></span><select aria-label={`Purpose for ${upload.file.name}`} value={upload.kind} onChange={(event) => updateUpload(upload.id, { kind: event.target.value as BlueprintFileKind })}>{blueprintKindsForFile(upload.file.name).map((kind) => <option key={kind} value={kind}>{blueprintFileKindLabel(kind)}</option>)}</select>{upload.kind === 'wp-content' && <input aria-label={`Destination for ${upload.file.name}`} value={upload.destination} onChange={(event) => updateUpload(upload.id, { destination: event.target.value })} placeholder={`wp-content/blueprint-files/${upload.file.name}`} />}<button type="button" onClick={() => setUploads((current) => current.filter((item) => item.id !== upload.id))} aria-label={`Remove ${upload.file.name}`}><X aria-hidden="true" /></button></div>)}{!uploads.length && <p>No files selected. You can still create a blueprint from WordPress.org plugin or theme slugs.</p>}</div></div><div className="blueprint-json-note"><Info aria-hidden="true" /><p><strong>Settings JSON format</strong>Use the top-level fields <code>options</code>, <code>plugins</code>, <code>themes</code> and <code>pages</code>. Unknown fields are rejected so a bad export cannot silently misconfigure a launch.</p><button type="button" onClick={downloadBlueprintSettingsExample}>Download example JSON</button></div>{error && <p className="blueprint-form-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={locked}>Cancel</button><button className="primary-button" disabled={locked}>{locked ? 'Saving blueprint…' : 'Add blueprint'}</button></div></form></section></div>;
 }
 
+function CreateStagingModal({ productionSites, busy, onClose, onSubmit }: { productionSites: Site[]; busy: boolean; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  const [productionSiteId, setProductionSiteId] = useState(productionSites[0]?.id || '');
+  const source = productionSites.find((site) => site.id === productionSiteId) || null;
+  const [name, setName] = useState(source ? `${source.name} Staging` : '');
+  const [domain, setDomain] = useState(source ? stagingDomainFor(source.domain) : '');
+  function chooseProduction(id: string) {
+    const next = productionSites.find((site) => site.id === id);
+    setProductionSiteId(id);
+    setName(next ? `${next.name} Staging` : '');
+    setDomain(next ? stagingDomainFor(next.domain) : '');
+  }
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal staging-modal" role="dialog" aria-modal="true" aria-labelledby="staging-modal-title"><div className="modal-head"><div><p className="eyebrow">SAFE WORDPRESS WORKFLOW</p><h2 id="staging-modal-title">Create staging</h2><p>Clone a production WordPress site into a completely isolated local environment.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><div className="staging-workflow"><span>1</span><p><strong>Clone</strong>Copy WordPress files and database.</p><span>2</span><p><strong>Test</strong>Work safely with email and indexing blocked.</p><span>3</span><p><strong>Promote</strong>Back up production and push changes live.</p></div><div className="form-grid"><label className="full-field">Production WordPress site<select name="productionSiteId" value={productionSiteId} onChange={(event) => chooseProduction(event.target.value)} required autoFocus><option value="" disabled>Choose a production site</option>{productionSites.map((site) => <option value={site.id} key={site.id}>{site.name} — {site.domain}</option>)}</select><small>Each production WordPress site can have one isolated staging environment.</small></label><label>Staging name<input name="name" required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="Client Site Staging" /></label><label>Staging domain<input name="domain" required value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="staging.client.localhost" /></label><label className="full-field">Container profile<select name="pod" defaultValue={source?.pod || 'Standard'} key={source?.id || 'none'}><option>Micro</option><option>Standard</option><option>Performance</option><option>Power</option></select><small>Defaults to the same resource profile as production.</small></label></div><div className="launch-footnote"><span><ShieldCheck aria-hidden="true" /></span><p>The production site is read-only during cloning. Staging gets its own database, files, network, hostname and containers. URLs are rewritten automatically, and production is never overwritten until you explicitly choose Push to production.</p></div>{!productionSites.length && <p className="staging-form-error" role="alert">Every production WordPress site already has staging, or no WordPress production site exists yet.</p>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy || !source}>{busy ? 'Cloning production…' : 'Create staging'}</button></div></form></section></div>;
+}
+
 function ClientModal({ client, busy, onClose, onSubmit }: { client: Client | null; busy: boolean; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !busy) onClose(); }}><section className="modal small-modal" role="dialog" aria-modal="true" aria-labelledby="client-title"><div className="modal-head"><div><p className="eyebrow">CLIENT RECORD</p><h2 id="client-title">{client ? 'Edit client' : 'Add client'}</h2><p>{client ? 'Update the client record without changing its assigned sites.' : 'Create an empty client record, then assign real sites to it.'}</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div><form onSubmit={onSubmit}><div className="form-grid"><label>Client name<input name="name" required maxLength={100} defaultValue={client?.name || ''} autoFocus /></label><label>Company<input name="company" maxLength={120} defaultValue={client?.company || ''} /></label><label>Email<input name="email" type="email" maxLength={160} defaultValue={client?.email || ''} /></label><label>Phone<input name="phone" maxLength={60} defaultValue={client?.phone || ''} /></label><label className="full-field">Notes<textarea name="notes" maxLength={1000} rows={4} defaultValue={client?.notes || ''} /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy}>{busy ? 'Saving…' : 'Save client'}</button></div></form></section></div>; }
 
 function Status({ site }: { site: Site }) { const tone = site.status.toLowerCase().replace(/[^a-z]+/g, '-'); return <span className={`status-pill ${tone}`}><i />{site.phase || site.status}</span>; }
@@ -855,6 +925,7 @@ function inferBlueprintFileKind(name: string): BlueprintFileKind { const extensi
 function blueprintKindsForFile(name: string): BlueprintFileKind[] { const inferred = inferBlueprintFileKind(name); return inferred === 'plugin' ? ['plugin', 'theme', 'wp-content'] : inferred === 'settings' ? ['settings', 'wp-content'] : inferred === 'content' ? ['content', 'wp-content'] : inferred === 'mu-plugin' ? ['mu-plugin', 'wp-content'] : ['wp-content']; }
 function blueprintFileKindLabel(kind: BlueprintFileKind) { return ({ plugin: 'Plugin ZIP', theme: 'Theme ZIP', settings: 'Settings JSON', content: 'WordPress export XML', 'mu-plugin': 'Must-use plugin', 'wp-content': 'wp-content file' } as const)[kind]; }
 function blueprintItemCount(blueprint: Blueprint) { return blueprint.plugins.length + blueprint.themes.length + blueprint.fileCount; }
+function stagingDomainFor(domain: string) { return `staging.${domain.replace(/^staging\./, '')}`; }
 function fileToBase64(file: File) { return new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onerror = () => reject(new Error(`${file.name} could not be read.`)); reader.onload = () => { const result = String(reader.result || ''); const separator = result.indexOf(','); if (separator < 0) reject(new Error(`${file.name} could not be encoded.`)); else resolve(result.slice(separator + 1)); }; reader.readAsDataURL(file); }); }
 function downloadBlueprintSettingsExample() { const example = { options: { blogdescription: 'A concise site tagline', timezone_string: 'America/Los_Angeles', default_comment_status: 'closed' }, plugins: [{ slug: 'wordpress-seo', activate: true }], themes: [{ slug: 'astra', activate: true }], pages: [{ title: 'Home', slug: 'home', status: 'publish', content: '<h1>Welcome</h1>' }] }; const url = URL.createObjectURL(new Blob([`${JSON.stringify(example, null, 2)}\n`], { type: 'application/json' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'geekheros-blueprint-settings.json'; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 0); }
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
