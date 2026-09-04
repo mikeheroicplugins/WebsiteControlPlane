@@ -13,7 +13,7 @@ import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 
-type View = 'Overview' | 'Sites' | 'Staging' | 'Clients' | 'Blueprints' | 'Agents' | 'Analytics' | 'Activity' | 'Settings';
+type View = 'Overview' | 'Sites' | 'Staging' | 'Domains' | 'Clients' | 'Blueprints' | 'Agents' | 'Analytics' | 'Activity' | 'Settings';
 type Filter = 'All' | 'Running' | 'Attention';
 type SiteTab = 'Overview' | 'Updates' | 'Backups' | 'Tools';
 type SiteKind = 'wordpress' | 'lovable';
@@ -142,11 +142,38 @@ type AnalyticsData = {
   recentChecks: AnalyticsCheck[];
   operationTypes: Array<{ type: string; count: number; failures: number }>;
 };
+type PorkbunMode = 'sandbox' | 'live';
+type PorkbunCredentialStatus = { configured: boolean; apiKey: string | null; updatedAt: string | null };
+type PorkbunStatus = {
+  provider: 'Porkbun'; mode: PorkbunMode; credentials: Record<PorkbunMode, PorkbunCredentialStatus>;
+  operationCount: number; apiVersion: string;
+};
+type PorkbunDomain = {
+  domain: string; status: string; tld: string; createDate: string; expireDate: string;
+  securityLock: number; whoisPrivacy: number; autoRenew: number; apiAccess: number; notLocal: number;
+  labels?: Array<{ id: string; title: string; color: string }>;
+};
+type PorkbunTransfer = { domain: string; status: string; statusDescription?: string; transferDate?: string; orderId?: number };
+type PorkbunDashboard = {
+  status: PorkbunStatus; balance: { balance?: number; display?: string } | null;
+  domains: PorkbunDomain[]; transfers: PorkbunTransfer[]; errors: string[];
+};
+type PorkbunOperation = {
+  id: string; group: string; method: 'GET' | 'POST'; path: string; summary: string; pathParameters: string[];
+  billable: boolean; destructive: boolean; requiresConfirmation: boolean; supportsDryRun: boolean;
+};
+type PorkbunCallResult = { mode: PorkbunMode; operation: PorkbunOperation; data: Record<string, unknown> };
+type DomainAvailability = {
+  avail: 'yes' | 'no'; type: string; price: string; firstYearPromo?: 'yes' | 'no'; regularPrice?: string;
+  premium?: 'yes' | 'no'; minDuration?: number;
+  additional?: { renewal?: { price?: string; regularPrice?: string }; transfer?: { price?: string; regularPrice?: string } };
+};
+type PorkbunDnsRecord = { id: string; name: string; type: string; content: string; ttl: string; prio: string | null; notes: string | null };
 
 type NavigationItem = { view: View; icon: LucideIcon; children?: Array<{ view: View; icon: LucideIcon }> };
 
 const nav: NavigationItem[] = [
-  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container, children: [{ view: 'Staging', icon: FlaskConical }] }, { view: 'Clients', icon: Users },
+  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container, children: [{ view: 'Staging', icon: FlaskConical }, { view: 'Domains', icon: Globe2 }] }, { view: 'Clients', icon: Users },
   { view: 'Blueprints', icon: Boxes },
   { view: 'Agents', icon: Bot },
   { view: 'Analytics', icon: ChartNoAxesCombined },
@@ -546,12 +573,13 @@ export default function Home() {
       <div className="sidebar-user"><span className="user-avatar">GH</span><span className="workspace-copy"><strong>Local administrator</strong><small>Docker access enabled</small></span></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, staging, clients, blueprints and agents" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
+      <header className="topbar"><label className="global-search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sites, staging, domains, clients, blueprints and agents" /></label><div className={`top-actions ${system.connected ? '' : 'offline-copy'}`}><span className="live-dot" />{system.connected ? `Docker ${system.dockerVersion}` : 'Docker agent offline'}<button className="icon-button" onClick={() => void refresh()} aria-label="Refresh"><RefreshCw aria-hidden="true" /></button></div></header>
       {error && <div className="connection-banner"><span><CircleAlert aria-hidden="true" /></span><div><strong>Docker control is unavailable</strong><p>{error}</p></div><button onClick={() => void refresh()}>Retry connection</button></div>}
       {selected ? <SiteWorkspace key={selected.id} site={selected} clients={clients} backupHistoryRevision={[...sites, ...stagingSites].map((site) => `${site.id}:${site.backupCount}:${site.lastBackupAt || ''}`).join('|')} busy={busy} onBack={() => setSelectedId(null)} onOperate={operate} onRestoreBackup={restoreSiteBackup} onSaveMetadata={saveMetadata} onSaveBackupSchedule={saveBackupSchedule} onLogin={oneClickLogin} /> : <div className="page-content">
         {view === 'Overview' && <Overview sites={sites} clients={clients} system={system} activity={activity} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Staging' && <StagingView stagingSites={visibleStagingSites} productionSites={sites} busy={busy} onCreate={() => setStagingOpen(true)} onManage={manageStaging} onBackup={(site) => operate(site, 'backup')} onLogin={oneClickLogin} onOpen={setSelectedId} />}
+        {view === 'Domains' && <DomainsView onToast={setToast} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
         {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} pluginLibrary={pluginLibrary} busy={busy} onAdd={() => { setEditingBlueprint(null); setBlueprintOpen(true); }} onEdit={(blueprint) => { setEditingBlueprint(blueprint); setBlueprintOpen(true); }} onBrowse={(blueprintId) => { setPluginBrowserBlueprintId(blueprintId); setPluginBrowserOpen(true); }} onDelete={deleteBlueprint} onDeleteLibraryPlugin={deleteLibraryPlugin} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
         {view === 'Agents' && <AgentsView agents={visibleAgents} allAgents={agents} busy={busy} onManage={manageAgent} onRefresh={() => void refresh(true)} />}
@@ -602,6 +630,210 @@ function StagingView({ stagingSites, productionSites, busy, onCreate, onManage, 
       const actionBusy = Boolean(busy?.includes(site.id)) || site.status === 'Provisioning';
       return <article className="staging-card" key={site.id}><div className="staging-card-head"><span className="staging-icon"><FlaskConical aria-hidden="true" /></span><div><small>STAGING ENVIRONMENT</small><h2>{site.name}</h2><a href={site.siteUrl} target="_blank" rel="noreferrer">{site.domain}<ExternalLink aria-hidden="true" /></a></div><Status site={site} /></div><div className="staging-route"><span><small>Production</small><strong>{production?.name || 'Missing production site'}</strong><em>{production?.domain || 'Unavailable'}</em></span><ArrowRight aria-hidden="true" /><span><small>Staging</small><strong>{site.name}</strong><em>{site.domain}</em></span></div>{site.error && <div className="staging-card-error"><CircleAlert aria-hidden="true" />{site.error}</div>}<div className="staging-meta"><span><small>Last production sync</small><strong>{site.lastSyncedAt ? relativeTime(site.lastSyncedAt) : 'Still cloning'}</strong></span><span><small>Last promotion</small><strong>{site.lastPromotedAt ? relativeTime(site.lastPromotedAt) : 'Never pushed live'}</strong></span><span><small>Recovery points</small><strong>{site.backupCount}</strong></span><span><small>Runtime</small><strong>WP {site.wp} · PHP {site.php}</strong></span></div><div className="staging-actions"><button className="secondary-button" disabled={actionBusy || !production} onClick={() => void onManage(site, 'sync')}><Download aria-hidden="true" />Sync from production</button><button className="primary-button" disabled={actionBusy || !production} onClick={() => void onManage(site, 'promote')}><Rocket aria-hidden="true" />Push to production</button><button className="secondary-button compact-action" disabled={actionBusy || site.status !== 'Running'} onClick={() => void onBackup(site)}><ArchiveRestore aria-hidden="true" />Back up now</button><button className="secondary-button compact-action" disabled={actionBusy || site.status !== 'Running'} onClick={() => void onLogin(site)}><LogIn aria-hidden="true" />WP Admin</button><button className="secondary-button compact-action" onClick={() => onOpen(site.id)}><ServerCog aria-hidden="true" />Manage</button><button className="staging-delete" disabled={actionBusy} onClick={() => void onManage(site, 'delete')} aria-label={`Delete ${site.name}`} title="Delete staging"><Trash2 aria-hidden="true" /></button></div></article>;
     })}{!stagingSites.length && <div className="staging-empty"><span><FlaskConical aria-hidden="true" /></span><h2>No staging environments yet</h2><p>Clone a production WordPress site to test plugins, themes, content and configuration without touching the live site.</p><button className="primary-button" onClick={onCreate} disabled={!productionSites.some((site) => site.kind === 'wordpress')}><Plus aria-hidden="true" />Create your first staging site</button>{!productionSites.some((site) => site.kind === 'wordpress') && <small>Launch a production WordPress site first.</small>}</div>}</section></>;
+}
+
+function DomainsView({ onToast }: { onToast: (message: string) => void }) {
+  const [dashboard, setDashboard] = useState<PorkbunDashboard | null>(null);
+  const [operations, setOperations] = useState<PorkbunOperation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [domainQuery, setDomainQuery] = useState('');
+  const [availability, setAvailability] = useState<{ domain: string; result: DomainAvailability } | null>(null);
+  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  const [dnsRecords, setDnsRecords] = useState<PorkbunDnsRecord[]>([]);
+  const [dnsLoading, setDnsLoading] = useState(false);
+  const [operationGroup, setOperationGroup] = useState('Domain');
+  const [operationId, setOperationId] = useState('getDomain');
+  const [pathParameters, setPathParameters] = useState<Record<string, string>>({ domain: '' });
+  const [queryJson, setQueryJson] = useState('{}');
+  const [bodyJson, setBodyJson] = useState('{}');
+  const [operationConfirmed, setOperationConfirmed] = useState(false);
+  const [operationResult, setOperationResult] = useState('');
+
+  const load = useCallback(async (mode?: PorkbunMode) => {
+    setLoading(true);
+    try {
+      const [dashboardResponse, operationsResponse] = await Promise.all([
+        apiFetch(`/api/domains${mode ? `?mode=${mode}` : ''}`, { cache: 'no-store' }),
+        apiFetch('/api/domains/operations', { cache: 'no-store' }),
+      ]);
+      const dashboardPayload = await dashboardResponse.json() as { dashboard?: PorkbunDashboard; error?: string };
+      const operationsPayload = await operationsResponse.json() as { operations?: PorkbunOperation[]; error?: string };
+      if (!dashboardResponse.ok || !dashboardPayload.dashboard) throw new Error(dashboardPayload.error || 'Porkbun data could not be loaded.');
+      setDashboard(dashboardPayload.dashboard);
+      if (operationsResponse.ok) setOperations(operationsPayload.operations || []);
+    } catch (failure) { onToast(messageFrom(failure, 'Porkbun data could not be loaded.')); }
+    finally { setLoading(false); }
+  }, [onToast]);
+
+  useEffect(() => { const frame = window.requestAnimationFrame(() => void load()); return () => window.cancelAnimationFrame(frame); }, [load]);
+
+  async function invoke(operation: string, input: { pathParameters?: Record<string, unknown>; query?: Record<string, unknown>; body?: Record<string, unknown>; confirm?: boolean; mode?: PorkbunMode } = {}) {
+    const response = await apiFetch('/api/domains', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ operationId: operation, mode: input.mode || dashboard?.status.mode, ...input }) });
+    const payload = await response.json() as { result?: PorkbunCallResult; error?: string };
+    if (!response.ok || !payload.result) throw new Error(payload.error || 'Porkbun operation failed.');
+    return payload.result;
+  }
+
+  async function switchMode(mode: PorkbunMode) {
+    if (mode === dashboard?.status.mode) return;
+    setBusy('mode');
+    try {
+      const response = await apiFetch('/api/domains', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'mode', mode }) });
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error || 'Mode could not be changed.');
+      setAvailability(null); setSelectedDomain(null); setDnsRecords([]);
+      await load(mode);
+      onToast(`Domains switched to ${mode === 'sandbox' ? 'Test' : 'Live'} mode.`);
+    } catch (failure) { onToast(messageFrom(failure, 'Mode could not be changed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function saveCredentials(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy('credentials');
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form).entries());
+    try {
+      const response = await apiFetch('/api/domains', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'credentials', mode: values.mode, apiKey: values.apiKey, secretApiKey: values.secretApiKey, activate: values.activate === 'on' }) });
+      const payload = await response.json() as { status?: PorkbunStatus; error?: string };
+      if (!response.ok || !payload.status) throw new Error(payload.error || 'Credentials could not be saved.');
+      form.reset(); await load(payload.status.mode); onToast(`${values.mode === 'sandbox' ? 'Test' : 'Live'} Porkbun credentials saved locally.`);
+    } catch (failure) { onToast(messageFrom(failure, 'Credentials could not be saved.')); }
+    finally { setBusy(null); }
+  }
+
+  async function searchDomain(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const domain = domainQuery.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (!domain) return;
+    setBusy('search'); setAvailability(null);
+    try {
+      const result = await invoke('domainCheckDomain', { pathParameters: { domain } });
+      const response = result.data.response as DomainAvailability | undefined;
+      if (!response) throw new Error('Porkbun returned no availability result.');
+      setAvailability({ domain, result: response });
+    } catch (failure) { onToast(messageFrom(failure, 'Domain search failed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function registerDomain() {
+    if (!availability || availability.result.avail !== 'yes') return;
+    const duration = Math.max(1, Number(availability.result.minDuration) || 1);
+    const price = Math.round(Number(availability.result.price) * duration * 100);
+    if (!Number.isFinite(price) || price < 1) return onToast('Porkbun did not return a valid registration quote.');
+    setBusy('register');
+    try {
+      const preview = await invoke('domainCreate', { pathParameters: { domain: availability.domain }, body: { cost: price, agreeToTerms: 'yes', whoisPrivacy: true, dryRun: true } });
+      const previewData = preview.data as { message?: string };
+      const mode = dashboard?.status.mode || 'sandbox';
+      const confirmed = window.confirm(`${mode === 'live' ? 'LIVE PURCHASE' : 'TEST REGISTRATION'}\n\nRegister ${availability.domain} for $${(price / 100).toFixed(2)}${duration > 1 ? ` (${duration} years)` : ''}?\n\n${previewData.message || 'Porkbun preflight succeeded.'}`);
+      if (!confirmed) return;
+      await invoke('domainCreate', { pathParameters: { domain: availability.domain }, body: { cost: price, agreeToTerms: 'yes', whoisPrivacy: true, dryRun: false }, confirm: true });
+      onToast(`${availability.domain} registered in ${mode === 'live' ? 'Live' : 'Test'} mode.`); setAvailability(null); await load();
+    } catch (failure) { onToast(messageFrom(failure, 'Domain registration failed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function renewDomain(domain: string) {
+    setBusy(`renew:${domain}`);
+    try {
+      const quote = await invoke('domainCheckDomain', { pathParameters: { domain } });
+      const response = quote.data.response as DomainAvailability | undefined;
+      const priceText = response?.additional?.renewal?.price;
+      const cost = Math.round(Number(priceText) * 100);
+      if (!priceText || !Number.isFinite(cost) || cost < 1) throw new Error('Porkbun did not return a valid renewal quote.');
+      const preview = await invoke('domainRenew', { pathParameters: { domain }, body: { cost, dryRun: true } });
+      const previewData = preview.data as { message?: string };
+      if (!window.confirm(`${dashboard?.status.mode === 'live' ? 'LIVE RENEWAL' : 'TEST RENEWAL'}\n\nRenew ${domain} for $${priceText}?\n\n${previewData.message || 'Porkbun preflight succeeded.'}`)) return;
+      await invoke('domainRenew', { pathParameters: { domain }, body: { cost, dryRun: false }, confirm: true });
+      onToast(`${domain} renewed.`); await load();
+    } catch (failure) { onToast(messageFrom(failure, 'Domain renewal failed.')); }
+    finally { setBusy(null); }
+  }
+
+  async function setAutoRenew(domain: PorkbunDomain) {
+    const next = domain.autoRenew ? 'off' : 'on';
+    if (!window.confirm(`Turn automatic renewal ${next} for ${domain.domain}?`)) return;
+    setBusy(`auto:${domain.domain}`);
+    try {
+      await invoke('domainUpdateAutoRenew', { pathParameters: { domain: domain.domain }, body: { status: next }, confirm: true });
+      onToast(`Automatic renewal turned ${next} for ${domain.domain}.`); await load();
+    } catch (failure) { onToast(messageFrom(failure, 'Automatic renewal could not be updated.')); }
+    finally { setBusy(null); }
+  }
+
+  async function loadDns(domain: string) {
+    setSelectedDomain(domain); setDnsLoading(true); setDnsRecords([]);
+    try {
+      const result = await invoke('getDnsRecords', { pathParameters: { domain } });
+      setDnsRecords((result.data.records || []) as PorkbunDnsRecord[]);
+    } catch (failure) { onToast(messageFrom(failure, 'DNS records could not be loaded.')); }
+    finally { setDnsLoading(false); }
+  }
+
+  async function createDns(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); if (!selectedDomain) return;
+    const form = event.currentTarget; const values = Object.fromEntries(new FormData(form).entries());
+    setBusy('dns:create');
+    try {
+      const body = { name: values.name === '@' ? '' : values.name, type: values.type, content: values.content, ttl: Number(values.ttl || 600), prio: Number(values.prio || 0), notes: values.notes, dryRun: false };
+      await invoke('dnsCreate', { pathParameters: { domain: selectedDomain }, body, confirm: true });
+      form.reset(); onToast(`DNS record created for ${selectedDomain}.`); await loadDns(selectedDomain);
+    } catch (failure) { onToast(messageFrom(failure, 'DNS record could not be created.')); }
+    finally { setBusy(null); }
+  }
+
+  async function deleteDns(record: PorkbunDnsRecord) {
+    if (!selectedDomain || !window.confirm(`Delete the ${record.type} record for ${record.name}?`)) return;
+    setBusy(`dns:${record.id}`);
+    try {
+      await invoke('dnsDelete', { pathParameters: { domain: selectedDomain, id: record.id }, confirm: true });
+      onToast('DNS record deleted.'); await loadDns(selectedDomain);
+    } catch (failure) { onToast(messageFrom(failure, 'DNS record could not be deleted.')); }
+    finally { setBusy(null); }
+  }
+
+  function chooseAdvancedOperation(id: string) {
+    const operation = operations.find((item) => item.id === id);
+    if (!operation) return;
+    setOperationId(id); setOperationGroup(operation.group); setOperationConfirmed(false); setOperationResult('');
+    setPathParameters(Object.fromEntries(operation.pathParameters.map((name) => [name, name === 'domain' ? selectedDomain || availability?.domain || '' : ''])));
+    setBodyJson(operation.supportsDryRun ? '{\n  "dryRun": true\n}' : '{}'); setQueryJson('{}');
+  }
+
+  async function runAdvanced(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const operation = operations.find((item) => item.id === operationId); if (!operation) return;
+    setBusy('advanced');
+    try {
+      const query = JSON.parse(queryJson) as Record<string, unknown>;
+      const body = JSON.parse(bodyJson) as Record<string, unknown>;
+      const result = await invoke(operation.id, { pathParameters, query, body, confirm: operationConfirmed });
+      setOperationResult(JSON.stringify(result.data, null, 2));
+      if (operation.method === 'POST' && operation.id !== 'domainCheckDomain' && body.dryRun !== true) await load();
+    } catch (failure) { setOperationResult(JSON.stringify({ error: messageFrom(failure, 'Porkbun operation failed.') }, null, 2)); }
+    finally { setBusy(null); }
+  }
+
+  const status = dashboard?.status;
+  const mode = status?.mode || 'sandbox';
+  const configured = Boolean(status?.credentials[mode].configured);
+  const expiring = dashboard?.domains.filter((domain) => porkbunExpiresWithinDays(domain.expireDate, 30)).length || 0;
+  const groups = [...new Set(operations.map((operation) => operation.group))];
+  const groupOperations = operations.filter((operation) => operation.group === operationGroup);
+  const selectedOperation = operations.find((operation) => operation.id === operationId) || groupOperations[0];
+  const advancedDryRun = Boolean(selectedOperation?.supportsDryRun && /\"dryRun\"\s*:\s*true/.test(bodyJson));
+
+  return <><PageHeading eyebrow="PORKBUN DOMAIN CONTROL" title="Domains" description="Search, purchase and operate real domains through Porkbun without leaving the control plane." actions={<div className={`domain-mode-switch ${mode}`} role="group" aria-label="Porkbun environment"><button className={mode === 'sandbox' ? 'active' : ''} disabled={busy === 'mode'} onClick={() => void switchMode('sandbox')}>Test</button><button className={mode === 'live' ? 'active' : ''} disabled={busy === 'mode'} onClick={() => void switchMode('live')}>Live</button></div>} />
+    <div className={`domain-mode-notice ${mode}`}><ShieldCheck aria-hidden="true" /><div><strong>{mode === 'sandbox' ? 'Test mode — simulated domain lifecycle' : 'Live mode — real purchases and DNS changes'}</strong><p>{mode === 'sandbox' ? 'Uses Porkbun sandbox funds and test inventory. Hosting and email operations are not available in sandbox.' : 'Every billable or state-changing action requires confirmation. Review the quoted amount before continuing.'}</p></div><span>{configured ? `${status?.credentials[mode].apiKey} connected` : 'Credentials required'}</span></div>
+    <div className="metric-grid compact-metrics"><MetricCard icon={Globe2} tone="green" label="Registered domains" value={loading ? '…' : String(dashboard?.domains.length || 0)} detail={`Actual ${mode === 'sandbox' ? 'test' : 'live'} Porkbun inventory`} /><MetricCard icon={Clock3} tone="amber" label="Expiring in 30 days" value={loading ? '…' : String(expiring)} detail="Calculated from current expiration dates" /><MetricCard icon={RefreshCw} tone="blue" label="Active transfers" value={loading ? '…' : String(dashboard?.transfers.length || 0)} detail="Current inbound domain transfers" /><MetricCard icon={Database} tone="violet" label="Account balance" value={dashboard?.balance?.display || (configured ? '—' : 'Not connected')} detail={mode === 'sandbox' ? 'Sandbox credit' : 'Available Porkbun credit'} /></div>
+    {!configured && <section className="domain-connect-card"><span><Globe2 aria-hidden="true" /></span><div><h2>Connect {mode === 'sandbox' ? 'Test' : 'Live'} Porkbun credentials</h2><p>Open Connection settings below. Credentials stay in ignored local agent state and never enter the hosted dashboard bundle.</p></div></section>}
+    {dashboard?.errors.map((error) => <div className="domain-api-error" key={error}><CircleAlert aria-hidden="true" />{error}</div>)}
+    <section className="domain-search-panel"><div className="domain-section-title"><div><small>DOMAIN DISCOVERY</small><h2>Find your next domain</h2><p>Availability and every displayed price come directly from Porkbun.</p></div><a href="https://porkbun.com/api/json/v3/documentation" target="_blank" rel="noreferrer">API documentation<ExternalLink aria-hidden="true" /></a></div><form onSubmit={searchDomain}><label><Search aria-hidden="true" /><input value={domainQuery} onChange={(event) => setDomainQuery(event.target.value)} placeholder="yourbrand.com" required disabled={!configured} /></label><button className="primary-button" disabled={!configured || busy === 'search'}>{busy === 'search' ? 'Checking…' : 'Search domain'}</button></form>{availability && <div className={`domain-availability ${availability.result.avail === 'yes' ? 'available' : 'unavailable'}`}><span><Globe2 aria-hidden="true" /></span><div><small>{availability.result.avail === 'yes' ? 'AVAILABLE TO REGISTER' : 'NOT AVAILABLE'}</small><h3>{availability.domain}</h3><p>{availability.result.premium === 'yes' ? 'Premium domain' : 'Standard domain'} · {availability.result.minDuration || 1}-year minimum</p></div><div className="domain-price"><small>Registration / year</small><strong>${availability.result.price}</strong>{availability.result.additional?.renewal?.price && <span>Renews at ${availability.result.additional.renewal.price}</span>}</div>{availability.result.avail === 'yes' && <button className="primary-button" disabled={busy === 'register'} onClick={() => void registerDomain()}>{busy === 'register' ? 'Running preflight…' : mode === 'live' ? 'Register domain' : 'Test registration'}</button>}</div>}</section>
+    <section className="domain-portfolio"><div className="domain-section-title"><div><small>PORTFOLIO</small><h2>{mode === 'sandbox' ? 'Test domains' : 'Registered domains'}</h2><p>Expiration, privacy, lock and renewal data are live from your account.</p></div><button className="secondary-button" disabled={loading} onClick={() => void load()}><RefreshCw aria-hidden="true" />Refresh</button></div><div className="domain-table" role="table"><div className="domain-row domain-table-head"><span>Domain</span><span>Expiration</span><span>Protection</span><span>Auto-renew</span><span /></div>{dashboard?.domains.map((domain) => <div className="domain-row" role="row" key={domain.domain}><div><span className="domain-favicon"><Globe2 aria-hidden="true" /></span><span><strong>{domain.domain}</strong><small>{domain.status} · {domain.apiAccess ? 'API enabled' : 'API disabled'}</small></span></div><span className="domain-date"><strong>{formatPorkbunDate(domain.expireDate)}</strong><small>{domainExpiryCopy(domain.expireDate)}</small></span><span className="domain-protection"><i className={domain.securityLock ? 'on' : ''}>{domain.securityLock ? 'Locked' : 'Unlocked'}</i><small>{domain.whoisPrivacy ? 'Privacy on' : 'Public WHOIS'}</small></span><button className={`domain-renew-toggle ${domain.autoRenew ? 'on' : ''}`} disabled={Boolean(busy)} onClick={() => void setAutoRenew(domain)}><i /><span>{domain.autoRenew ? 'On' : 'Off'}</span></button><div className="domain-row-actions"><button className="secondary-button" disabled={Boolean(busy)} onClick={() => void renewDomain(domain.domain)}>{busy === `renew:${domain.domain}` ? 'Quoting…' : 'Renew'}</button><button className="secondary-button" onClick={() => void loadDns(domain.domain)}>Manage</button></div></div>)}{!loading && !dashboard?.domains.length && <Empty title={`No ${mode === 'sandbox' ? 'test' : 'registered'} domains found`} copy={configured ? 'The selected Porkbun account returned an empty portfolio.' : `Add ${mode === 'sandbox' ? 'Test' : 'Live'} credentials to load this account.`} />}</div></section>
+    {selectedDomain && <section className="domain-dns-panel"><div className="domain-section-title"><div><small>DNS ZONE</small><h2>{selectedDomain}</h2><p>Authoritative DNS records returned by Porkbun.</p></div><button className="secondary-button" onClick={() => { setSelectedDomain(null); setDnsRecords([]); }}><X aria-hidden="true" />Close</button></div><form className="dns-create-form" onSubmit={createDns}><label>Host<input name="name" placeholder="@ or www" /></label><label>Type<select name="type" defaultValue="A">{['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'ALIAS', 'CAA', 'SRV', 'NS', 'TLSA', 'SSHFP', 'HTTPS', 'SVCB'].map((type) => <option key={type}>{type}</option>)}</select></label><label className="dns-content-field">Value<input name="content" required placeholder="192.0.2.1" /></label><label>TTL<input name="ttl" type="number" min="0" defaultValue="600" /></label><label>Priority<input name="prio" type="number" min="0" defaultValue="0" /></label><button className="primary-button" disabled={busy === 'dns:create'}><Plus aria-hidden="true" />Add record</button></form><div className="dns-record-list"><div className="dns-record-row dns-record-head"><span>Type</span><span>Name</span><span>Value</span><span>TTL</span><span /></div>{dnsRecords.map((record) => <div className="dns-record-row" key={record.id}><strong>{record.type}</strong><span>{record.name}</span><code>{record.content}</code><span>{record.ttl}</span><button disabled={busy === `dns:${record.id}`} onClick={() => void deleteDns(record)} aria-label={`Delete ${record.type} record`}><Trash2 aria-hidden="true" /></button></div>)}{dnsLoading && <p className="dns-record-loading">Loading DNS records…</p>}{!dnsLoading && !dnsRecords.length && <p className="dns-record-loading">No DNS records returned for this domain.</p>}</div></section>}
+    <section className="domain-advanced"><div className="domain-section-title"><div><small>COMPLETE API ACCESS</small><h2>Advanced Porkbun operations</h2><p>Every supported v3 domain capability is allowlisted here and mirrored in MCP.</p></div><span className="domain-operation-count">{operations.length} operations</span></div><form onSubmit={runAdvanced}><div className="advanced-operation-picker"><label>Capability<select value={operationGroup} onChange={(event) => { const group = event.target.value; setOperationGroup(group); const first = operations.find((operation) => operation.group === group); if (first) chooseAdvancedOperation(first.id); }}>{groups.map((group) => <option key={group}>{group}</option>)}</select></label><label>Operation<select value={selectedOperation?.id || ''} onChange={(event) => chooseAdvancedOperation(event.target.value)}>{groupOperations.map((operation) => <option value={operation.id} key={operation.id}>{operation.summary}</option>)}</select></label></div>{selectedOperation && <div className="advanced-operation-meta"><span className={selectedOperation.method.toLowerCase()}>{selectedOperation.method}</span><code>{selectedOperation.path}</code>{selectedOperation.billable && <strong>Billable</strong>}{selectedOperation.destructive && <strong>Destructive</strong>}</div>}<div className="advanced-operation-fields">{selectedOperation?.pathParameters.map((name) => <label key={name}>{name}<input value={pathParameters[name] || ''} onChange={(event) => setPathParameters((current) => ({ ...current, [name]: event.target.value }))} required /></label>)}<label className="advanced-json-field">Query JSON<textarea value={queryJson} onChange={(event) => setQueryJson(event.target.value)} spellCheck={false} /></label>{selectedOperation?.method === 'POST' && <label className="advanced-json-field">Request JSON<textarea value={bodyJson} onChange={(event) => setBodyJson(event.target.value)} spellCheck={false} /></label>}</div>{selectedOperation?.requiresConfirmation && <label className="advanced-confirm"><input type="checkbox" checked={operationConfirmed} onChange={(event) => setOperationConfirmed(event.target.checked)} /><span><strong>I reviewed the {mode === 'live' ? 'Live' : 'Test'} operation and payload.</strong>This authorizes the state-changing API call. Use dryRun where supported.</span></label>}<div className="advanced-operation-actions"><button className="primary-button" disabled={busy === 'advanced' || Boolean(selectedOperation?.requiresConfirmation && !operationConfirmed && !advancedDryRun)}><Terminal aria-hidden="true" />{busy === 'advanced' ? 'Running…' : 'Run operation'}</button></div></form>{operationResult && <pre className="domain-operation-result"><code>{operationResult}</code></pre>}</section>
+    <details className="domain-credentials"><summary><span><Settings aria-hidden="true" /></span><div><strong>Connection settings</strong><small>Replace Test or Live credentials without exposing saved secret keys.</small></div><ChevronDown aria-hidden="true" /></summary><form onSubmit={saveCredentials}><label>Credential set<select name="mode" defaultValue={mode}><option value="sandbox">Test / Sandbox</option><option value="live">Live</option></select></label><label>Public API key<input name="apiKey" type="password" autoComplete="off" required placeholder="pk1_…" /></label><label>Secret API key<input name="secretApiKey" type="password" autoComplete="new-password" required placeholder="sk1_…" /></label><label className="credential-activate"><input name="activate" type="checkbox" defaultChecked /><span>Switch to this mode after saving</span></label><button className="primary-button" disabled={busy === 'credentials'}>{busy === 'credentials' ? 'Saving…' : 'Save credentials locally'}</button></form><p><ShieldCheck aria-hidden="true" />Keys are written only to <code>.geekheros/state.json</code>, which is excluded from Git and Sites deployment. Saved secret values are never returned to the browser or MCP clients.</p></details>
+  </>;
 }
 
 function ClientsView({ clients, sites, busy, onAdd, onEdit, onDelete, onOpenSite }: { clients: Client[]; sites: Site[]; busy: string | null; onAdd: () => void; onEdit: (client: Client) => void; onDelete: (client: Client) => void; onOpenSite: (id: string) => void }) {
@@ -1307,6 +1539,10 @@ function fileToBase64(file: File) { return new Promise<string>((resolve, reject)
 function downloadBlueprintSettingsExample() { const example = { options: { blogdescription: 'A concise site tagline', timezone_string: 'America/Los_Angeles', default_comment_status: 'closed' }, plugins: [{ slug: 'wordpress-seo', activate: true }], themes: [{ slug: 'astra', activate: true }], pages: [{ title: 'Home', slug: 'home', status: 'publish', content: '<h1>Welcome</h1>' }] }; const url = URL.createObjectURL(new Blob([`${JSON.stringify(example, null, 2)}\n`], { type: 'application/json' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'geekheros-blueprint-settings.json'; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 0); }
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
+function porkbunDate(value: string) { const parsed = Date.parse(String(value || '').replace(' ', 'T')); return Number.isFinite(parsed) ? new Date(parsed) : null; }
+function porkbunExpiresWithinDays(value: string, days: number) { const parsed = porkbunDate(value); if (!parsed) return false; const remaining = parsed.getTime() - Date.now(); return remaining >= 0 && remaining <= days * 86_400_000; }
+function formatPorkbunDate(value: string) { const parsed = porkbunDate(value); return parsed ? parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : 'Unknown'; }
+function domainExpiryCopy(value: string) { const parsed = porkbunDate(value); if (!parsed) return 'Expiration unavailable'; const days = Math.ceil((parsed.getTime() - Date.now()) / 86_400_000); if (days < 0) return `Expired ${Math.abs(days)} day${Math.abs(days) === 1 ? '' : 's'} ago`; if (days === 0) return 'Expires today'; return `${days} day${days === 1 ? '' : 's'} remaining`; }
 function formatCompactNumber(value: number) { return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value); }
 function formatPluginRating(value: number) { return `${(value / 20).toFixed(1)} / 5`; }
 function analyticsRangeLabel(days: AnalyticsRangeDays) { return days === 1 ? 'Last 24 hours' : `Last ${days} days`; }

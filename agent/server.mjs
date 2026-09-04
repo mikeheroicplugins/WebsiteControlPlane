@@ -10,6 +10,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { parseRemoteReferences, selectRemoteBranch } from './git-remote.mjs';
 import { controlPlaneMcpToolCount, createControlPlaneMcpHandler } from './mcp.mjs';
+import { porkbunOperations, porkbunOperationsById } from './porkbun-operations.mjs';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -46,6 +47,7 @@ const monitoringRetentionChecks = 90 * 24 * 6;
 const activityRetentionEntries = 5_000;
 const wordpressPluginApiUrl = 'https://api.wordpress.org/plugins/info/1.2/';
 const wordpressPluginDownloadHosts = new Set(['downloads.wordpress.org']);
+const porkbunApiBaseUrl = 'https://api.porkbun.com/api/json/v3';
 const allowedBackupIntervals = new Set([6, 12, 24, 72, 168, 720]);
 const screenshotCaptures = new Map();
 const scheduledBackupRuns = new Set();
@@ -126,7 +128,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 10, sites: {}, clients: {}, blueprints: {}, pluginLibrary: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 11, sites: {}, clients: {}, blueprints: {}, pluginLibrary: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {}, porkbun: { mode: 'sandbox', live: {}, sandbox: {} } } };
 }
 
 function validIsoTimestamp(value) {
@@ -165,7 +167,7 @@ async function readState() {
     return {
       ...base,
       ...parsed,
-      version: 10,
+      version: 11,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
@@ -177,6 +179,11 @@ async function readState() {
         ...(parsed.integrations || {}),
         lovable: { ...(parsed.integrations?.lovable || {}) },
         mcp: { ...(parsed.integrations?.mcp || {}) },
+        porkbun: {
+          mode: parsed.integrations?.porkbun?.mode === 'live' ? 'live' : 'sandbox',
+          live: { ...(parsed.integrations?.porkbun?.live || {}) },
+          sandbox: { ...(parsed.integrations?.porkbun?.sandbox || {}) },
+        },
       },
     };
   } catch (error) {
@@ -234,6 +241,175 @@ function mcpIntegration(state) {
   state.integrations ||= {};
   state.integrations.mcp ||= {};
   return state.integrations.mcp;
+}
+
+function porkbunIntegration(state) {
+  state.integrations ||= {};
+  state.integrations.porkbun ||= { mode: 'sandbox', live: {}, sandbox: {} };
+  state.integrations.porkbun.mode = state.integrations.porkbun.mode === 'live' ? 'live' : 'sandbox';
+  state.integrations.porkbun.live ||= {};
+  state.integrations.porkbun.sandbox ||= {};
+  return state.integrations.porkbun;
+}
+
+function porkbunMode(value, fallback = 'sandbox') {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (value !== 'live' && value !== 'sandbox') throw Object.assign(new Error('Porkbun mode must be live or sandbox.'), { status: 400 });
+  return value;
+}
+
+function publicPorkbunOperation(operation) {
+  return {
+    id: operation.id, group: operation.group, method: operation.method, path: operation.path,
+    summary: operation.summary, pathParameters: operation.pathParameters, billable: operation.billable,
+    destructive: operation.destructive, requiresConfirmation: operation.requiresConfirmation,
+    supportsDryRun: operation.supportsDryRun,
+  };
+}
+
+function maskPorkbunKey(value) {
+  if (typeof value !== 'string' || value.length < 8) return null;
+  return `${value.slice(0, value.includes('_sb_') ? 7 : 4)}••••${value.slice(-4)}`;
+}
+
+function configuredPorkbunCredential(credential) {
+  return Boolean(credential && typeof credential.apiKey === 'string' && typeof credential.secretApiKey === 'string');
+}
+
+function scrubPorkbunPayload(value) {
+  if (Array.isArray(value)) return value.map(scrubPorkbunPayload);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !['apikey', 'secretapikey', 'apiKey', 'secretApiKey', 'x-api-key', 'x-secret-api-key'].includes(key)).map(([key, item]) => [key, scrubPorkbunPayload(item)]));
+}
+
+function validatePorkbunCredentials(mode, apiKey, secretApiKey) {
+  const publicKey = String(apiKey || '').trim();
+  const secretKey = String(secretApiKey || '').trim();
+  const expectedPublicPrefix = mode === 'sandbox' ? 'pk1_sb_' : 'pk1_';
+  const expectedSecretPrefix = mode === 'sandbox' ? 'sk1_sb_' : 'sk1_';
+  if (!publicKey.startsWith(expectedPublicPrefix) || !secretKey.startsWith(expectedSecretPrefix)) {
+    throw Object.assign(new Error(`Those credentials do not match ${mode === 'sandbox' ? 'Test' : 'Live'} mode.`), { status: 400 });
+  }
+  if (mode === 'live' && (publicKey.startsWith('pk1_sb_') || secretKey.startsWith('sk1_sb_'))) {
+    throw Object.assign(new Error('Sandbox credentials cannot be saved as Live credentials.'), { status: 400 });
+  }
+  if (publicKey.length > 300 || secretKey.length > 300) throw Object.assign(new Error('Porkbun credentials are too long.'), { status: 400 });
+  return { apiKey: publicKey, secretApiKey: secretKey };
+}
+
+async function getPorkbunStatus() {
+  const integration = porkbunIntegration(await readState());
+  return {
+    provider: 'Porkbun', mode: integration.mode,
+    credentials: {
+      live: { configured: configuredPorkbunCredential(integration.live), apiKey: maskPorkbunKey(integration.live?.apiKey), updatedAt: integration.live?.updatedAt || null },
+      sandbox: { configured: configuredPorkbunCredential(integration.sandbox), apiKey: maskPorkbunKey(integration.sandbox?.apiKey), updatedAt: integration.sandbox?.updatedAt || null },
+    },
+    operationCount: porkbunOperations.length,
+    apiVersion: 'v3',
+  };
+}
+
+async function configurePorkbun(input) {
+  const mode = porkbunMode(input.mode);
+  const credentials = validatePorkbunCredentials(mode, input.apiKey, input.secretApiKey);
+  await updateState((state) => {
+    const integration = porkbunIntegration(state);
+    integration[mode] = { ...credentials, updatedAt: new Date().toISOString() };
+    if (input.activate === true) integration.mode = mode;
+  });
+  await recordActivity({ siteId: '', siteName: 'Porkbun', type: 'domains.credentials', message: `${mode === 'sandbox' ? 'Test' : 'Live'} Porkbun credentials updated locally.` });
+  return getPorkbunStatus();
+}
+
+async function setPorkbunMode(input) {
+  const mode = porkbunMode(input.mode);
+  await updateState((state) => { porkbunIntegration(state).mode = mode; });
+  await recordActivity({ siteId: '', siteName: 'Porkbun', type: 'domains.mode', message: `Porkbun switched to ${mode === 'sandbox' ? 'Test' : 'Live'} mode.` });
+  return getPorkbunStatus();
+}
+
+async function listPorkbunOperations() {
+  return porkbunOperations.map(publicPorkbunOperation);
+}
+
+async function callPorkbunApi(input) {
+  const state = await readState();
+  const integration = porkbunIntegration(state);
+  const mode = porkbunMode(input.mode, integration.mode);
+  const credential = integration[mode];
+  if (!configuredPorkbunCredential(credential)) throw Object.assign(new Error(`${mode === 'sandbox' ? 'Test' : 'Live'} Porkbun credentials are not configured.`), { status: 409 });
+  const operation = porkbunOperationsById.get(String(input.operationId || ''));
+  if (!operation) throw Object.assign(new Error('Choose a supported Porkbun API operation.'), { status: 400 });
+  const body = scrubPorkbunPayload(input.body && typeof input.body === 'object' ? input.body : {});
+  const dryRun = operation.supportsDryRun && body.dryRun === true;
+  if (operation.requiresConfirmation && !dryRun && input.confirm !== true) {
+    const consequence = operation.billable ? 'can incur a charge' : operation.destructive ? 'can remove or replace data' : 'changes Porkbun account state';
+    throw Object.assign(new Error(`${operation.summary} ${consequence}. Set confirm to true after reviewing the selected mode and payload.`), { status: 409 });
+  }
+  const pathParameters = input.pathParameters && typeof input.pathParameters === 'object' ? input.pathParameters : {};
+  let resolvedPath = operation.path;
+  for (const name of operation.pathParameters) {
+    const value = String(pathParameters[name] ?? '').trim();
+    if (!value || value.length > 500) throw Object.assign(new Error(`Path parameter ${name} is required.`), { status: 400 });
+    resolvedPath = resolvedPath.replace(`{${name}}`, encodeURIComponent(value));
+  }
+  const endpoint = new URL(`${porkbunApiBaseUrl}${resolvedPath}`);
+  const query = input.query && typeof input.query === 'object' ? input.query : {};
+  for (const [name, raw] of Object.entries(query)) {
+    if (!/^[A-Za-z][A-Za-z0-9[\]_-]{0,80}$/.test(name) || raw === undefined || raw === null || raw === '') continue;
+    for (const value of Array.isArray(raw) ? raw : [raw]) endpoint.searchParams.append(name, String(value).slice(0, 2_000));
+  }
+  const request = {
+    method: operation.method,
+    headers: {
+      accept: 'application/json',
+      'X-API-Key': credential.apiKey,
+      'X-Secret-API-Key': credential.secretApiKey,
+      ...(operation.method === 'POST' ? { 'content-type': 'application/json', 'Idempotency-Key': randomUUID() } : {}),
+    },
+    signal: AbortSignal.timeout(45_000),
+    ...(operation.method === 'POST' ? { body: JSON.stringify(body) } : {}),
+  };
+  let response;
+  let payload;
+  try {
+    response = await fetch(endpoint, request);
+    const text = await response.text();
+    payload = text ? JSON.parse(text) : {};
+  } catch (error) {
+    const message = error?.name === 'TimeoutError' ? 'Porkbun did not respond within 45 seconds.' : 'The Porkbun API could not be reached.';
+    throw Object.assign(new Error(message), { status: 502 });
+  }
+  if (!response.ok || payload?.status === 'ERROR') {
+    const message = String(payload?.message || payload?.error || `Porkbun returned HTTP ${response.status}.`).slice(0, 2_000);
+    const error = Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502 });
+    if (operation.method === 'POST') await recordActivity({ siteId: '', siteName: `Porkbun ${mode}`, type: `domains.${operation.id}`, state: 'failed', message });
+    throw error;
+  }
+  if (operation.method === 'POST' && operation.id !== 'domainCheckDomain') {
+    await recordActivity({ siteId: '', siteName: `Porkbun ${mode}`, type: `domains.${operation.id}`, message: `${operation.summary}${dryRun ? ' dry run completed.' : ' completed.'}` });
+  }
+  return { mode, operation: publicPorkbunOperation(operation), data: payload };
+}
+
+async function getPorkbunDashboard(input = {}) {
+  const status = await getPorkbunStatus();
+  const mode = porkbunMode(input.mode, status.mode);
+  if (!status.credentials[mode].configured) return { status: { ...status, mode }, balance: null, domains: [], transfers: [], errors: [] };
+  const requests = await Promise.allSettled([
+    callPorkbunApi({ mode, operationId: 'getBalance' }),
+    callPorkbunApi({ mode, operationId: 'getDomains', query: { includeLabels: 'yes', sortName: 'expire_date', sortDirection: 'asc' } }),
+    callPorkbunApi({ mode, operationId: 'listTransfersGet' }),
+  ]);
+  const errors = requests.filter((result) => result.status === 'rejected').map((result) => result.reason instanceof Error ? result.reason.message : 'Porkbun request failed.');
+  return {
+    status: { ...status, mode },
+    balance: requests[0].status === 'fulfilled' ? requests[0].value.data : null,
+    domains: requests[1].status === 'fulfilled' ? requests[1].value.data.domains || [] : [],
+    transfers: requests[2].status === 'fulfilled' ? requests[2].value.data.transfers || [] : [],
+    errors,
+  };
 }
 
 async function ensureMcpToken() {
@@ -3888,6 +4064,12 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   deleteBlueprint,
   listMcpAgents,
   manageMcpAgent,
+  getPorkbunStatus,
+  configurePorkbun,
+  setPorkbunMode,
+  listPorkbunOperations,
+  callPorkbunApi,
+  getPorkbunDashboard,
   getLovableConnection,
   startLovableConnection,
   disconnectLovable,
@@ -3916,7 +4098,7 @@ const server = createServer(async (request, response) => {
   if (request.method === 'OPTIONS') {
     response.writeHead(204, {
       ...corsHeaders(response),
-      'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+      'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
       'access-control-allow-headers': 'authorization, content-type, x-geekheros-token',
       'access-control-max-age': '600',
       'vary': 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers',
@@ -3952,6 +4134,15 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/lovable/connect') return send(response, 200, await startLovableConnection());
     if (request.method === 'DELETE' && url.pathname === '/lovable') return send(response, 200, await disconnectLovable());
     if (request.method === 'POST' && url.pathname === '/lovable/projects') return send(response, 201, { project: await createLovableProject(await readJson(request)) });
+    if (request.method === 'GET' && url.pathname === '/domains') return send(response, 200, { dashboard: await getPorkbunDashboard({ mode: url.searchParams.get('mode') }) });
+    if (request.method === 'GET' && url.pathname === '/domains/operations') return send(response, 200, { operations: await listPorkbunOperations() });
+    if (request.method === 'POST' && url.pathname === '/domains/call') return send(response, 200, { result: await callPorkbunApi(await readJson(request, 105_000_000)) });
+    if (request.method === 'PUT' && url.pathname === '/domains/settings') {
+      const body = await readJson(request);
+      if (body.action === 'mode') return send(response, 200, { status: await setPorkbunMode(body) });
+      if (body.action === 'credentials') return send(response, 200, { status: await configurePorkbun(body) });
+      throw Object.assign(new Error('Choose mode or credentials.'), { status: 400 });
+    }
     if (request.method === 'GET' && url.pathname === '/sites') return send(response, 200, { sites: await listSites() });
     if (request.method === 'POST' && url.pathname === '/sites') return send(response, 202, { site: await createSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/staging') return send(response, 200, { staging: await listStagingSites() });

@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 46;
+export const controlPlaneMcpToolCount = 57;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -9,6 +9,9 @@ const blueprintIdSchema = z.string().min(1).describe('Blueprint ID returned by l
 const pluginLibraryIdSchema = z.string().regex(/^plugin_[a-f0-9]{12}$/).describe('Plugin library ID returned by list_plugin_library.');
 const agentIdSchema = z.string().min(1).describe('MCP agent ID returned by list_agents.');
 const packageNamesSchema = z.array(z.string().min(1)).max(100).optional();
+const porkbunModeSchema = z.enum(['sandbox', 'live']).describe('Porkbun Test (sandbox) or Live account. Omit to use the dashboard toggle.');
+const porkbunDomainSchema = z.string().min(3).max(253).describe('Fully qualified domain name without a protocol or path.');
+const porkbunJsonSchema = z.record(z.string(), z.unknown()).default({});
 
 function mcpResult(result) {
   return {
@@ -54,6 +57,110 @@ function createControlPlaneMcpServer(api) {
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, (input) => api.getAnalytics(input));
+
+  register(server, 'get_domain_provider_status', {
+    title: 'Get Porkbun connection status',
+    description: 'Read the active Test/Live mode, masked credential status and available domain-operation count. Secret keys are never returned.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.getPorkbunStatus());
+
+  register(server, 'configure_porkbun_credentials', {
+    title: 'Configure Porkbun credentials',
+    description: 'Store a Porkbun public and secret API key pair in ignored local control-plane state. Existing credentials are never readable through MCP.',
+    inputSchema: z.object({
+      mode: porkbunModeSchema,
+      apiKey: z.string().min(8).max(300).describe('Porkbun public API key.'),
+      secretApiKey: z.string().min(8).max(300).describe('Porkbun secret API key.'),
+      activate: z.boolean().default(false).describe('Also make this the active dashboard mode.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  }, (input) => api.configurePorkbun(input));
+
+  register(server, 'set_domain_mode', {
+    title: 'Set domain mode',
+    description: 'Switch the Domains dashboard and default MCP domain operations between Porkbun Test and Live credentials.',
+    inputSchema: z.object({ mode: porkbunModeSchema }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, (input) => api.setPorkbunMode(input));
+
+  register(server, 'list_domain_api_operations', {
+    title: 'List Porkbun API operations',
+    description: 'List every Porkbun v3 operation exposed by the Domains page and call_domain_api, including required path parameters and risk metadata.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listPorkbunOperations());
+
+  register(server, 'call_domain_api', {
+    title: 'Call Porkbun domain API',
+    description: 'Call any allowlisted Porkbun v3 operation exposed in the Domains advanced console. Mutating operations require confirm=true; billable operations should be dry-run first when supported.',
+    inputSchema: z.object({
+      operationId: z.string().min(1).max(100).describe('Operation ID returned by list_domain_api_operations.'),
+      mode: porkbunModeSchema.optional(),
+      pathParameters: porkbunJsonSchema.describe('Values for placeholders such as domain, id, type or subdomain.'),
+      query: porkbunJsonSchema.describe('Optional query-string parameters.'),
+      body: porkbunJsonSchema.describe('JSON request body without credentials.'),
+      confirm: z.boolean().default(false).describe('Required for a state-changing operation after its mode and payload have been reviewed.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, (input) => api.callPorkbunApi(input));
+
+  register(server, 'search_domain', {
+    title: 'Search domain availability',
+    description: 'Check a domain name in Porkbun and return live availability plus registration, renewal and transfer pricing. Porkbun rate-limits checks.',
+    inputSchema: z.object({ domain: porkbunDomainSchema, mode: porkbunModeSchema.optional() }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  }, ({ domain, mode }) => api.callPorkbunApi({ operationId: 'domainCheckDomain', mode, pathParameters: { domain } }));
+
+  register(server, 'list_registered_domains', {
+    title: 'List Porkbun domains',
+    description: 'List real domains in the selected Porkbun account with lifecycle, expiration, privacy, lock and auto-renew state.',
+    inputSchema: z.object({
+      mode: porkbunModeSchema.optional(), start: z.number().int().min(0).default(0), nameContains: z.string().max(253).optional(),
+      expiringWithinDays: z.number().int().min(0).max(3650).optional(), autoRenew: z.enum(['yes', 'no']).optional(),
+    }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  }, ({ mode, ...query }) => api.callPorkbunApi({ operationId: 'getDomains', mode, query: { ...query, includeLabels: 'yes' } }));
+
+  register(server, 'register_domain', {
+    title: 'Register Porkbun domain',
+    description: 'Register a domain at the exact quoted cost in cents. Run search_domain first. dryRun=true performs preflight only; a real registration requires confirm=true and agrees to Porkbun terms.',
+    inputSchema: z.object({
+      domain: porkbunDomainSchema, cost: z.number().int().min(1), mode: porkbunModeSchema.optional(),
+      whoisPrivacy: z.boolean().default(true), dryRun: z.boolean().default(true), confirm: z.boolean().default(false),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, ({ domain, mode, cost, whoisPrivacy, dryRun, confirm }) => api.callPorkbunApi({ operationId: 'domainCreate', mode, pathParameters: { domain }, body: { cost, agreeToTerms: 'yes', whoisPrivacy, dryRun }, confirm }));
+
+  register(server, 'renew_domain', {
+    title: 'Renew Porkbun domain',
+    description: 'Renew a domain at the exact quoted cost in cents. dryRun=true performs preflight only; a real renewal requires confirm=true.',
+    inputSchema: z.object({ domain: porkbunDomainSchema, cost: z.number().int().min(1), mode: porkbunModeSchema.optional(), dryRun: z.boolean().default(true), confirm: z.boolean().default(false) }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, ({ domain, mode, cost, dryRun, confirm }) => api.callPorkbunApi({ operationId: 'domainRenew', mode, pathParameters: { domain }, body: { cost, dryRun }, confirm }));
+
+  register(server, 'set_domain_auto_renew', {
+    title: 'Set domain auto-renew',
+    description: 'Turn Porkbun automatic renewal on or off for one or more domains. Requires confirm=true.',
+    inputSchema: z.object({ domain: porkbunDomainSchema, status: z.enum(['on', 'off']), additionalDomains: z.array(porkbunDomainSchema).max(100).default([]), mode: porkbunModeSchema.optional(), confirm: z.boolean().default(false) }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, ({ domain, status, additionalDomains, mode, confirm }) => api.callPorkbunApi({ operationId: 'domainUpdateAutoRenew', mode, pathParameters: { domain }, body: { status, domains: additionalDomains }, confirm }));
+
+  register(server, 'manage_domain_dns', {
+    title: 'Manage Porkbun DNS',
+    description: 'List, create, edit or delete Porkbun DNS records. Changes require confirm=true; create supports dry-run validation.',
+    inputSchema: z.object({
+      domain: porkbunDomainSchema, action: z.enum(['list', 'create', 'edit', 'delete']), mode: porkbunModeSchema.optional(),
+      id: z.string().max(100).optional(), type: z.enum(['A', 'AAAA', 'MX', 'CNAME', 'ALIAS', 'TXT', 'NS', 'SRV', 'TLSA', 'CAA', 'SSHFP', 'HTTPS', 'SVCB']).optional(),
+      name: z.string().max(253).optional(), content: z.string().max(10_000).optional(), ttl: z.number().int().min(0).optional(),
+      priority: z.number().int().min(0).optional(), notes: z.string().max(1_000).optional(), dryRun: z.boolean().default(false), confirm: z.boolean().default(false),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, ({ domain, action, mode, id, type, name, content, ttl, priority, notes, dryRun, confirm }) => {
+    if (action === 'list') return api.callPorkbunApi({ operationId: 'getDnsRecords', mode, pathParameters: { domain } });
+    if ((action === 'edit' || action === 'delete') && !id) throw new Error(`DNS record ID is required for ${action}.`);
+    if ((action === 'create' || action === 'edit') && (!type || !content)) throw new Error(`DNS type and content are required for ${action}.`);
+    const operationId = action === 'create' ? 'dnsCreate' : action === 'edit' ? 'dnsEdit' : 'dnsDelete';
+    return api.callPorkbunApi({ operationId, mode, pathParameters: { domain, id }, body: action === 'delete' ? {} : { type, name, content, ttl, prio: priority, notes, ...(action === 'create' ? { dryRun } : {}) }, confirm });
+  });
 
   register(server, 'list_sites', {
     title: 'List sites',
