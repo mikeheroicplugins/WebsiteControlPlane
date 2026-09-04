@@ -1,11 +1,12 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 42;
+export const controlPlaneMcpToolCount = 46;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
 const blueprintIdSchema = z.string().min(1).describe('Blueprint ID returned by list_blueprints.');
+const pluginLibraryIdSchema = z.string().regex(/^plugin_[a-f0-9]{12}$/).describe('Plugin library ID returned by list_plugin_library.');
 const agentIdSchema = z.string().min(1).describe('MCP agent ID returned by list_agents.');
 const packageNamesSchema = z.array(z.string().min(1)).max(100).optional();
 
@@ -327,6 +328,19 @@ function createControlPlaneMcpServer(api) {
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   }, (input) => api.searchWordPressPlugins(input));
 
+  register(server, 'list_plugin_library', {
+    title: 'List downloaded WordPress plugins',
+    description: 'List official WordPress.org plugin ZIPs downloaded to the reusable local plugin library. These plugins are not tied to a blueprint until explicitly selected.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.listPluginLibrary());
+
+  register(server, 'delete_plugin_library_item', {
+    title: 'Remove downloaded WordPress plugin',
+    description: 'Remove a plugin ZIP from the reusable local library. Blueprint copies and existing sites are not changed.',
+    inputSchema: z.object({ pluginId: pluginLibraryIdSchema }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  }, ({ pluginId }) => api.deletePluginLibraryItem(pluginId));
+
   register(server, 'create_blueprint', {
     title: 'Create blueprint',
     description: 'Create a WordPress blueprint from catalog packages and base64-encoded plugin, theme, settings, content, MU-plugin or wp-content files.',
@@ -335,6 +349,7 @@ function createControlPlaneMcpServer(api) {
       description: z.string().max(500).optional(),
       plugins: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(100).optional(),
       themes: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(20).optional(),
+      libraryPluginIds: z.array(pluginLibraryIdSchema).max(25).optional(),
       files: z.array(z.object({
         name: z.string().min(1).max(180),
         kind: z.enum(['plugin', 'theme', 'settings', 'content', 'mu-plugin', 'wp-content']),
@@ -344,6 +359,37 @@ function createControlPlaneMcpServer(api) {
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, (input) => api.createBlueprint(input));
+
+  register(server, 'update_blueprint', {
+    title: 'Update blueprint',
+    description: 'Edit an existing WordPress blueprint, including metadata, catalog packages, retained files, new uploads and any mix of plugins from the local plugin library.',
+    inputSchema: z.object({
+      blueprintId: blueprintIdSchema,
+      name: z.string().min(1).max(100).optional(),
+      description: z.string().max(500).optional(),
+      plugins: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(100).optional(),
+      themes: z.array(z.union([z.string(), z.object({ slug: z.string(), activate: z.boolean().default(true) })])).max(20).optional(),
+      retainedFileIds: z.array(z.string().min(1)).max(25).optional(),
+      libraryPluginIds: z.array(pluginLibraryIdSchema).max(25).optional(),
+      files: z.array(z.object({
+        name: z.string().min(1).max(180),
+        kind: z.enum(['plugin', 'theme', 'settings', 'content', 'mu-plugin', 'wp-content']),
+        destination: z.string().max(300).optional(),
+        content: z.string().min(1).max(35_000_000).describe('Base64-encoded file contents.'),
+      })).max(25).optional(),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  }, ({ blueprintId, ...input }) => api.updateBlueprint(blueprintId, input));
+
+  register(server, 'download_wordpress_plugins', {
+    title: 'Download WordPress.org plugins',
+    description: 'Download one or more current official plugin ZIPs into the reusable local plugin library, optionally adding the same plugins to an existing blueprint.',
+    inputSchema: z.object({
+      slugs: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,190}$/)).min(1).max(24),
+      blueprintId: blueprintIdSchema.optional(),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, (input) => api.downloadWordPressPlugins(input));
 
   register(server, 'download_wordpress_plugin_to_blueprint', {
     title: 'Download WordPress.org plugin to blueprint',

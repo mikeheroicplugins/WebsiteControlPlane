@@ -18,6 +18,7 @@ const stateFile = path.join(stateDir, 'state.json');
 const backupRoot = path.join(stateDir, 'backups');
 const sourceRoot = path.join(stateDir, 'sources');
 const blueprintRoot = path.join(stateDir, 'blueprints');
+const pluginLibraryRoot = path.join(stateDir, 'plugin-library');
 const screenshotRoot = path.join(stateDir, 'screenshots');
 const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
 const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
@@ -125,7 +126,7 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 10, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 10, sites: {}, clients: {}, blueprints: {}, pluginLibrary: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
 }
 
 function validIsoTimestamp(value) {
@@ -168,6 +169,7 @@ async function readState() {
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
+      pluginLibrary: parsed.pluginLibrary || {},
       agents: parsed.agents || {},
       activity: parsed.activity || [],
       integrations: {
@@ -951,6 +953,7 @@ function publicBlueprint(blueprint, sites = []) {
     source: file.source?.provider === 'wordpress.org' ? {
       provider: 'wordpress.org', slug: file.source.slug, name: file.source.name,
       version: file.source.version, pluginUrl: file.source.pluginUrl, downloadedAt: file.source.downloadedAt,
+      libraryPluginId: file.source.libraryPluginId || null,
     } : null,
   })) : [];
   return {
@@ -1089,53 +1092,188 @@ async function downloadWordPressPluginArchive(downloadUrl) {
   return archive;
 }
 
-async function downloadWordPressPluginToBlueprint(blueprintId, pluginSlug) {
+function publicPluginLibraryItem(item) {
+  return {
+    id: item.id,
+    name: item.name,
+    slug: item.slug,
+    version: item.version,
+    author: item.author || '',
+    shortDescription: item.shortDescription || '',
+    rating: Number(item.rating || 0),
+    ratingCount: Number(item.ratingCount || 0),
+    activeInstalls: Number(item.activeInstalls || 0),
+    requiresWordPress: item.requiresWordPress || '',
+    testedWordPress: item.testedWordPress || '',
+    requiresPhp: item.requiresPhp || '',
+    lastUpdated: item.lastUpdated || '',
+    pluginUrl: item.pluginUrl,
+    fileName: item.fileName,
+    size: Number(item.size || 0),
+    sha256: item.sha256,
+    downloadedAt: item.downloadedAt,
+  };
+}
+
+async function listPluginLibrary() {
+  const state = await readState();
+  return Object.values(state.pluginLibrary || {}).map(publicPluginLibraryItem)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function deletePluginLibraryItem(pluginId) {
+  const id = String(pluginId || '');
+  if (!/^plugin_[a-f0-9]{12}$/.test(id)) throw Object.assign(new Error('Choose a valid plugin library item.'), { status: 400 });
+  const item = await updateState((state) => {
+    const current = state.pluginLibrary?.[id];
+    if (!current) throw Object.assign(new Error('Plugin library item not found.'), { status: 404 });
+    delete state.pluginLibrary[id];
+    return current;
+  });
+  if (path.basename(String(item.storageName || '')) === item.storageName) await rm(path.join(pluginLibraryRoot, item.storageName), { force: true }).catch(() => undefined);
+  await recordActivity({ siteId: '', siteName: item.name, type: 'plugin-library.delete', message: `${item.name} was removed from the reusable plugin library.` })
+    .catch((error) => console.error('Unable to record plugin library removal:', error.message));
+  return { deleted: true };
+}
+
+function validatePluginLibraryIds(values, state) {
+  const ids = [...new Set((Array.isArray(values) ? values : []).map(String))];
+  if (ids.length > 25 || ids.some((id) => !/^plugin_[a-f0-9]{12}$/.test(id))) throw Object.assign(new Error('Choose up to 25 valid library plugins.'), { status: 400 });
+  return ids.map((id) => {
+    const item = state.pluginLibrary?.[id];
+    if (!item) throw Object.assign(new Error('A selected library plugin is no longer available.'), { status: 404 });
+    return item;
+  });
+}
+
+async function materializeLibraryPlugins(items, directory) {
+  const files = [];
+  try {
+    for (const item of items) {
+      if (path.basename(String(item.storageName || '')) !== item.storageName) throw new Error(`Plugin library metadata is invalid for ${item.name}.`);
+      const contents = await readFile(path.join(pluginLibraryRoot, item.storageName));
+      if (createHash('sha256').update(contents).digest('hex') !== item.sha256) throw new Error(`Plugin library file ${item.name} failed its integrity check.`);
+      const fileId = randomBytes(8).toString('hex');
+      const storageName = `${fileId}.zip`;
+      await writeFile(path.join(directory, storageName), contents);
+      files.push({
+        id: fileId,
+        name: item.fileName,
+        kind: 'plugin',
+        destination: '',
+        size: contents.length,
+        sha256: item.sha256,
+        storageName,
+        source: {
+          provider: 'wordpress.org', slug: item.slug, name: item.name, version: item.version,
+          pluginUrl: item.pluginUrl, downloadedAt: item.downloadedAt, libraryPluginId: item.id,
+        },
+      });
+    }
+  } catch (error) {
+    await Promise.all(files.map((file) => rm(path.join(directory, file.storageName), { force: true }).catch(() => undefined)));
+    throw error;
+  }
+  return files;
+}
+
+async function downloadWordPressPluginToLibrary(pluginSlug) {
   const slug = validateWordPressPluginSlug(pluginSlug);
-  const before = await readState();
-  if (!before.blueprints[blueprintId]) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
   const info = await requestWordPressPluginApi('plugin_information', { slug, locale: 'en_US', is_ssl: 1 });
+  if (!info || typeof info !== 'object') throw Object.assign(new Error('WordPress.org could not find that plugin.'), { status: 404 });
   const plugin = publicWordPressPlugin(info);
   if (plugin.slug !== slug) throw Object.assign(new Error('WordPress.org returned a different plugin than requested.'), { status: 502 });
-  const downloadUrl = wordpressPluginDownloadUrl(info?.download_link);
+  const downloadUrl = wordpressPluginDownloadUrl(info.download_link);
   const contents = await downloadWordPressPluginArchive(downloadUrl);
   const downloadedAt = new Date().toISOString();
-  const fileId = randomBytes(8).toString('hex');
-  const storageName = `${fileId}.zip`;
-  const fileName = cleanBlueprintFileName(path.basename(downloadUrl.pathname));
-  const directory = path.join(blueprintRoot, blueprintId);
-  const storagePath = path.join(directory, storageName);
-  await mkdir(directory, { recursive: true });
+  const storageName = `${randomBytes(12).toString('hex')}.zip`;
+  const storagePath = path.join(pluginLibraryRoot, storageName);
+  await mkdir(pluginLibraryRoot, { recursive: true });
   await writeFile(storagePath, contents);
   let result;
   try {
     result = await updateState((state) => {
-      const blueprint = state.blueprints[blueprintId];
-      if (!blueprint) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
-      blueprint.files ||= [];
-      const existingIndex = blueprint.files.findIndex((file) => file.source?.provider === 'wordpress.org' && file.source.slug === slug);
-      const existing = existingIndex >= 0 ? blueprint.files[existingIndex] : null;
-      if (existingIndex < 0 && blueprint.files.length >= 25) throw Object.assign(new Error('A blueprint may contain up to 25 stored files.'), { status: 409 });
-      const nextTotal = blueprint.files.reduce((sum, file) => sum + Number(file.size || 0), 0) - Number(existing?.size || 0) + contents.length;
-      if (nextTotal > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint files may total up to 75 MB.'), { status: 413 });
-      const source = { provider: 'wordpress.org', slug, name: plugin.name, version: plugin.version, pluginUrl: plugin.pluginUrl, downloadedAt };
-      const file = { id: fileId, name: fileName, kind: 'plugin', destination: '', size: contents.length, sha256: createHash('sha256').update(contents).digest('hex'), storageName, source };
-      if (existingIndex >= 0) blueprint.files[existingIndex] = file;
-      else blueprint.files.push(file);
-      blueprint.plugins = (Array.isArray(blueprint.plugins) ? blueprint.plugins : []).filter((entry) => entry.slug !== slug);
-      blueprint.updatedAt = downloadedAt;
-      return { blueprint, previousStorageName: existing?.storageName || null };
+      state.pluginLibrary ||= {};
+      const existing = Object.values(state.pluginLibrary).find((item) => item.slug === slug) || null;
+      if (!existing && Object.keys(state.pluginLibrary).length >= 250) throw Object.assign(new Error('The plugin library may contain up to 250 plugins.'), { status: 409 });
+      const id = existing?.id || `plugin_${randomBytes(6).toString('hex')}`;
+      const item = {
+        id, ...plugin, fileName: cleanBlueprintFileName(path.basename(downloadUrl.pathname)), size: contents.length,
+        sha256: createHash('sha256').update(contents).digest('hex'), storageName, downloadedAt,
+      };
+      state.pluginLibrary[id] = item;
+      return { item, previousStorageName: existing?.storageName || null };
     });
   } catch (error) {
     await rm(storagePath, { force: true }).catch(() => undefined);
     throw error;
   }
   if (result.previousStorageName && path.basename(result.previousStorageName) === result.previousStorageName) {
+    await rm(path.join(pluginLibraryRoot, result.previousStorageName), { force: true }).catch(() => undefined);
+  }
+  await recordActivity({ siteId: '', siteName: plugin.name, type: 'plugin-library.download', message: `${plugin.name} ${plugin.version} was downloaded from WordPress.org into the plugin library.` })
+    .catch((error) => console.error('Unable to record WordPress.org plugin download:', error.message));
+  return { plugin, libraryPlugin: publicPluginLibraryItem(result.item), replaced: Boolean(result.previousStorageName) };
+}
+
+async function attachLibraryPluginToBlueprint(blueprintId, libraryPluginId) {
+  const snapshot = await readState();
+  const blueprint = snapshot.blueprints[blueprintId];
+  if (!blueprint) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+  const [libraryItem] = validatePluginLibraryIds([libraryPluginId], snapshot);
+  const directory = path.join(blueprintRoot, blueprintId);
+  await mkdir(directory, { recursive: true });
+  const [file] = await materializeLibraryPlugins([libraryItem], directory);
+  let result;
+  try {
+    result = await updateState((state) => {
+      const current = state.blueprints[blueprintId];
+      if (!current) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+      current.files ||= [];
+      const existingIndex = current.files.findIndex((entry) => entry.source?.provider === 'wordpress.org' && entry.source.slug === libraryItem.slug);
+      const existing = existingIndex >= 0 ? current.files[existingIndex] : null;
+      if (existingIndex < 0 && current.files.length >= 25) throw Object.assign(new Error('A blueprint may contain up to 25 stored files.'), { status: 409 });
+      const nextTotal = current.files.reduce((sum, entry) => sum + Number(entry.size || 0), 0) - Number(existing?.size || 0) + file.size;
+      if (nextTotal > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint files may total up to 75 MB.'), { status: 413 });
+      if (existingIndex >= 0) current.files[existingIndex] = file;
+      else current.files.push(file);
+      current.plugins = (Array.isArray(current.plugins) ? current.plugins : []).filter((entry) => entry.slug !== libraryItem.slug);
+      current.updatedAt = new Date().toISOString();
+      return { blueprint: current, previousStorageName: existing?.storageName || null };
+    });
+  } catch (error) {
+    await rm(path.join(directory, file.storageName), { force: true }).catch(() => undefined);
+    throw error;
+  }
+  if (result.previousStorageName && path.basename(result.previousStorageName) === result.previousStorageName) {
     await rm(path.join(directory, result.previousStorageName), { force: true }).catch(() => undefined);
   }
+  return { blueprint: result.blueprint, replaced: Boolean(result.previousStorageName) };
+}
+
+async function downloadWordPressPlugins(input = {}) {
+  const slugs = [...new Set((Array.isArray(input.slugs) ? input.slugs : [input.slug]).filter(Boolean).map(validateWordPressPluginSlug))];
+  if (!slugs.length || slugs.length > 24) throw Object.assign(new Error('Choose between 1 and 24 WordPress.org plugins.'), { status: 400 });
+  const blueprintId = input.blueprintId ? String(input.blueprintId) : null;
+  if (blueprintId && !(await readState()).blueprints[blueprintId]) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+  const items = [];
+  for (const slug of slugs) {
+    const downloaded = await downloadWordPressPluginToLibrary(slug);
+    const attached = blueprintId ? await attachLibraryPluginToBlueprint(blueprintId, downloaded.libraryPlugin.id) : null;
+    items.push({ ...downloaded, blueprintReplaced: attached?.replaced || false });
+  }
   const latest = await readState();
-  await recordActivity({ siteId: '', siteName: result.blueprint.name, type: 'blueprint.plugin-download', message: `${plugin.name} ${plugin.version} was downloaded from WordPress.org into ${result.blueprint.name}.` })
-    .catch((error) => console.error('Unable to record WordPress.org plugin download:', error.message));
-  return { blueprint: publicBlueprint(result.blueprint, Object.values(latest.sites)), plugin, replaced: Boolean(result.previousStorageName) };
+  const blueprint = blueprintId ? publicBlueprint(latest.blueprints[blueprintId], Object.values(latest.sites)) : null;
+  if (blueprint) {
+    await recordActivity({ siteId: '', siteName: blueprint.name, type: 'blueprint.plugins-add', message: `${items.length} WordPress.org plugin${items.length === 1 ? '' : 's'} added to ${blueprint.name}.` })
+      .catch((error) => console.error('Unable to record blueprint plugin changes:', error.message));
+  }
+  return { plugins: items.map((item) => item.plugin), libraryPlugins: items.map((item) => item.libraryPlugin), blueprint, replaced: items.some((item) => item.replaced || item.blueprintReplaced) };
+}
+
+async function downloadWordPressPluginToBlueprint(blueprintId, pluginSlug) {
+  const result = await downloadWordPressPlugins({ blueprintId, slugs: [pluginSlug] });
+  return { blueprint: result.blueprint, plugin: result.plugins[0], replaced: result.replaced };
 }
 
 async function createBlueprint(input) {
@@ -1153,10 +1291,15 @@ async function createBlueprint(input) {
   }
   const sourceFiles = Array.isArray(input.files) ? input.files : [];
   if (sourceFiles.length > 25) throw Object.assign(new Error('A blueprint may contain up to 25 uploaded files.'), { status: 400 });
-  if (!plugins.length && !themes.length && !sourceFiles.length) throw Object.assign(new Error('Add at least one plugin, theme, settings file, content export or must-use plugin.'), { status: 400 });
   let decodedFiles;
   try { decodedFiles = sourceFiles.map(decodeBlueprintFile); } catch (error) { throw Object.assign(error, { status: 400 }); }
-  const totalBytes = decodedFiles.reduce((sum, file) => sum + file.contents.length, 0);
+  const snapshot = await readState();
+  const libraryItems = validatePluginLibraryIds(input.libraryPluginIds || [], snapshot);
+  if (!plugins.length && !themes.length && !decodedFiles.length && !libraryItems.length) throw Object.assign(new Error('Add at least one plugin, theme, settings file, content export or must-use plugin.'), { status: 400 });
+  if (decodedFiles.length + libraryItems.length > 25) throw Object.assign(new Error('A blueprint may contain up to 25 stored files.'), { status: 400 });
+  const librarySlugs = new Set(libraryItems.map((item) => item.slug));
+  plugins = plugins.filter((entry) => !librarySlugs.has(entry.slug));
+  const totalBytes = decodedFiles.reduce((sum, file) => sum + file.contents.length, 0) + libraryItems.reduce((sum, item) => sum + Number(item.size || 0), 0);
   if (totalBytes > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint uploads may total up to 75 MB.'), { status: 413 });
   const id = `blueprint_${randomBytes(6).toString('hex')}`;
   const directory = path.join(blueprintRoot, id);
@@ -1171,6 +1314,7 @@ async function createBlueprint(input) {
       await writeFile(path.join(directory, storageName), file.contents);
       files.push({ id: fileId, name: file.name, kind: file.kind, destination: file.destination, size: file.contents.length, sha256: createHash('sha256').update(file.contents).digest('hex'), storageName });
     }
+    files.push(...await materializeLibraryPlugins(libraryItems, directory));
     blueprint = { id, name, description, plugins, themes, files, createdAt: now, updatedAt: now };
     await updateState((state) => { state.blueprints[id] = blueprint; });
   } catch (error) {
@@ -1179,6 +1323,71 @@ async function createBlueprint(input) {
   }
   await recordActivity({ siteId: '', siteName: name, type: 'blueprint.create', message: `${name} was saved as a WordPress blueprint.` }).catch((error) => console.error('Unable to record blueprint creation:', error.message));
   return publicBlueprint(blueprint);
+}
+
+async function updateBlueprint(blueprintId, input = {}) {
+  const snapshot = await readState();
+  const current = snapshot.blueprints[blueprintId];
+  if (!current) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+  const name = input.name === undefined ? current.name : String(input.name || '').trim();
+  const description = input.description === undefined ? current.description || '' : String(input.description || '').trim();
+  if (!name || name.length > 100) throw Object.assign(new Error('Enter a blueprint name up to 100 characters.'), { status: 400 });
+  if (description.length > 500) throw Object.assign(new Error('Blueprint descriptions may be up to 500 characters.'), { status: 400 });
+  let plugins;
+  let themes;
+  try {
+    plugins = input.plugins === undefined ? current.plugins || [] : normalizeBlueprintSlugs(input.plugins, 'plugin');
+    themes = input.themes === undefined ? current.themes || [] : normalizeBlueprintSlugs(input.themes, 'theme', 20);
+  } catch (error) { throw Object.assign(error, { status: 400 }); }
+  const sourceFiles = Array.isArray(input.files) ? input.files : [];
+  if (sourceFiles.length > 25) throw Object.assign(new Error('A blueprint may contain up to 25 new files at once.'), { status: 400 });
+  let decodedFiles;
+  try { decodedFiles = sourceFiles.map(decodeBlueprintFile); } catch (error) { throw Object.assign(error, { status: 400 }); }
+  const requestedRetainedIds = input.retainedFileIds === undefined ? (current.files || []).map((file) => file.id) : [...new Set((Array.isArray(input.retainedFileIds) ? input.retainedFileIds : []).map(String))];
+  if (requestedRetainedIds.some((id) => !(current.files || []).some((file) => file.id === id))) throw Object.assign(new Error('A retained blueprint file is invalid.'), { status: 400 });
+  const libraryItems = input.libraryPluginIds === undefined ? [] : validatePluginLibraryIds(input.libraryPluginIds, snapshot);
+  const selectedLibraryIds = new Set(libraryItems.map((item) => item.id));
+  const selectedLibrarySlugs = new Set(libraryItems.map((item) => item.slug));
+  const retainedFiles = (current.files || []).filter((file) => requestedRetainedIds.includes(file.id)
+    && !(file.source?.libraryPluginId && selectedLibraryIds.has(file.source.libraryPluginId))
+    && !(file.source?.provider === 'wordpress.org' && selectedLibrarySlugs.has(file.source.slug)));
+  const nextFileCount = retainedFiles.length + decodedFiles.length + libraryItems.length;
+  if (nextFileCount > 25) throw Object.assign(new Error('A blueprint may contain up to 25 stored files.'), { status: 400 });
+  const nextBytes = retainedFiles.reduce((sum, file) => sum + Number(file.size || 0), 0)
+    + decodedFiles.reduce((sum, file) => sum + file.contents.length, 0)
+    + libraryItems.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  if (nextBytes > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint files may total up to 75 MB.'), { status: 413 });
+  if (!plugins.length && !themes.length && !nextFileCount) throw Object.assign(new Error('Keep at least one plugin, theme or configuration file in the blueprint.'), { status: 400 });
+  const directory = path.join(blueprintRoot, blueprintId);
+  await mkdir(directory, { recursive: true });
+  const addedFiles = [];
+  try {
+    for (const file of decodedFiles) {
+      const fileId = randomBytes(8).toString('hex');
+      const storageName = `${fileId}${path.extname(file.name).toLowerCase()}`;
+      await writeFile(path.join(directory, storageName), file.contents);
+      addedFiles.push({ id: fileId, name: file.name, kind: file.kind, destination: file.destination, size: file.contents.length, sha256: createHash('sha256').update(file.contents).digest('hex'), storageName });
+    }
+    addedFiles.push(...await materializeLibraryPlugins(libraryItems, directory));
+    const librarySlugs = new Set(libraryItems.map((item) => item.slug));
+    plugins = plugins.filter((entry) => !librarySlugs.has(entry.slug));
+    const now = new Date().toISOString();
+    await updateState((state) => {
+      const blueprint = state.blueprints[blueprintId];
+      if (!blueprint) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+      Object.assign(blueprint, { name, description, plugins, themes, files: [...retainedFiles, ...addedFiles], updatedAt: now });
+    });
+  } catch (error) {
+    await Promise.all(addedFiles.map((file) => rm(path.join(directory, file.storageName), { force: true }).catch(() => undefined)));
+    throw error;
+  }
+  const keptStorageNames = new Set([...retainedFiles, ...addedFiles].map((file) => file.storageName));
+  await Promise.all((current.files || []).filter((file) => !keptStorageNames.has(file.storageName) && path.basename(String(file.storageName || '')) === file.storageName)
+    .map((file) => rm(path.join(directory, file.storageName), { force: true }).catch(() => undefined)));
+  const latest = await readState();
+  await recordActivity({ siteId: '', siteName: name, type: 'blueprint.update', message: `${name} was updated.` })
+    .catch((error) => console.error('Unable to record blueprint update:', error.message));
+  return publicBlueprint(latest.blueprints[blueprintId], Object.values(latest.sites));
 }
 
 async function deleteBlueprint(blueprintId) {
@@ -3670,8 +3879,12 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   deleteClient,
   listBlueprints,
   searchWordPressPlugins,
+  listPluginLibrary,
+  deletePluginLibraryItem,
+  downloadWordPressPlugins,
   downloadWordPressPluginToBlueprint,
   createBlueprint,
+  updateBlueprint,
   deleteBlueprint,
   listMcpAgents,
   manageMcpAgent,
@@ -3745,6 +3958,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/staging') return send(response, 202, { staging: await createStagingSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/blueprints') return send(response, 200, { blueprints: await listBlueprints() });
     if (request.method === 'POST' && url.pathname === '/blueprints') return send(response, 201, { blueprint: await createBlueprint(await readJson(request, 105_000_000)) });
+    if (request.method === 'GET' && url.pathname === '/wordpress/plugins/library') return send(response, 200, { plugins: await listPluginLibrary() });
+    if (request.method === 'POST' && url.pathname === '/wordpress/plugins/library') return send(response, 200, await downloadWordPressPlugins(await readJson(request)));
     if (request.method === 'GET' && url.pathname === '/wordpress/plugins') return send(response, 200, { repository: await searchWordPressPlugins({
       query: url.searchParams.get('query'),
       page: url.searchParams.get('page'),
@@ -3767,12 +3982,15 @@ const server = createServer(async (request, response) => {
     if (clientMatch && request.method === 'PATCH') return send(response, 200, { client: await updateClient(decodeURIComponent(clientMatch[1]), await readJson(request)) });
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
     const blueprintMatch = url.pathname.match(/^\/blueprints\/([^/]+)$/);
+    if (blueprintMatch && request.method === 'PATCH') return send(response, 200, { blueprint: await updateBlueprint(decodeURIComponent(blueprintMatch[1]), await readJson(request, 105_000_000)) });
     if (blueprintMatch && request.method === 'DELETE') return send(response, 200, await deleteBlueprint(decodeURIComponent(blueprintMatch[1])));
     const blueprintPluginMatch = url.pathname.match(/^\/blueprints\/([^/]+)\/plugins$/);
     if (blueprintPluginMatch && request.method === 'POST') {
       const body = await readJson(request);
       return send(response, 200, await downloadWordPressPluginToBlueprint(decodeURIComponent(blueprintPluginMatch[1]), body.slug));
     }
+    const pluginLibraryMatch = url.pathname.match(/^\/wordpress\/plugins\/library\/([^/]+)$/);
+    if (pluginLibraryMatch && request.method === 'DELETE') return send(response, 200, await deletePluginLibraryItem(decodeURIComponent(pluginLibraryMatch[1])));
     const agentActionMatch = url.pathname.match(/^\/agents\/([^/]+)\/actions$/);
     if (agentActionMatch && request.method === 'POST') {
       const body = await readJson(request);
