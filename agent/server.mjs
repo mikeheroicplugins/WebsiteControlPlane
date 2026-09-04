@@ -2575,6 +2575,43 @@ async function issueOneClickLogin(siteId) {
   };
 }
 
+function wordpressFamilyId(site) {
+  return site.environment === 'staging' ? site.productionSiteId : site.id;
+}
+
+function assertRestoreDestination(sourceSite, targetSite) {
+  if (sourceSite.kind === 'lovable' || targetSite.kind === 'lovable') {
+    throw Object.assign(new Error('Backup restore is available only for WordPress sites.'), { status: 409 });
+  }
+  if (!wordpressFamilyId(sourceSite) || wordpressFamilyId(sourceSite) !== wordpressFamilyId(targetSite)) {
+    throw Object.assign(new Error('Choose the production site or a staging environment linked to this backup.'), { status: 409 });
+  }
+}
+
+async function getBackupHistory(siteId) {
+  const state = await readState();
+  const site = state.sites[siteId];
+  if (!site) throw Object.assign(new Error('Site not found.'), { status: 404 });
+  if (site.kind === 'lovable') throw Object.assign(new Error('WordPress backup history is not available for Lovable sites.'), { status: 409 });
+  const familyId = wordpressFamilyId(site);
+  const familySites = Object.values(state.sites).filter((entry) => entry.kind !== 'lovable' && wordpressFamilyId(entry) === familyId);
+  const backups = familySites.flatMap((source) => (Array.isArray(source.backups) ? source.backups : []).map((backup) => ({
+    ...backup,
+    sourceSiteId: source.id,
+    sourceSiteName: source.name,
+    sourceEnvironment: source.environment === 'staging' ? 'staging' : 'production',
+  }))).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const destinations = familySites.map((destination) => ({
+    id: destination.id,
+    name: destination.name,
+    domain: destination.domain,
+    environment: destination.environment === 'staging' ? 'staging' : 'production',
+    status: destination.status,
+    phase: destination.phase || null,
+  })).sort((a, b) => a.environment.localeCompare(b.environment));
+  return { siteId: site.id, familyId, backups, destinations };
+}
+
 async function createBackup(site, options = {}) {
   const trigger = ['manual', 'automatic', 'system'].includes(options.trigger) ? options.trigger : 'system';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2613,39 +2650,106 @@ async function createBackup(site, options = {}) {
   return backup;
 }
 
-async function restoreBackup(site, backupId, scope = 'all') {
-  if (site.kind === 'lovable') throw Object.assign(new Error('Source restore is not yet available for Lovable builds; redeploy the current source instead.'), { status: 409 });
+async function restoreBackup(sourceSite, backupId, scope = 'all', targetSite = sourceSite) {
+  assertRestoreDestination(sourceSite, targetSite);
   if (!['all', 'files', 'database'].includes(scope)) throw Object.assign(new Error('Choose all, files or database for the restore scope.'), { status: 400 });
-  const backup = (Array.isArray(site.backups) ? site.backups : []).find((entry) => entry.id === String(backupId || ''));
+  const backup = (Array.isArray(sourceSite.backups) ? sourceSite.backups : []).find((entry) => entry.id === String(backupId || ''));
   if (!backup) throw Object.assign(new Error('Backup not found.'), { status: 404 });
-  const siteBackupDir = path.join(backupRoot, site.id);
+  const sourceBackupDir = path.join(backupRoot, sourceSite.id);
   const databaseName = backup.files.find((file) => file.endsWith('-database.sql'));
   const filesName = backup.files.find((file) => file.endsWith('-wordpress.tar.gz'));
   if (backup.files.some((file) => path.basename(file) !== file)) throw new Error('The backup contains an invalid file reference.');
   if ((scope === 'all' || scope === 'database') && !databaseName) throw new Error('This recovery point does not contain a database export.');
   if ((scope === 'all' || scope === 'files') && !filesName) throw new Error('This recovery point does not contain a WordPress file archive.');
-  await createBackup(site, { trigger: 'system' });
-  await docker(['stop', '-t', '20', site.wpContainer]).catch((error) => { if (!/is not running/i.test(error.message)) throw error; });
+  await docker(['start', targetSite.dbContainer]).catch((error) => { if (!/is already running/i.test(error.message)) throw error; });
+  await waitForDatabase(targetSite, 120_000);
+  const safetyBackup = await createBackup(targetSite, { trigger: 'system' });
+  await docker(['stop', '-t', '20', targetSite.wpContainer]).catch((error) => { if (!/is not running/i.test(error.message)) throw error; });
   try {
-    await docker(['start', site.dbContainer]).catch((error) => { if (!/is already running/i.test(error.message)) throw error; });
-    await waitForDatabase(site, 120_000);
     if (scope === 'all' || scope === 'files') {
       await docker([
-        'run', '--rm', '-v', `${site.wpVolume}:/target`, '-v', `${siteBackupDir}:/backups:ro`, 'alpine:latest',
+        'run', '--rm', '-v', `${targetSite.wpVolume}:/target`, '-v', `${sourceBackupDir}:/backups:ro`, 'alpine:latest',
         'sh', '-c', 'find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf "/backups/$1" -C /target', '--', filesName,
       ], { timeout: 600_000 });
     }
     if (scope === 'all' || scope === 'database') {
-      await dockerFromFile(['exec', '-i', '-e', `MYSQL_PWD=${site.secrets.dbRootPassword}`, site.dbContainer, 'mariadb', '-uroot', 'wordpress'], path.join(siteBackupDir, databaseName));
+      await docker([
+        'exec', '-e', `MYSQL_PWD=${targetSite.secrets.dbRootPassword}`, targetSite.dbContainer,
+        'mariadb', '-uroot', '-e', 'DROP DATABASE IF EXISTS wordpress; CREATE DATABASE wordpress CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+      ], { timeout: 120_000 });
+      await dockerFromFile(['exec', '-i', '-e', `MYSQL_PWD=${targetSite.secrets.dbRootPassword}`, targetSite.dbContainer, 'mariadb', '-uroot', 'wordpress'], path.join(sourceBackupDir, databaseName));
     }
   } finally {
-    await docker(['start', site.wpContainer]).catch(() => undefined);
+    await docker(['start', targetSite.wpContainer]).catch(() => undefined);
   }
-  await ensureLocalPreviewConfig(site);
-  await ensureControlPlaneMuPlugin(site);
-  await ensureStagingGuard(site);
-  await refreshVersions(site);
-  return { backupId: backup.id, scope, restoredAt: new Date().toISOString() };
+  await waitForWordPressFiles(targetSite, 120_000);
+  await ensureLocalPreviewConfig(targetSite);
+  await ensureControlPlaneMuPlugin(targetSite);
+  await ensureStagingGuard(targetSite);
+  if ((scope === 'all' || scope === 'database') && sourceSite.id !== targetSite.id) {
+    const targetUrl = `http://${targetSite.domain}`;
+    for (const sourceUrl of [`http://${sourceSite.domain}`, `https://${sourceSite.domain}`]) {
+      await runWp(targetSite, ['search-replace', sourceUrl, targetUrl, '--all-tables', '--precise', '--recurse-objects', '--skip-columns=guid'], { timeout: 600_000 });
+    }
+    await runWp(targetSite, ['option', 'update', 'home', targetUrl], { timeout: 90_000 });
+    await runWp(targetSite, ['option', 'update', 'siteurl', targetUrl], { timeout: 90_000 });
+  }
+  if (targetSite.environment === 'staging') await runWp(targetSite, ['option', 'update', 'blog_public', '0'], { timeout: 90_000 });
+  await runWp(targetSite, ['rewrite', 'flush', '--hard'], { timeout: 120_000 });
+  await runWp(targetSite, ['cache', 'flush'], { timeout: 90_000 }).catch(() => undefined);
+  await rm(screenshotPath(targetSite.id), { force: true }).catch(() => undefined);
+  await refreshVersions(targetSite);
+  return {
+    backupId: backup.id,
+    sourceSiteId: sourceSite.id,
+    targetSiteId: targetSite.id,
+    targetEnvironment: targetSite.environment === 'staging' ? 'staging' : 'production',
+    scope,
+    safetyBackupId: safetyBackup.id,
+    restoredAt: new Date().toISOString(),
+  };
+}
+
+async function runRestoreOperation(sourceSite, input) {
+  const targetSite = input.targetSiteId ? await requireSite(String(input.targetSiteId)) : sourceSite;
+  assertRestoreDestination(sourceSite, targetSite);
+  if (targetSite.id !== sourceSite.id && targetSite.phase) {
+    throw Object.assign(new Error(`The destination site is currently ${targetSite.phase.toLowerCase()}.`), { status: 409 });
+  }
+  const affectedSites = targetSite.id === sourceSite.id ? [sourceSite] : [sourceSite, targetSite];
+  const destinationLabel = targetSite.environment === 'staging' ? 'staging' : 'production';
+  for (const affected of affectedSites) {
+    await setSiteState(affected.id, { phase: `Restoring backup to ${destinationLabel}`, error: null });
+  }
+  try {
+    const restore = await restoreBackup(sourceSite, input.backupId, String(input.restoreScope || 'all'), targetSite);
+    const currentSource = await requireSite(sourceSite.id);
+    const currentTarget = targetSite.id === sourceSite.id ? currentSource : await requireSite(targetSite.id);
+    for (const affected of [currentSource, ...(currentTarget.id === currentSource.id ? [] : [currentTarget])]) {
+      const inspect = await inspectContainer(affected.wpContainer).catch(() => null);
+      await setSiteState(affected.id, { phase: null, status: inspect?.State?.Running ? 'Running' : 'Stopped', error: null });
+    }
+    await recordActivity({
+      siteId: targetSite.id,
+      siteName: targetSite.name,
+      type: 'backup.restore',
+      message: `${sourceSite.name} backup restored to ${targetSite.name} (${destinationLabel}); a destination safety backup was created first.`,
+    });
+    const finalSource = await requireSite(sourceSite.id);
+    const finalTarget = targetSite.id === sourceSite.id ? finalSource : await requireSite(targetSite.id);
+    return {
+      restore,
+      site: publicSite(finalSource, await inspectContainer(finalSource.wpContainer)),
+      targetSite: publicSite(finalTarget, await inspectContainer(finalTarget.wpContainer)),
+    };
+  } catch (error) {
+    for (const affected of affectedSites) {
+      const inspect = await inspectContainer(affected.wpContainer).catch(() => null);
+      await setSiteState(affected.id, { phase: null, status: inspect?.State?.Running ? 'Running' : 'Stopped', error: error.message || 'Backup restore failed.' });
+    }
+    await recordActivity({ siteId: targetSite.id, siteName: targetSite.name, type: 'backup.restore', state: 'failed', message: error.message || 'Backup restore failed.' });
+    throw error;
+  }
 }
 
 async function runOperation(siteId, type, input = {}) {
@@ -2677,6 +2781,8 @@ async function runOperation(siteId, type, input = {}) {
     await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name} was removed${input.deleteData ? ' with its data' : '; volumes were preserved'}.` });
     return { deleted: true };
   }
+
+  if (operation === 'restore-backup') return runRestoreOperation(site, input);
 
   await setSiteState(site.id, { phase: `${operation[0].toUpperCase()}${operation.slice(1)} in progress`, error: null });
   try {
@@ -2723,8 +2829,6 @@ async function runOperation(siteId, type, input = {}) {
       await refreshVersions(site);
     } else if (operation === 'backup') {
       await createBackup(site, { trigger: input.backupTrigger === 'automatic' ? 'automatic' : 'manual' });
-    } else if (operation === 'restore-backup') {
-      await restoreBackup(site, input.backupId, String(input.restoreScope || 'all'));
     } else if (operation === 'update') {
       await createBackup(site, { trigger: 'system' });
       await runWp(site, ['core', 'update'], { timeout: 600_000 });
@@ -3200,6 +3304,7 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   getSiteInventory,
   getBackupSchedule,
   updateBackupSchedule,
+  getBackupHistory,
   getSiteScreenshot,
   getSiteMonitoring,
   getSiteLogs,
@@ -3324,6 +3429,8 @@ const server = createServer(async (request, response) => {
     const backupScheduleMatch = url.pathname.match(/^\/sites\/([^/]+)\/backup-schedule$/);
     if (backupScheduleMatch && request.method === 'GET') return send(response, 200, { backupSchedule: await getBackupSchedule(decodeURIComponent(backupScheduleMatch[1])) });
     if (backupScheduleMatch && request.method === 'PATCH') return send(response, 200, { backupSchedule: await updateBackupSchedule(decodeURIComponent(backupScheduleMatch[1]), await readJson(request)) });
+    const backupHistoryMatch = url.pathname.match(/^\/sites\/([^/]+)\/backups$/);
+    if (backupHistoryMatch && request.method === 'GET') return send(response, 200, { backupHistory: await getBackupHistory(decodeURIComponent(backupHistoryMatch[1])) });
     const developerMatch = url.pathname.match(/^\/sites\/([^/]+)\/developer$/);
     if (developerMatch && request.method === 'GET') {
       const siteId = decodeURIComponent(developerMatch[1]);

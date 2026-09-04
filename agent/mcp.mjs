@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 38;
+export const controlPlaneMcpToolCount = 39;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -147,6 +147,13 @@ function createControlPlaneMcpServer(api) {
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, ({ siteId, ...input }) => api.updateBackupSchedule(siteId, input));
 
+  register(server, 'get_backup_history', {
+    title: 'Get WordPress backup history',
+    description: 'List all recovery points across a linked production WordPress site and its staging environment, plus the valid restore destinations.',
+    inputSchema: z.object({ siteId: siteIdSchema }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, ({ siteId }) => api.getBackupHistory(siteId));
+
   registerRaw(server, 'get_site_screenshot', {
     title: 'Get site screenshot',
     description: 'Capture or read the current 1440×1000 frontend preview for a managed site. Cached previews refresh every 60 minutes.',
@@ -247,10 +254,15 @@ function createControlPlaneMcpServer(api) {
 
   register(server, 'restore_site_backup', {
     title: 'Restore site backup',
-    description: 'Create a safety recovery point, then restore files, the database, or both from an existing WordPress backup.',
-    inputSchema: z.object({ siteId: siteIdSchema, backupId: z.string().uuid(), restoreScope: z.enum(['all', 'files', 'database']).default('all') }),
+    description: 'Create a destination safety recovery point, then restore files, the database, or both from any backup in a linked production/staging WordPress family.',
+    inputSchema: z.object({
+      siteId: siteIdSchema.describe('WordPress site that owns the backup.'),
+      backupId: z.string().uuid(),
+      targetSiteId: siteIdSchema.optional().describe('Linked production or staging destination. Defaults to the site that owns the backup.'),
+      restoreScope: z.enum(['all', 'files', 'database']).default('all'),
+    }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
-  }, ({ siteId, backupId, restoreScope }) => api.runSiteOperation(siteId, 'restore-backup', { backupId, restoreScope }));
+  }, ({ siteId, backupId, targetSiteId, restoreScope }) => api.runSiteOperation(siteId, 'restore-backup', { backupId, targetSiteId, restoreScope }));
 
   register(server, 'delete_site', {
     title: 'Delete site',

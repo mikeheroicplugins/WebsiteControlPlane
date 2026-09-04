@@ -54,6 +54,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 - Create client records, assign sites to clients and organize sites with persistent tags.
 - Read live Docker, WordPress, PHP, plugin and theme versions.
 - Back up the MariaDB database and WordPress volume on demand, or schedule automatic backups every 6 or 12 hours, daily, every 3 days, weekly, or monthly for production and staging sites.
+- Review one combined production/staging backup history and restore any recovery point to either linked environment. Every restore first creates a safety backup of the destination, and cross-environment database restores rewrite site URLs automatically.
 - Update WordPress core, individual or all plugins, and individual or all themes after creating a backup.
 - Activate and deactivate plugins and switch installed themes through WP-CLI.
 - Verify WordPress core and plugin checksums.
@@ -74,7 +75,7 @@ Local state, Lovable source checkouts and backups live under `.geekheros/` and a
 
 Managed site details include a real browser-rendered frontend capture that refreshes every 60 minutes, 10-minute uptime checks, manual and scheduled WordPress backups, safety-backed restore operations, container logs, an audited terminal and WP-CLI console, database queries, a scoped `wp-content` code editor, and runtime inspection. Microsoft Edge or Google Chrome is required on the agent machine for frontend captures.
 
-Every dashboard capability is also part of the authenticated MCP server. WordPress staging is available through dedicated list, create and lifecycle tools, including scoped file/database sync and promotion. Backup schedules are readable and configurable through MCP, while `run_site_operation` can create an immediate production or staging backup. The Agents page records authenticated MCP client metadata, network origin, recency, tool usage and response timing without storing authorization headers, tool arguments or prompts. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
+Every dashboard capability is also part of the authenticated MCP server. WordPress staging is available through dedicated list, create and lifecycle tools, including scoped file/database sync and promotion. Backup schedules are readable and configurable through MCP, while `run_site_operation` can create an immediate production or staging backup. `get_backup_history` returns the combined recovery timeline and valid restore destinations; `restore_site_backup` restores a selected recovery point to its owning site or its linked production/staging counterpart. The Agents page records authenticated MCP client metadata, network origin, recency, tool usage and response timing without storing authorization headers, tool arguments or prompts. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
 
 ## Hosted dashboard connection
 
