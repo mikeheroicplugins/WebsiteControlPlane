@@ -143,8 +143,10 @@ type AnalyticsData = {
   operationTypes: Array<{ type: string; count: number; failures: number }>;
 };
 
-const nav: Array<{ view: View; icon: LucideIcon; subnav?: boolean }> = [
-  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Staging', icon: FlaskConical, subnav: true }, { view: 'Clients', icon: Users },
+type NavigationItem = { view: View; icon: LucideIcon; children?: Array<{ view: View; icon: LucideIcon }> };
+
+const nav: NavigationItem[] = [
+  { view: 'Overview', icon: House }, { view: 'Sites', icon: Container, children: [{ view: 'Staging', icon: FlaskConical }] }, { view: 'Clients', icon: Users },
   { view: 'Blueprints', icon: Boxes },
   { view: 'Agents', icon: Bot },
   { view: 'Analytics', icon: ChartNoAxesCombined },
@@ -209,6 +211,7 @@ export default function Home() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [openNavGroups, setOpenNavGroups] = useState<Partial<Record<View, boolean>>>({ Sites: true });
 
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -274,7 +277,12 @@ export default function Home() {
   const visibleBlueprints = useMemo(() => blueprints.filter((blueprint) => `${blueprint.name} ${blueprint.description} ${blueprint.plugins.map((plugin) => plugin.slug).join(' ')} ${blueprint.themes.map((theme) => theme.slug).join(' ')} ${blueprint.files.map((file) => file.name).join(' ')}`.toLowerCase().includes(query.toLowerCase())), [blueprints, query]);
   const visibleAgents = useMemo(() => agents.filter((agent) => `${agent.name} ${agent.clientName || ''} ${agent.clientVersion || ''} ${agent.ip} ${agent.platform} ${agent.userAgent} ${agent.lastTool || ''}`.toLowerCase().includes(query.toLowerCase())), [agents, query]);
 
-  function navigate(next: View) { setView(next); setSelectedId(null); }
+  function navigate(next: View) {
+    setView(next);
+    setSelectedId(null);
+    const parent = nav.find((item) => item.children?.some((child) => child.view === next));
+    if (parent) setOpenNavGroups({ [parent.view]: true });
+  }
   function openLaunch() { setPreferredBlueprintId(null); setLaunchMode('choose'); }
 
   async function createSite(event: FormEvent<HTMLFormElement>) {
@@ -505,7 +513,35 @@ export default function Home() {
     <aside className="sidebar">
       <button className="brand" onClick={() => navigate('Overview')}><span className="brand-mark">G</span><span>GeekHeros</span></button>
       <div className="workspace-switcher static-workspace"><span className="workspace-avatar">DK</span><span className="workspace-copy"><strong>Docker Desktop</strong><small>{system.connected ? 'Local node connected' : 'Agent offline'}</small></span><span className={`connection-light ${system.connected ? 'online' : ''}`} /></div>
-      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => <button key={item.view} onClick={() => navigate(item.view)} className={`nav-item ${item.subnav ? 'subnav' : ''} ${view === item.view && !selected ? 'active' : ''}`}><span><item.icon aria-hidden="true" /></span>{item.view}{item.view === 'Sites' && <em>{sites.length}</em>}{item.view === 'Staging' && <em>{stagingSites.length}</em>}{item.view === 'Clients' && <em>{clients.length}</em>}{item.view === 'Blueprints' && <em>{blueprints.length}</em>}{item.view === 'Agents' && <em>{agents.filter((agent) => agent.status === 'Connected').length}</em>}</button>)}</nav>
+      <nav aria-label="Primary navigation"><p className="nav-label">Control plane</p>{nav.map((item) => {
+        const children = item.children || [];
+        const expanded = Boolean(openNavGroups[item.view]);
+        const active = view === item.view && !selected;
+        const descendantActive = children.some((child) => child.view === view) && !selected;
+        const count = item.view === 'Sites' ? sites.length : item.view === 'Clients' ? clients.length : item.view === 'Blueprints' ? blueprints.length : item.view === 'Agents' ? agents.filter((agent) => agent.status === 'Connected').length : null;
+        return <div className={`nav-group ${children.length ? 'has-children' : ''}`} key={item.view}>
+          <button
+            onClick={() => {
+              navigate(item.view);
+              if (children.length) setOpenNavGroups((current) => ({ [item.view]: !current[item.view] }));
+            }}
+            className={`nav-item ${children.length ? 'nav-parent' : ''} ${active ? 'active' : ''} ${descendantActive ? 'descendant-active' : ''}`}
+            aria-current={active ? 'page' : undefined}
+            aria-expanded={children.length ? expanded : undefined}
+            aria-controls={children.length ? `nav-children-${item.view.toLowerCase()}` : undefined}
+          >
+            <span><item.icon aria-hidden="true" /></span>{item.view}
+            {(count !== null || children.length > 0) && <div className="nav-trailing">{count !== null && <em>{count}</em>}{children.length > 0 && <ChevronDown className="nav-caret" aria-hidden="true" />}</div>}
+          </button>
+          {children.length > 0 && <div className="nav-submenu" id={`nav-children-${item.view.toLowerCase()}`} role="group" aria-label={`${item.view} submenu`} hidden={!expanded}>
+            {children.map((child) => {
+              const childActive = view === child.view && !selected;
+              const childCount = child.view === 'Staging' ? stagingSites.length : null;
+              return <button key={child.view} onClick={() => navigate(child.view)} className={`nav-item subnav ${childActive ? 'active' : ''}`} aria-current={childActive ? 'page' : undefined}><span><child.icon aria-hidden="true" /></span>{child.view}{childCount !== null && <em>{childCount}</em>}</button>;
+            })}
+          </div>}
+        </div>;
+      })}</nav>
       <div className="node-card"><div className="node-card-head"><span>Managed fleet</span><strong>{system.runningSites || 0}/{system.managedSites || 0}</strong></div><div className="capacity-track"><span style={{ width: `${system.managedSites ? Math.round(((system.runningSites || 0) / system.managedSites) * 100) : 0}%` }} /></div><small>{system.cpuCount || 0} CPU · {formatBytes(system.memoryBytes || 0)} memory</small></div>
       <div className="sidebar-user"><span className="user-avatar">GH</span><span className="workspace-copy"><strong>Local administrator</strong><small>Docker access enabled</small></span></div>
     </aside>

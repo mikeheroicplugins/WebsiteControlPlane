@@ -25,6 +25,13 @@ nav { flex:1; overflow:auto; }
 .nav-item:hover { background:#19251f; color:#e8eeeb; }
 .nav-item.active { color:#eff4f1; background:#24302a; }
 .nav-item.active>span { color:#c5d0ca; }
+.nav-group { width:100%; }
+.nav-parent.descendant-active { color:#d7e3dc; background:#19251f; }
+.nav-trailing { min-width:0; margin-left:auto; display:flex; align-items:center; justify-content:flex-end; gap:7px; }
+.nav-trailing em { margin-left:0; }
+.nav-caret { width:14px; height:14px; color:#738178; stroke-width:1.9; transition:transform .18s ease; }
+.nav-parent[aria-expanded='true'] .nav-caret { transform:rotate(180deg); }
+.nav-submenu { margin:1px 0 5px; }
 .nav-item.subnav { width:calc(100% - 18px); height:32px; margin-left:18px; padding-left:9px; border-left:1px solid #324139; border-radius:0 7px 7px 0; color:#84938a; font-size:13px; }
 .nav-item.subnav>span svg { width:12px; height:12px; }
 .nav-item.subnav.active { color:#dff2e7; border-left-color:#62d493; background:#1d2b24; }
