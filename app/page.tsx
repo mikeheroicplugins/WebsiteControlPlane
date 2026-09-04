@@ -79,7 +79,8 @@ type ActivityEntry = {
 };
 type LoginResponse = { actionUrl: string; action: string; token: string; expiresAt: string };
 type BlueprintFileKind = 'plugin' | 'theme' | 'settings' | 'content' | 'mu-plugin' | 'wp-content';
-type BlueprintFile = { id: string; name: string; kind: BlueprintFileKind; destination: string; size: number; sha256: string };
+type BlueprintFileSource = { provider: 'wordpress.org'; slug: string; name: string; version: string; pluginUrl: string; downloadedAt: string };
+type BlueprintFile = { id: string; name: string; kind: BlueprintFileKind; destination: string; size: number; sha256: string; source: BlueprintFileSource | null };
 type BlueprintPackage = { slug: string; activate: boolean };
 type Blueprint = {
   id: string; name: string; description: string; plugins: BlueprintPackage[]; themes: BlueprintPackage[];
@@ -87,6 +88,12 @@ type Blueprint = {
 };
 type BlueprintUpload = { id: string; file: File; kind: BlueprintFileKind; destination: string };
 type BlueprintInput = { name: string; description: string; plugins: string[]; themes: string[]; files: Array<{ name: string; kind: BlueprintFileKind; destination: string; content: string }> };
+type WordPressPlugin = {
+  name: string; slug: string; version: string; author: string; shortDescription: string; rating: number;
+  ratingCount: number; activeInstalls: number; requiresWordPress: string; testedWordPress: string;
+  requiresPhp: string; lastUpdated: string; pluginUrl: string;
+};
+type WordPressPluginSearch = { query: string; page: number; pages: number; total: number; plugins: WordPressPlugin[]; searchedAt: string };
 type McpAgent = {
   id: string; name: string; clientName: string | null; clientTitle: string | null; clientVersion: string | null;
   protocolVersion: string | null; capabilities: string[]; ip: string; local: boolean; platform: string;
@@ -190,6 +197,8 @@ export default function Home() {
   const [launchMode, setLaunchMode] = useState<LaunchMode>(null);
   const [clientOpen, setClientOpen] = useState(false);
   const [blueprintOpen, setBlueprintOpen] = useState(false);
+  const [pluginBrowserOpen, setPluginBrowserOpen] = useState(false);
+  const [pluginBrowserBlueprintId, setPluginBrowserBlueprintId] = useState<string | null>(null);
   const [stagingOpen, setStagingOpen] = useState(false);
   const [preferredBlueprintId, setPreferredBlueprintId] = useState<string | null>(null);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
@@ -355,6 +364,23 @@ export default function Home() {
     finally { setBusy(null); }
   }
 
+  async function downloadWordPressPlugin(blueprintId: string, slug: string) {
+    setBusy(`blueprint:${blueprintId}:plugin:${slug}`);
+    try {
+      const response = await apiFetch(`/api/blueprints/${encodeURIComponent(blueprintId)}/plugins`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slug }),
+      });
+      const result = await response.json() as { blueprint?: Blueprint; plugin?: WordPressPlugin; replaced?: boolean; error?: string };
+      if (!response.ok || !result.blueprint || !result.plugin) throw new Error(result.error || 'The plugin could not be downloaded.');
+      setToast(`${result.plugin.name} ${result.replaced ? 'was updated in' : 'was downloaded into'} ${result.blueprint.name}.`);
+      await refresh(true);
+      return true;
+    } catch (failure) {
+      setToast(messageFrom(failure, 'The plugin could not be downloaded.'));
+      return false;
+    } finally { setBusy(null); }
+  }
+
   async function manageAgent(agent: McpAgent, action: 'restart' | 'remove' | 'restore' | 'forget') {
     if (action === 'remove' && !window.confirm(`Remove MCP access for ${agent.name}? Requests from this client fingerprint will be denied until you restore it.`)) return;
     if (action === 'forget' && !window.confirm(`Permanently forget the telemetry record for ${agent.name}? It can reappear only after access is restored and it reconnects.`)) return;
@@ -470,7 +496,7 @@ export default function Home() {
         {view === 'Sites' && <SitesView sites={visibleSites} clients={clients} total={sites.length} loading={loading} query={query} onQuery={setQuery} filter={filter} onFilter={setFilter} onLaunch={openLaunch} onOpen={setSelectedId} />}
         {view === 'Staging' && <StagingView stagingSites={visibleStagingSites} productionSites={sites} busy={busy} onCreate={() => setStagingOpen(true)} onManage={manageStaging} onBackup={(site) => operate(site, 'backup')} onLogin={oneClickLogin} onOpen={setSelectedId} />}
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
-        {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
+        {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onBrowse={(blueprintId) => { setPluginBrowserBlueprintId(blueprintId); setPluginBrowserOpen(true); }} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
         {view === 'Agents' && <AgentsView agents={visibleAgents} allAgents={agents} busy={busy} onManage={manageAgent} onRefresh={() => void refresh(true)} />}
         {view === 'Analytics' && <AnalyticsView sites={[...sites, ...stagingSites]} onOpen={setSelectedId} />}
         {view === 'Activity' && <ActivityView entries={activity} />}
@@ -482,6 +508,7 @@ export default function Home() {
     {launchMode === 'lovable' && <LovableLaunchModal clients={clients} busy={busy === 'create'} onBack={() => setLaunchMode('choose')} onClose={() => setLaunchMode(null)} onOpenSettings={() => { setLaunchMode(null); navigate('Settings'); }} onSubmit={createSite} />}
     {clientOpen && <ClientModal client={editingClient} busy={busy === 'client:save'} onClose={() => { setClientOpen(false); setEditingClient(null); }} onSubmit={createClient} />}
     {blueprintOpen && <BlueprintModal busy={busy === 'blueprint:create'} onClose={() => setBlueprintOpen(false)} onSubmit={createBlueprint} />}
+    {pluginBrowserOpen && <WordPressPluginRepositoryModal blueprints={blueprints} initialBlueprintId={pluginBrowserBlueprintId} busy={busy} onClose={() => { setPluginBrowserOpen(false); setPluginBrowserBlueprintId(null); }} onDownload={downloadWordPressPlugin} />}
     {stagingOpen && <CreateStagingModal productionSites={sites.filter((site) => site.kind === 'wordpress' && !stagingSites.some((staging) => staging.productionSiteId === site.id))} busy={busy === 'staging:create'} onClose={() => setStagingOpen(false)} onSubmit={createStaging} />}
     {toast && <div className="toast" role="status"><span><Check aria-hidden="true" /></span>{toast}<button onClick={() => setToast(null)} aria-label="Dismiss notification"><X aria-hidden="true" /></button></div>}
   </main>;
@@ -527,13 +554,13 @@ function ClientsView({ clients, sites, busy, onAdd, onEdit, onDelete, onOpenSite
     <section className="client-list-panel">{clients.map((client) => { const clientSites = sites.filter((site) => site.clientId === client.id); return <article className="client-record" key={client.id}><div className="client-record-head"><span className="client-avatar">{initials(client.name)}</span><div><h2>{client.name}</h2>{client.company && <p>{client.company}</p>}</div><div className="client-record-actions"><button onClick={() => onEdit(client)}>Edit</button><button className="quiet-danger" disabled={busy === `client:${client.id}:delete`} onClick={() => onDelete(client)}>Remove</button></div></div><div className="client-contact">{client.email && <a href={`mailto:${client.email}`}>{client.email}</a>}{client.phone && <span>{client.phone}</span>}{!client.email && !client.phone && <span>No contact details saved</span>}</div>{client.notes && <p className="client-notes">{client.notes}</p>}<div className="client-sites"><strong>{client.siteCount} site{client.siteCount === 1 ? '' : 's'}</strong>{clientSites.map((site) => <button key={site.id} onClick={() => onOpenSite(site.id)}><span>{site.name} · {site.kind === 'lovable' ? 'Lovable' : 'WordPress'}</span><Status site={site} /><em><ChevronRight aria-hidden="true" /></em></button>)}{!clientSites.length && <small>Assign a site from its Overview tab.</small>}</div></article>; })}{!clients.length && <Empty title="No clients yet" copy="Add a client, then assign existing WordPress or Lovable sites to it." />}</section></>;
 }
 
-function BlueprintsView({ blueprints, busy, onAdd, onDelete, onLaunch }: { blueprints: Blueprint[]; busy: string | null; onAdd: () => void; onDelete: (blueprint: Blueprint) => void; onLaunch: (blueprintId: string) => void }) {
+function BlueprintsView({ blueprints, busy, onAdd, onBrowse, onDelete, onLaunch }: { blueprints: Blueprint[]; busy: string | null; onAdd: () => void; onBrowse: (blueprintId: string | null) => void; onDelete: (blueprint: Blueprint) => void; onLaunch: (blueprintId: string) => void }) {
   const pluginCount = blueprints.reduce((sum, blueprint) => sum + blueprint.plugins.length + blueprint.files.filter((file) => file.kind === 'plugin' || file.kind === 'mu-plugin').length, 0);
   const configurationCount = blueprints.reduce((sum, blueprint) => sum + blueprint.files.filter((file) => !['plugin', 'mu-plugin'].includes(file.kind)).length, 0);
   const usageCount = blueprints.reduce((sum, blueprint) => sum + blueprint.usageCount, 0);
-  return <><PageHeading eyebrow="WORDPRESS STARTERS" title="Blueprints" description="Reusable plugin, theme, content and configuration packages for nearly finished WordPress launches." actions={<button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add blueprint</button>} />
+  return <><PageHeading eyebrow="WORDPRESS STARTERS" title="Blueprints" description="Reusable plugin, theme, content and configuration packages for nearly finished WordPress launches." actions={<><button className="secondary-button" disabled={!blueprints.length} title={blueprints.length ? 'Search WordPress.org' : 'Add a blueprint first'} onClick={() => onBrowse(null)}><Download aria-hidden="true" />Get WordPress plugins</button><button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add blueprint</button></>} />
     <div className="metric-grid compact-metrics"><MetricCard icon={Boxes} tone="green" label="Blueprints" value={String(blueprints.length)} detail="Stored only on this local control plane" /><MetricCard icon={Package} tone="violet" label="Plugin packages" value={String(pluginCount)} detail="WordPress.org, ZIP and must-use plugins" /><MetricCard icon={Database} tone="blue" label="Setup files" value={String(configurationCount)} detail="Settings, content, themes and wp-content files" /><MetricCard icon={CirclePlay} tone="amber" label="Sites launched" value={String(usageCount)} detail="Managed sites tied to a blueprint" /></div>
-    <section className="blueprint-grid">{blueprints.map((blueprint, index) => <article className="blueprint-card" key={blueprint.id}><div className={`blueprint-cover ${index % 3 === 1 ? 'violet' : index % 3 === 2 ? 'blue' : ''}`}><span><Boxes aria-hidden="true" /></span><small>WORDPRESS BLUEPRINT</small></div><div className="blueprint-body"><div className="blueprint-title"><h2>{blueprint.name}</h2><button className="blueprint-remove" disabled={busy === `blueprint:${blueprint.id}:delete` || blueprint.usageCount > 0} onClick={() => onDelete(blueprint)}>{blueprint.usageCount > 0 ? 'In use' : 'Remove'}</button></div><p>{blueprint.description || 'Reusable WordPress setup package.'}</p><div className="blueprint-meta"><span>{blueprint.plugins.length} plugin slug{blueprint.plugins.length === 1 ? '' : 's'}</span><span>{blueprint.themes.length} theme{blueprint.themes.length === 1 ? '' : 's'}</span><span>{blueprint.fileCount} file{blueprint.fileCount === 1 ? '' : 's'}</span><span>{formatBytes(blueprint.totalBytes)}</span></div><div className="blueprint-files">{blueprint.plugins.slice(0, 2).map((plugin) => <span key={`plugin:${plugin.slug}`}><Package aria-hidden="true" /><strong>{plugin.slug}</strong><small>WordPress.org plugin</small></span>)}{blueprint.themes.slice(0, 1).map((theme) => <span key={`theme:${theme.slug}`}><Boxes aria-hidden="true" /><strong>{theme.slug}</strong><small>WordPress.org theme</small></span>)}{blueprint.files.slice(0, Math.max(0, 4 - Math.min(3, blueprint.plugins.length + blueprint.themes.length))).map((file) => <span key={file.id}><ArchiveRestore aria-hidden="true" /><strong>{file.name}</strong><small>{blueprintFileKindLabel(file.kind)}</small></span>)}{blueprintItemCount(blueprint) > 4 && <em>+{blueprintItemCount(blueprint) - 4} more item{blueprintItemCount(blueprint) - 4 === 1 ? '' : 's'}</em>}</div><button className="secondary-button full-button" onClick={() => onLaunch(blueprint.id)}><CirclePlay aria-hidden="true" />Launch with blueprint</button></div></article>)}{!blueprints.length && <div className="blueprint-empty"><Empty title="No WordPress blueprints yet" copy="Add plugins, themes, settings JSON, content exports, must-use plugins or any file destined for wp-content." /><button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add your first blueprint</button></div>}</section></>;
+    <section className="blueprint-grid">{blueprints.map((blueprint, index) => <article className="blueprint-card" key={blueprint.id}><div className={`blueprint-cover ${index % 3 === 1 ? 'violet' : index % 3 === 2 ? 'blue' : ''}`}><span><Boxes aria-hidden="true" /></span><small>WORDPRESS BLUEPRINT</small></div><div className="blueprint-body"><div className="blueprint-title"><h2>{blueprint.name}</h2><button className="blueprint-remove" disabled={busy === `blueprint:${blueprint.id}:delete` || blueprint.usageCount > 0} onClick={() => onDelete(blueprint)}>{blueprint.usageCount > 0 ? 'In use' : 'Remove'}</button></div><p>{blueprint.description || 'Reusable WordPress setup package.'}</p><div className="blueprint-meta"><span>{blueprint.plugins.length} plugin slug{blueprint.plugins.length === 1 ? '' : 's'}</span><span>{blueprint.themes.length} theme{blueprint.themes.length === 1 ? '' : 's'}</span><span>{blueprint.fileCount} file{blueprint.fileCount === 1 ? '' : 's'}</span><span>{formatBytes(blueprint.totalBytes)}</span></div><div className="blueprint-files">{blueprint.plugins.slice(0, 2).map((plugin) => <span key={`plugin:${plugin.slug}`}><Package aria-hidden="true" /><strong>{plugin.slug}</strong><small>Install from WordPress.org at launch</small></span>)}{blueprint.themes.slice(0, 1).map((theme) => <span key={`theme:${theme.slug}`}><Boxes aria-hidden="true" /><strong>{theme.slug}</strong><small>WordPress.org theme</small></span>)}{blueprint.files.slice(0, Math.max(0, 4 - Math.min(3, blueprint.plugins.length + blueprint.themes.length))).map((file) => <span key={file.id}><ArchiveRestore aria-hidden="true" /><strong>{file.source?.name || file.name}</strong><small>{file.source ? `WordPress.org ZIP · v${file.source.version}` : blueprintFileKindLabel(file.kind)}</small></span>)}{blueprintItemCount(blueprint) > 4 && <em>+{blueprintItemCount(blueprint) - 4} more item{blueprintItemCount(blueprint) - 4 === 1 ? '' : 's'}</em>}</div><div className="blueprint-actions"><button className="secondary-button" onClick={() => onBrowse(blueprint.id)}><Download aria-hidden="true" />Add plugins</button><button className="secondary-button" onClick={() => onLaunch(blueprint.id)}><CirclePlay aria-hidden="true" />Launch with blueprint</button></div></div></article>)}{!blueprints.length && <div className="blueprint-empty"><Empty title="No WordPress blueprints yet" copy="Create your first blueprint, then search WordPress.org and store official plugin ZIPs directly inside it." /><button className="primary-button" onClick={onAdd}><Plus aria-hidden="true" />Add your first blueprint</button></div>}</section></>;
 }
 
 function SiteWorkspace({ site, clients, backupHistoryRevision, busy, onBack, onOperate, onRestoreBackup, onSaveMetadata, onSaveBackupSchedule, onLogin }: { site: Site; clients: Client[]; backupHistoryRevision: string; busy: string | null; onBack: () => void; onOperate: (site: Site, type: string, options?: Record<string, unknown>) => Promise<boolean>; onRestoreBackup: (sourceSiteId: string, backupId: string, targetSiteId: string, restoreScope: 'all' | 'files' | 'database') => Promise<boolean>; onSaveMetadata: (site: Site, clientId: string | null, tags: string[]) => Promise<boolean>; onSaveBackupSchedule: (site: Site, mode: BackupMode, intervalHours: number) => Promise<boolean>; onLogin: (site: Site) => Promise<void> }) {
@@ -1061,6 +1088,61 @@ function LovableLaunchModal({ clients, busy, onBack, onClose, onOpenSettings, on
   </div>;
 }
 
+function WordPressPluginRepositoryModal({ blueprints, initialBlueprintId, busy, onClose, onDownload }: { blueprints: Blueprint[]; initialBlueprintId: string | null; busy: string | null; onClose: () => void; onDownload: (blueprintId: string, slug: string) => Promise<boolean> }) {
+  const [blueprintId, setBlueprintId] = useState(initialBlueprintId || blueprints[0]?.id || '');
+  const [query, setQuery] = useState('');
+  const [repository, setRepository] = useState<WordPressPluginSearch | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const target = blueprints.find((blueprint) => blueprint.id === blueprintId) || null;
+  const locked = Boolean(busy?.startsWith(`blueprint:${blueprintId}:plugin:`));
+
+  async function search(page = 1) {
+    const term = query.trim();
+    if (term.length < 2) { setError('Enter at least 2 characters to search WordPress.org.'); return; }
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams({ query: term, page: String(page), perPage: '12' });
+      const response = await apiFetch(`/api/wordpress/plugins?${params.toString()}`, { cache: 'no-store' });
+      const result = await response.json() as { repository?: WordPressPluginSearch; error?: string };
+      if (!response.ok || !result.repository) throw new Error(result.error || 'WordPress.org plugins could not be loaded.');
+      setRepository(result.repository);
+    } catch (failure) { setError(messageFrom(failure, 'WordPress.org plugins could not be loaded.')); }
+    finally { setLoading(false); }
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await search(1);
+  }
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target && !locked) onClose(); }}>
+    <section className="modal plugin-repository-modal" role="dialog" aria-modal="true" aria-labelledby="plugin-repository-title">
+      <div className="modal-head"><div><p className="eyebrow">OFFICIAL WORDPRESS.ORG REPOSITORY</p><h2 id="plugin-repository-title">Download plugins</h2><p>Find a public plugin and store its current official ZIP directly in a blueprint.</p></div><button onClick={onClose} disabled={locked} aria-label="Close"><X aria-hidden="true" /></button></div>
+      <div className="plugin-repository-controls">
+        <label>Save plugins to<select value={blueprintId} onChange={(event) => setBlueprintId(event.target.value)} disabled={locked}>{blueprints.map((blueprint) => <option key={blueprint.id} value={blueprint.id}>{blueprint.name}</option>)}</select><small>The stored ZIP is installed and activated whenever this blueprint launches.</small></label>
+        <form className="plugin-search-form" onSubmit={submit}><label>Search WordPress.org<input value={query} onChange={(event) => setQuery(event.target.value)} minLength={2} maxLength={100} placeholder="SEO, forms, security…" autoFocus /></label><button className="primary-button" disabled={loading || locked || query.trim().length < 2}><Search aria-hidden="true" />{loading ? 'Searching…' : 'Search plugins'}</button></form>
+      </div>
+      {error && <p className="plugin-repository-error" role="alert"><CircleAlert aria-hidden="true" />{error}</p>}
+      {!repository && !error && <div className="plugin-repository-intro"><span><Download aria-hidden="true" /></span><strong>Search the live WordPress.org catalog</strong><p>Results include the current version, compatibility, rating and active install count. No sample plugins are shown.</p></div>}
+      {repository && <>
+        <div className="plugin-search-summary" aria-live="polite"><span><strong>{repository.total.toLocaleString()}</strong> result{repository.total === 1 ? '' : 's'} for “{repository.query}”</span><small>Page {repository.page} of {Math.max(1, repository.pages)}</small></div>
+        <div className="plugin-repository-results">{repository.plugins.map((plugin) => {
+          const stored = target?.files.find((file) => file.source?.provider === 'wordpress.org' && file.source.slug === plugin.slug)?.source || null;
+          const downloading = busy === `blueprint:${blueprintId}:plugin:${plugin.slug}`;
+          return <article className="plugin-repository-row" key={plugin.slug}>
+            <span className="plugin-repository-icon"><Package aria-hidden="true" /></span>
+            <div className="plugin-repository-copy"><div><h3>{plugin.name}</h3><span>{plugin.slug} · v{plugin.version}</span></div><p>{plugin.shortDescription || 'No description supplied by the plugin author.'}</p><div className="plugin-repository-meta"><span>{formatPluginRating(plugin.rating)} from {plugin.ratingCount.toLocaleString()} ratings</span><span>{formatCompactNumber(plugin.activeInstalls)} active installs</span><span>{plugin.testedWordPress ? `Tested with WP ${plugin.testedWordPress}` : plugin.requiresWordPress ? `Requires WP ${plugin.requiresWordPress}` : 'Compatibility not listed'}</span></div></div>
+            <div className="plugin-repository-actions"><a href={plugin.pluginUrl} target="_blank" rel="noreferrer">View plugin<ExternalLink aria-hidden="true" /></a><button className="secondary-button" disabled={!target || downloading || locked} onClick={() => void onDownload(blueprintId, plugin.slug)}><Download aria-hidden="true" />{downloading ? 'Downloading…' : stored ? (stored.version === plugin.version ? 'Refresh stored ZIP' : `Update to ${plugin.version}`) : 'Download ZIP'}</button>{stored && <small>Stored v{stored.version}</small>}</div>
+          </article>;
+        })}{!repository.plugins.length && <Empty title="No plugins found" copy="Try a broader plugin name or feature." />}</div>
+        {repository.pages > 1 && <div className="plugin-repository-pagination"><button className="secondary-button" disabled={loading || locked || repository.page <= 1} onClick={() => void search(repository.page - 1)}><ArrowLeft aria-hidden="true" />Previous</button><span>Page {repository.page} of {repository.pages}</span><button className="secondary-button" disabled={loading || locked || repository.page >= repository.pages} onClick={() => void search(repository.page + 1)}>Next<ArrowRight aria-hidden="true" /></button></div>}
+      </>}
+      <div className="plugin-repository-footnote"><ShieldCheck aria-hidden="true" /><p>Downloads are accepted only from <strong>downloads.wordpress.org</strong>, verified as ZIP archives and kept within blueprint file limits.</p></div>
+    </section>
+  </div>;
+}
+
 function BlueprintModal({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (input: BlueprintInput) => Promise<void> }) {
   const [uploads, setUploads] = useState<BlueprintUpload[]>([]);
   const [preparing, setPreparing] = useState(false);
@@ -1135,6 +1217,8 @@ function fileToBase64(file: File) { return new Promise<string>((resolve, reject)
 function downloadBlueprintSettingsExample() { const example = { options: { blogdescription: 'A concise site tagline', timezone_string: 'America/Los_Angeles', default_comment_status: 'closed' }, plugins: [{ slug: 'wordpress-seo', activate: true }], themes: [{ slug: 'astra', activate: true }], pages: [{ title: 'Home', slug: 'home', status: 'publish', content: '<h1>Welcome</h1>' }] }; const url = URL.createObjectURL(new Blob([`${JSON.stringify(example, null, 2)}\n`], { type: 'application/json' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'geekheros-blueprint-settings.json'; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 0); }
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
+function formatCompactNumber(value: number) { return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value); }
+function formatPluginRating(value: number) { return `${(value / 20).toFixed(1)} / 5`; }
 function analyticsRangeLabel(days: AnalyticsRangeDays) { return days === 1 ? 'Last 24 hours' : `Last ${days} days`; }
 function formatAnalyticsPercent(value: number | null) { if (value === null) return '—'; return `${value.toFixed(Number.isInteger(value) ? 0 : 2)}%`; }
 function analyticsAxisLabel(value: string, days: AnalyticsRangeDays) { const date = new Date(value); return days === 1 ? date.toLocaleTimeString([], { hour: 'numeric' }) : date.toLocaleDateString([], { month: 'short', day: 'numeric' }); }

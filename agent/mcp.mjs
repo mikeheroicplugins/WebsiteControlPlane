@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 40;
+export const controlPlaneMcpToolCount = 42;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -316,6 +316,17 @@ function createControlPlaneMcpServer(api) {
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, () => api.listBlueprints());
 
+  register(server, 'search_wordpress_plugins', {
+    title: 'Search WordPress.org plugins',
+    description: 'Search the official WordPress.org plugin repository before choosing a plugin to store in a blueprint.',
+    inputSchema: z.object({
+      query: z.string().min(2).max(100),
+      page: z.number().int().min(1).max(50).default(1),
+      perPage: z.number().int().min(1).max(24).default(12),
+    }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  }, (input) => api.searchWordPressPlugins(input));
+
   register(server, 'create_blueprint', {
     title: 'Create blueprint',
     description: 'Create a WordPress blueprint from catalog packages and base64-encoded plugin, theme, settings, content, MU-plugin or wp-content files.',
@@ -333,6 +344,16 @@ function createControlPlaneMcpServer(api) {
     }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, (input) => api.createBlueprint(input));
+
+  register(server, 'download_wordpress_plugin_to_blueprint', {
+    title: 'Download WordPress.org plugin to blueprint',
+    description: 'Download the current official plugin ZIP from WordPress.org and store it in an existing blueprint. Repeating the call updates the stored ZIP.',
+    inputSchema: z.object({
+      blueprintId: blueprintIdSchema,
+      slug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,190}$/).describe('WordPress.org plugin slug returned by search_wordpress_plugins.'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, ({ blueprintId, slug }) => api.downloadWordPressPluginToBlueprint(blueprintId, slug));
 
   register(server, 'delete_blueprint', {
     title: 'Delete blueprint',

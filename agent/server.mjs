@@ -43,6 +43,8 @@ const uptimeCheckIntervalMs = 10 * 60 * 1000;
 const backupScheduleCheckIntervalMs = 60 * 1000;
 const monitoringRetentionChecks = 90 * 24 * 6;
 const activityRetentionEntries = 5_000;
+const wordpressPluginApiUrl = 'https://api.wordpress.org/plugins/info/1.2/';
+const wordpressPluginDownloadHosts = new Set(['downloads.wordpress.org']);
 const allowedBackupIntervals = new Set([6, 12, 24, 72, 168, 720]);
 const screenshotCaptures = new Map();
 const scheduledBackupRuns = new Set();
@@ -946,6 +948,10 @@ function publicBlueprint(blueprint, sites = []) {
   const files = Array.isArray(blueprint.files) ? blueprint.files.map((file) => ({
     id: file.id, name: file.name, kind: file.kind, destination: file.destination || '',
     size: Number(file.size || 0), sha256: file.sha256,
+    source: file.source?.provider === 'wordpress.org' ? {
+      provider: 'wordpress.org', slug: file.source.slug, name: file.source.name,
+      version: file.source.version, pluginUrl: file.source.pluginUrl, downloadedAt: file.source.downloadedAt,
+    } : null,
   })) : [];
   return {
     id: blueprint.id,
@@ -967,6 +973,169 @@ async function listBlueprints() {
   const sites = Object.values(state.sites);
   return Object.values(state.blueprints).map((blueprint) => publicBlueprint(blueprint, sites))
     .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+}
+
+function cleanWordPressPluginText(value, maximum = 500) {
+  const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  return String(value || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&#(x[0-9a-f]+|\d+);/gi, (match, code) => {
+      const point = String(code).toLowerCase().startsWith('x') ? Number.parseInt(String(code).slice(1), 16) : Number.parseInt(code, 10);
+      try { return Number.isFinite(point) && point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : match; } catch { return match; }
+    })
+    .replace(/&([a-z]+);/gi, (match, entity) => named[String(entity).toLowerCase()] ?? match)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maximum);
+}
+
+function validateWordPressPluginSlug(value) {
+  const slug = String(value || '').trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,190}$/.test(slug)) throw Object.assign(new Error('Enter a valid WordPress.org plugin slug.'), { status: 400 });
+  return slug;
+}
+
+async function requestWordPressPluginApi(action, request) {
+  const url = new URL(wordpressPluginApiUrl);
+  url.searchParams.set('action', action);
+  for (const [key, value] of Object.entries(request)) url.searchParams.set(`request[${key}]`, String(value));
+  for (const [field, enabled] of Object.entries({ short_description: 1, description: 0, sections: 0, tested: 1, requires: 1, requires_php: 1, rating: 1, ratings: 0, downloaded: 0, downloadlink: 1, last_updated: 1, added: 0, tags: 0, compatibility: 0, homepage: 0, versions: 0, donate_link: 0, reviews: 0, banners: 0, icons: 0, active_installs: 1, contributors: 0 })) {
+    url.searchParams.set(`request[fields][${field}]`, String(enabled));
+  }
+  let response;
+  try {
+    response = await fetch(url, { headers: { accept: 'application/json', 'user-agent': 'GeekHeros-Control-Plane/0.1' }, signal: AbortSignal.timeout(20_000) });
+  } catch (error) {
+    throw Object.assign(new Error(`WordPress.org could not be reached: ${error.message}`), { status: 502 });
+  }
+  if (!response.ok) throw Object.assign(new Error(`WordPress.org returned HTTP ${response.status}.`), { status: 502 });
+  let payload;
+  try { payload = await response.json(); } catch { throw Object.assign(new Error('WordPress.org returned an invalid plugin response.'), { status: 502 }); }
+  if (payload?.error) throw Object.assign(new Error(cleanWordPressPluginText(payload.error, 500) || 'WordPress.org rejected the plugin request.'), { status: 502 });
+  return payload;
+}
+
+function publicWordPressPlugin(plugin) {
+  const slug = validateWordPressPluginSlug(plugin?.slug);
+  return {
+    name: cleanWordPressPluginText(plugin?.name, 200) || slug,
+    slug,
+    version: cleanWordPressPluginText(plugin?.version, 60),
+    author: cleanWordPressPluginText(plugin?.author, 200),
+    shortDescription: cleanWordPressPluginText(plugin?.short_description, 600),
+    rating: Math.min(100, Math.max(0, Number(plugin?.rating) || 0)),
+    ratingCount: Math.max(0, Number(plugin?.num_ratings) || 0),
+    activeInstalls: Math.max(0, Number(plugin?.active_installs) || 0),
+    requiresWordPress: cleanWordPressPluginText(plugin?.requires, 40),
+    testedWordPress: cleanWordPressPluginText(plugin?.tested, 40),
+    requiresPhp: cleanWordPressPluginText(plugin?.requires_php, 40),
+    lastUpdated: cleanWordPressPluginText(plugin?.last_updated, 80),
+    pluginUrl: `https://wordpress.org/plugins/${slug}/`,
+  };
+}
+
+async function searchWordPressPlugins(input = {}) {
+  const query = String(input.query || '').trim();
+  const page = Math.min(50, Math.max(1, Number(input.page) || 1));
+  const perPage = Math.min(24, Math.max(1, Number(input.perPage) || 12));
+  if (query.length < 2 || query.length > 100) throw Object.assign(new Error('Search WordPress.org using 2 to 100 characters.'), { status: 400 });
+  const payload = await requestWordPressPluginApi('query_plugins', { search: query, page, per_page: perPage, locale: 'en_US', is_ssl: 1 });
+  const plugins = (Array.isArray(payload?.plugins) ? payload.plugins : []).map(publicWordPressPlugin);
+  return {
+    query,
+    page: Number(payload?.info?.page) || page,
+    pages: Math.max(0, Number(payload?.info?.pages) || 0),
+    total: Math.max(0, Number(payload?.info?.results) || plugins.length),
+    plugins,
+    searchedAt: new Date().toISOString(),
+  };
+}
+
+function wordpressPluginDownloadUrl(value) {
+  let url;
+  try { url = new URL(String(value || '')); } catch { throw Object.assign(new Error('WordPress.org did not provide a valid plugin download.'), { status: 502 }); }
+  if (url.protocol !== 'https:' || !wordpressPluginDownloadHosts.has(url.hostname) || !/^\/plugin\/[A-Za-z0-9._-]+\.zip$/.test(url.pathname)) {
+    throw Object.assign(new Error('WordPress.org returned an untrusted plugin download location.'), { status: 502 });
+  }
+  return url;
+}
+
+async function downloadWordPressPluginArchive(downloadUrl) {
+  let response;
+  try {
+    response = await fetch(downloadUrl, { redirect: 'follow', headers: { accept: 'application/zip, application/octet-stream', 'user-agent': 'GeekHeros-Control-Plane/0.1' }, signal: AbortSignal.timeout(90_000) });
+  } catch (error) {
+    throw Object.assign(new Error(`The plugin archive could not be downloaded: ${error.message}`), { status: 502 });
+  }
+  wordpressPluginDownloadUrl(response.url);
+  if (!response.ok || !response.body) throw Object.assign(new Error(`The plugin archive returned HTTP ${response.status}.`), { status: 502 });
+  const declaredBytes = Number(response.headers.get('content-length') || 0);
+  if (declaredBytes > blueprintMaxFileBytes) throw Object.assign(new Error('The WordPress.org plugin ZIP exceeds the 25 MB blueprint file limit.'), { status: 413 });
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of response.body) {
+    const contents = Buffer.from(chunk);
+    totalBytes += contents.length;
+    if (totalBytes > blueprintMaxFileBytes) {
+      await response.body.cancel().catch(() => undefined);
+      throw Object.assign(new Error('The WordPress.org plugin ZIP exceeds the 25 MB blueprint file limit.'), { status: 413 });
+    }
+    chunks.push(contents);
+  }
+  const archive = Buffer.concat(chunks, totalBytes);
+  if (!archive.length || !['504b0304', '504b0506', '504b0708'].includes(archive.subarray(0, 4).toString('hex'))) {
+    throw Object.assign(new Error('WordPress.org did not return a valid plugin ZIP archive.'), { status: 502 });
+  }
+  return archive;
+}
+
+async function downloadWordPressPluginToBlueprint(blueprintId, pluginSlug) {
+  const slug = validateWordPressPluginSlug(pluginSlug);
+  const before = await readState();
+  if (!before.blueprints[blueprintId]) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+  const info = await requestWordPressPluginApi('plugin_information', { slug, locale: 'en_US', is_ssl: 1 });
+  const plugin = publicWordPressPlugin(info);
+  if (plugin.slug !== slug) throw Object.assign(new Error('WordPress.org returned a different plugin than requested.'), { status: 502 });
+  const downloadUrl = wordpressPluginDownloadUrl(info?.download_link);
+  const contents = await downloadWordPressPluginArchive(downloadUrl);
+  const downloadedAt = new Date().toISOString();
+  const fileId = randomBytes(8).toString('hex');
+  const storageName = `${fileId}.zip`;
+  const fileName = cleanBlueprintFileName(path.basename(downloadUrl.pathname));
+  const directory = path.join(blueprintRoot, blueprintId);
+  const storagePath = path.join(directory, storageName);
+  await mkdir(directory, { recursive: true });
+  await writeFile(storagePath, contents);
+  let result;
+  try {
+    result = await updateState((state) => {
+      const blueprint = state.blueprints[blueprintId];
+      if (!blueprint) throw Object.assign(new Error('Blueprint not found.'), { status: 404 });
+      blueprint.files ||= [];
+      const existingIndex = blueprint.files.findIndex((file) => file.source?.provider === 'wordpress.org' && file.source.slug === slug);
+      const existing = existingIndex >= 0 ? blueprint.files[existingIndex] : null;
+      if (existingIndex < 0 && blueprint.files.length >= 25) throw Object.assign(new Error('A blueprint may contain up to 25 stored files.'), { status: 409 });
+      const nextTotal = blueprint.files.reduce((sum, file) => sum + Number(file.size || 0), 0) - Number(existing?.size || 0) + contents.length;
+      if (nextTotal > blueprintMaxTotalBytes) throw Object.assign(new Error('Blueprint files may total up to 75 MB.'), { status: 413 });
+      const source = { provider: 'wordpress.org', slug, name: plugin.name, version: plugin.version, pluginUrl: plugin.pluginUrl, downloadedAt };
+      const file = { id: fileId, name: fileName, kind: 'plugin', destination: '', size: contents.length, sha256: createHash('sha256').update(contents).digest('hex'), storageName, source };
+      if (existingIndex >= 0) blueprint.files[existingIndex] = file;
+      else blueprint.files.push(file);
+      blueprint.plugins = (Array.isArray(blueprint.plugins) ? blueprint.plugins : []).filter((entry) => entry.slug !== slug);
+      blueprint.updatedAt = downloadedAt;
+      return { blueprint, previousStorageName: existing?.storageName || null };
+    });
+  } catch (error) {
+    await rm(storagePath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  if (result.previousStorageName && path.basename(result.previousStorageName) === result.previousStorageName) {
+    await rm(path.join(directory, result.previousStorageName), { force: true }).catch(() => undefined);
+  }
+  const latest = await readState();
+  await recordActivity({ siteId: '', siteName: result.blueprint.name, type: 'blueprint.plugin-download', message: `${plugin.name} ${plugin.version} was downloaded from WordPress.org into ${result.blueprint.name}.` })
+    .catch((error) => console.error('Unable to record WordPress.org plugin download:', error.message));
+  return { blueprint: publicBlueprint(result.blueprint, Object.values(latest.sites)), plugin, replaced: Boolean(result.previousStorageName) };
 }
 
 async function createBlueprint(input) {
@@ -3500,6 +3669,8 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   updateClient,
   deleteClient,
   listBlueprints,
+  searchWordPressPlugins,
+  downloadWordPressPluginToBlueprint,
   createBlueprint,
   deleteBlueprint,
   listMcpAgents,
@@ -3574,6 +3745,11 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/staging') return send(response, 202, { staging: await createStagingSite(await readJson(request)) });
     if (request.method === 'GET' && url.pathname === '/blueprints') return send(response, 200, { blueprints: await listBlueprints() });
     if (request.method === 'POST' && url.pathname === '/blueprints') return send(response, 201, { blueprint: await createBlueprint(await readJson(request, 105_000_000)) });
+    if (request.method === 'GET' && url.pathname === '/wordpress/plugins') return send(response, 200, { repository: await searchWordPressPlugins({
+      query: url.searchParams.get('query'),
+      page: url.searchParams.get('page'),
+      perPage: url.searchParams.get('perPage'),
+    }) });
     if (request.method === 'GET' && url.pathname === '/agents') return send(response, 200, { agents: await listMcpAgents() });
     if (request.method === 'GET' && url.pathname === '/clients') return send(response, 200, { clients: await listClients() });
     if (request.method === 'POST' && url.pathname === '/clients') return send(response, 201, { client: await createClient(await readJson(request)) });
@@ -3592,6 +3768,11 @@ const server = createServer(async (request, response) => {
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
     const blueprintMatch = url.pathname.match(/^\/blueprints\/([^/]+)$/);
     if (blueprintMatch && request.method === 'DELETE') return send(response, 200, await deleteBlueprint(decodeURIComponent(blueprintMatch[1])));
+    const blueprintPluginMatch = url.pathname.match(/^\/blueprints\/([^/]+)\/plugins$/);
+    if (blueprintPluginMatch && request.method === 'POST') {
+      const body = await readJson(request);
+      return send(response, 200, await downloadWordPressPluginToBlueprint(decodeURIComponent(blueprintPluginMatch[1]), body.slug));
+    }
     const agentActionMatch = url.pathname.match(/^\/agents\/([^/]+)\/actions$/);
     if (agentActionMatch && request.method === 'POST') {
       const body = await readJson(request);

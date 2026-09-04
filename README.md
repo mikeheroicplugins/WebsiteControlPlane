@@ -27,7 +27,7 @@ Open `http://localhost:3000`.
 
 ## WordPress blueprints
 
-Blueprints are stored under the ignored local `.geekheros/` directory. A blueprint can include WordPress.org plugin or theme slugs, uploaded plugin/theme ZIPs, a WordPress export XML file, must-use plugin PHP, and arbitrary files placed under `wp-content/`.
+Blueprints are stored under the ignored local `.geekheros/` directory. A blueprint can include WordPress.org plugin or theme slugs, uploaded plugin/theme ZIPs, a WordPress export XML file, must-use plugin PHP, and arbitrary files placed under `wp-content/`. The Blueprints page can also search the live WordPress.org plugin repository and download the current official plugin ZIP directly into a selected blueprint. Repository downloads are restricted to `downloads.wordpress.org`, validated as ZIP archives, hashed, and stored with source/version metadata so the same plugin can be refreshed later.
 
 Settings JSON supports four top-level fields: `options`, `plugins`, `themes`, and `pages`. Download the example from the Add blueprint modal for a working schema. Uploaded files are size-limited, validated for their selected purpose, hashed for integrity, and copied only into the new WordPress volume. The launch modal defaults to `Default — Clean WordPress install`; selecting a blueprint applies it after WordPress core installation and before the site is marked ready.
 
@@ -50,7 +50,7 @@ For immediate local testing, use a hostname such as `client.localhost`. For a pu
 ## Working operations
 
 - Launch, start, stop, restart and permanently delete WordPress or Lovable sites.
-- Create reusable WordPress blueprints and apply one during a new launch.
+- Create reusable WordPress blueprints, search and download official WordPress.org plugin ZIPs into them, and apply one during a new launch.
 - Create client records, assign sites to clients and organize sites with persistent tags.
 - Read live Docker, WordPress, PHP, plugin and theme versions.
 - Back up the MariaDB database and WordPress volume on demand, or schedule automatic backups every 6 or 12 hours, daily, every 3 days, weekly, or monthly for production and staging sites.
@@ -76,7 +76,7 @@ Local state, Lovable source checkouts and backups live under `.geekheros/` and a
 
 Managed site details include a real browser-rendered frontend capture that refreshes every 60 minutes, 10-minute uptime checks, manual and scheduled WordPress backups, safety-backed restore operations, container logs, an audited terminal and WP-CLI console, database queries, a scoped `wp-content` code editor, and runtime inspection. Microsoft Edge or Google Chrome is required on the agent machine for frontend captures.
 
-Every dashboard capability is also part of the authenticated MCP server. WordPress staging is available through dedicated list, create and lifecycle tools, including scoped file/database sync and promotion. Backup schedules are readable and configurable through MCP, while `run_site_operation` can create an immediate production or staging backup. `get_backup_history` returns the combined recovery timeline and valid restore destinations; `restore_site_backup` restores a selected recovery point to its owning site or its linked production/staging counterpart. The Agents page records authenticated MCP client metadata, network origin, recency, tool usage and response timing without storing authorization headers, tool arguments or prompts. The Analytics page and `get_analytics` MCP tool expose the same observed monitoring, latency, operation, backup and health aggregates, including time-range, site, environment and workload filters and granular measurements. Analytics never creates sample records or empty chart buckets; blanks mean that the requested data has not yet been observed. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
+Every dashboard capability is also part of the authenticated MCP server. `search_wordpress_plugins` searches the official repository and `download_wordpress_plugin_to_blueprint` stores or refreshes an official ZIP in a blueprint. WordPress staging is available through dedicated list, create and lifecycle tools, including scoped file/database sync and promotion. Backup schedules are readable and configurable through MCP, while `run_site_operation` can create an immediate production or staging backup. `get_backup_history` returns the combined recovery timeline and valid restore destinations; `restore_site_backup` restores a selected recovery point to its owning site or its linked production/staging counterpart. The Agents page records authenticated MCP client metadata, network origin, recency, tool usage and response timing without storing authorization headers, tool arguments or prompts. The Analytics page and `get_analytics` MCP tool expose the same observed monitoring, latency, operation, backup and health aggregates, including time-range, site, environment and workload filters and granular measurements. Analytics never creates sample records or empty chart buckets; blanks mean that the requested data has not yet been observed. Feature work is incomplete until the corresponding MCP tool or MCP-accessible operation is registered and its discovery path is tested.
 
 ## Hosted dashboard connection
 
