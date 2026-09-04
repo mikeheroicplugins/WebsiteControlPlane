@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 39;
+export const controlPlaneMcpToolCount = 40;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -41,6 +41,18 @@ function createControlPlaneMcpServer(api) {
     inputSchema: z.object({ limit: z.number().int().min(1).max(100).default(50), siteId: z.string().min(1).optional() }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, ({ limit, siteId }) => api.listActivity({ limit, siteId }));
+
+  register(server, 'get_analytics', {
+    title: 'Get control-plane analytics',
+    description: 'Read fleet-wide or site-specific uptime, latency, operations, backups, health distribution and granular monitoring measurements for a selected time range.',
+    inputSchema: z.object({
+      rangeDays: z.union([z.literal(1), z.literal(7), z.literal(30), z.literal(90)]).default(7),
+      siteId: siteIdSchema.optional(),
+      environment: z.enum(['all', 'production', 'staging']).default('all'),
+      kind: z.enum(['all', 'wordpress', 'lovable']).default('all'),
+    }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, (input) => api.getAnalytics(input));
 
   register(server, 'list_sites', {
     title: 'List sites',

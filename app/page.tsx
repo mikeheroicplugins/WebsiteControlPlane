@@ -4,13 +4,16 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity, ArchiveRestore, ArrowLeft, ArrowRight, Bot, Boxes, Camera, Check, ChevronDown, ChevronRight, CircleAlert,
-  CirclePlay, Clock3, Container, Copy, Database, Download, ExternalLink, FileCode2, FlaskConical, Gauge, GitCommit,
+  ChartNoAxesCombined, CirclePlay, Clock3, Container, Copy, Database, Download, ExternalLink, FileCode2, FlaskConical, Gauge, GitCommit,
   Globe2, House, Info, LogIn, Logs, Package, Play, Plus, Radio, RefreshCw, Rocket, RotateCcw, RotateCw, Search,
   ServerCog, Settings, ShieldCheck, ShieldOff, Sparkles, Square, Terminal, Trash2, Undo2, Upload, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import {
+  Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
+} from 'recharts';
 
-type View = 'Overview' | 'Sites' | 'Staging' | 'Clients' | 'Blueprints' | 'Agents' | 'Activity' | 'Settings';
+type View = 'Overview' | 'Sites' | 'Staging' | 'Clients' | 'Blueprints' | 'Agents' | 'Analytics' | 'Activity' | 'Settings';
 type Filter = 'All' | 'Running' | 'Attention';
 type SiteTab = 'Overview' | 'Updates' | 'Backups' | 'Tools';
 type SiteKind = 'wordpress' | 'lovable';
@@ -94,11 +97,45 @@ type McpAgent = {
   lastResponseStatus: number | null; lastLatencyMs: number | null; averageLatencyMs: number | null;
   restartRequestedAt: string | null; revokedAt: string | null;
 };
+type AnalyticsRangeDays = 1 | 7 | 30 | 90;
+type AnalyticsEnvironment = 'all' | 'production' | 'staging';
+type AnalyticsKind = 'all' | 'wordpress' | 'lovable';
+type AnalyticsSeriesPoint = {
+  bucketStart: string; bucketEnd: string; checkCount: number; uptimePercent: number | null;
+  averageLatencyMs: number | null; p95LatencyMs: number | null; failedChecks: number;
+  operations: number; failedOperations: number; backups: number;
+};
+type SiteAnalyticsMetric = {
+  id: string; name: string; domain: string; kind: SiteKind; environment: 'production' | 'staging'; status: string;
+  uptimePercent: number | null; averageLatencyMs: number | null; p95LatencyMs: number | null;
+  checkCount: number; failedChecks: number; operationCount: number; failedOperations: number;
+  backupCount: number; updates: number; lastCheckAt: string | null; lastBackupAt: string | null;
+};
+type AnalyticsCheck = MonitoringCheck & {
+  siteId: string; siteName: string; domain: string; environment: 'production' | 'staging'; kind: SiteKind;
+};
+type AnalyticsData = {
+  generatedAt: string;
+  range: { days: AnalyticsRangeDays; startAt: string; endAt: string; bucket: 'hour' | 'day' };
+  filters: { siteId: string | null; environment: AnalyticsEnvironment; kind: AnalyticsKind };
+  summary: {
+    siteCount: number; runningSites: number; attentionSites: number; availabilityPercent: number | null;
+    averageLatencyMs: number | null; p95LatencyMs: number | null; checkCount: number; failedChecks: number;
+    operationCount: number; failedOperations: number; operationSuccessPercent: number | null;
+    backupCount: number; availableUpdates: number;
+  };
+  series: AnalyticsSeriesPoint[];
+  statusBreakdown: Array<{ status: string; count: number }>;
+  siteMetrics: SiteAnalyticsMetric[];
+  recentChecks: AnalyticsCheck[];
+  operationTypes: Array<{ type: string; count: number; failures: number }>;
+};
 
 const nav: Array<{ view: View; icon: LucideIcon; subnav?: boolean }> = [
   { view: 'Overview', icon: House }, { view: 'Sites', icon: Container }, { view: 'Staging', icon: FlaskConical, subnav: true }, { view: 'Clients', icon: Users },
   { view: 'Blueprints', icon: Boxes },
   { view: 'Agents', icon: Bot },
+  { view: 'Analytics', icon: ChartNoAxesCombined },
   { view: 'Activity', icon: Activity }, { view: 'Settings', icon: Settings },
 ];
 
@@ -431,6 +468,7 @@ export default function Home() {
         {view === 'Clients' && <ClientsView clients={visibleClients} sites={sites} busy={busy} onAdd={() => { setEditingClient(null); setClientOpen(true); }} onEdit={(client) => { setEditingClient(client); setClientOpen(true); }} onDelete={deleteClient} onOpenSite={setSelectedId} />}
         {view === 'Blueprints' && <BlueprintsView blueprints={visibleBlueprints} busy={busy} onAdd={() => setBlueprintOpen(true)} onDelete={deleteBlueprint} onLaunch={(blueprintId) => { setPreferredBlueprintId(blueprintId); setLaunchMode('wordpress'); }} />}
         {view === 'Agents' && <AgentsView agents={visibleAgents} allAgents={agents} busy={busy} onManage={manageAgent} onRefresh={() => void refresh(true)} />}
+        {view === 'Analytics' && <AnalyticsView sites={[...sites, ...stagingSites]} onOpen={setSelectedId} />}
         {view === 'Activity' && <ActivityView entries={activity} />}
         {view === 'Settings' && <SettingsView system={system} onToast={setToast} />}
       </div>}
@@ -756,6 +794,74 @@ function AgentsView({ agents, allAgents, busy, onManage, onRefresh }: { agents: 
     })}{!agents.length && <Empty title="No MCP agents observed" copy="Agents appear here after they authenticate and make their first MCP request." />}</section></>;
 }
 
+const analyticsStatusColors: Record<string, string> = {
+  Running: '#35b878', Stopped: '#93a099', Provisioning: '#e0a34a', Error: '#d96b5c', Attention: '#d96b5c', Unknown: '#77847d',
+};
+
+function AnalyticsView({ sites, onOpen }: { sites: Site[]; onOpen: (id: string) => void }) {
+  const [rangeDays, setRangeDays] = useState<AnalyticsRangeDays>(7);
+  const [siteId, setSiteId] = useState('');
+  const [environment, setEnvironment] = useState<AnalyticsEnvironment>('all');
+  const [kind, setKind] = useState<AnalyticsKind>('all');
+  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
+
+  const loadAnalytics = useCallback(async () => {
+    setAnalyticsLoading(true);
+    try {
+      const query = new URLSearchParams({ rangeDays: String(rangeDays), environment, kind });
+      if (siteId) query.set('siteId', siteId);
+      const response = await apiFetch(`/api/analytics?${query.toString()}`, { cache: 'no-store' });
+      const result = await response.json() as { analytics?: AnalyticsData; error?: string };
+      if (!response.ok || !result.analytics) throw new Error(result.error || 'Analytics could not be loaded.');
+      setAnalytics(result.analytics); setAnalyticsError(null);
+    } catch (failure) { setAnalyticsError(messageFrom(failure, 'Analytics could not be loaded.')); }
+    finally { setAnalyticsLoading(false); }
+  }, [environment, kind, rangeDays, siteId]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => void loadAnalytics());
+    return () => window.cancelAnimationFrame(frame);
+  }, [loadAnalytics, revision]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => void loadAnalytics(), 60_000);
+    return () => window.clearInterval(interval);
+  }, [loadAnalytics]);
+
+  const rangeLabel = analyticsRangeLabel(rangeDays);
+  const chartHasChecks = Boolean(analytics?.summary.checkCount);
+  const chartHasOperations = Boolean(analytics?.series.some((point) => point.operations || point.backups));
+  const sortedSites = useMemo(() => [...sites].sort((a, b) => a.name.localeCompare(b.name)), [sites]);
+  const recentChecks = analytics?.recentChecks.slice(0, 40) || [];
+
+  function chooseSite(value: string) {
+    setSiteId(value);
+    if (value) { setEnvironment('all'); setKind('all'); }
+  }
+  function chooseEnvironment(value: AnalyticsEnvironment) { setEnvironment(value); setSiteId(''); }
+  function chooseKind(value: AnalyticsKind) { setKind(value); setSiteId(''); }
+
+  return <><PageHeading eyebrow="FLEET INTELLIGENCE" title="Analytics" description="Availability, response time, operations and recovery data from the local control plane." actions={<button className="secondary-button" disabled={analyticsLoading} onClick={() => setRevision((value) => value + 1)}><RefreshCw aria-hidden="true" />{analyticsLoading ? 'Refreshing…' : 'Refresh data'}</button>} />
+    <section className="analytics-filter-bar" aria-label="Analytics filters"><label>Time range<select value={rangeDays} onChange={(event) => setRangeDays(Number(event.target.value) as AnalyticsRangeDays)}><option value={1}>Last 24 hours</option><option value={7}>Last 7 days</option><option value={30}>Last 30 days</option><option value={90}>Last 90 days</option></select></label><label>Site<select value={siteId} onChange={(event) => chooseSite(event.target.value)}><option value="">All sites</option>{sortedSites.map((site) => <option value={site.id} key={site.id}>{site.name} — {site.environment === 'staging' ? 'Staging' : 'Production'}</option>)}</select></label><label>Environment<select value={environment} onChange={(event) => chooseEnvironment(event.target.value as AnalyticsEnvironment)}><option value="all">All environments</option><option value="production">Production only</option><option value="staging">Staging only</option></select></label><label>Workload<select value={kind} onChange={(event) => chooseKind(event.target.value as AnalyticsKind)}><option value="all">All workloads</option><option value="wordpress">WordPress</option><option value="lovable">Lovable</option></select></label><span className="analytics-freshness"><i className={analyticsLoading ? 'loading' : ''} />{analytics ? `Updated ${relativeTime(analytics.generatedAt)}` : 'Waiting for telemetry'}</span></section>
+    {analyticsError && <div className="site-error"><span><CircleAlert aria-hidden="true" /></span><div><strong>Analytics unavailable</strong><p>{analyticsError}</p></div></div>}
+    {!analytics && analyticsLoading ? <section className="content-card"><Empty title="Calculating analytics…" copy="GeekHeros is aggregating real monitoring, backup and operation records." /></section> : analytics && <>
+      <div className="metric-grid analytics-metrics"><MetricCard icon={Gauge} tone="green" label="Availability" value={formatAnalyticsPercent(analytics.summary.availabilityPercent)} detail={`${analytics.summary.failedChecks} failed of ${analytics.summary.checkCount} checks`} meta={rangeLabel} /><MetricCard icon={Activity} tone="blue" label="Average response" value={analytics.summary.averageLatencyMs === null ? '—' : `${analytics.summary.averageLatencyMs} ms`} detail={`P95 ${analytics.summary.p95LatencyMs === null ? '—' : `${analytics.summary.p95LatencyMs} ms`}`} meta={rangeLabel} /><MetricCard icon={ShieldCheck} tone="violet" label="Operations completed" value={String(analytics.summary.operationCount - analytics.summary.failedOperations)} detail={`${analytics.summary.failedOperations} failed · ${formatAnalyticsPercent(analytics.summary.operationSuccessPercent)} success`} meta={rangeLabel} /><MetricCard icon={ArchiveRestore} tone="amber" label="Recovery points" value={String(analytics.summary.backupCount)} detail={`${analytics.summary.siteCount} site${analytics.summary.siteCount === 1 ? '' : 's'} · ${analytics.summary.availableUpdates} updates open`} meta={rangeLabel} /></div>
+      <div className="analytics-chart-grid"><section className="content-card analytics-chart-card analytics-chart-wide"><div className="analytics-card-heading"><div><small>UPTIME & LATENCY</small><h2>Service performance</h2><p>{analytics.summary.checkCount} real HTTP checks across the selected scope.</p></div><div className="analytics-legend"><span><i className="availability" />Availability</span><span><i className="latency" />Response time</span></div></div>{chartHasChecks ? <div className="analytics-chart"><ResponsiveContainer width="100%" height="100%"><AreaChart data={analytics.series} margin={{ top: 12, right: 8, left: -8, bottom: 2 }}><defs><linearGradient id="analyticsAvailability" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#43b979" stopOpacity={0.3} /><stop offset="100%" stopColor="#43b979" stopOpacity={0.02} /></linearGradient></defs><CartesianGrid stroke="#e8eeea" strokeDasharray="3 4" vertical={false} /><XAxis dataKey="bucketStart" tickFormatter={(value) => analyticsAxisLabel(String(value), rangeDays)} tick={{ fill: '#748078', fontSize: 11 }} axisLine={false} tickLine={false} minTickGap={24} /><YAxis yAxisId="uptime" domain={[0, 100]} tick={{ fill: '#748078', fontSize: 11 }} tickFormatter={(value) => `${value}%`} axisLine={false} tickLine={false} /><YAxis yAxisId="latency" orientation="right" tick={{ fill: '#748078', fontSize: 11 }} tickFormatter={(value) => `${value}ms`} axisLine={false} tickLine={false} /><Tooltip labelFormatter={(value) => new Date(String(value)).toLocaleString()} contentStyle={{ border: '1px solid #dfe7e2', borderRadius: 9, boxShadow: '0 10px 30px rgba(22,42,31,.12)', fontSize: 12 }} /><Area yAxisId="uptime" type="monotone" dataKey="uptimePercent" name="Availability (%)" stroke="#2ea86a" strokeWidth={2} fill="url(#analyticsAvailability)" connectNulls isAnimationActive={false} /><Line yAxisId="latency" type="monotone" dataKey="averageLatencyMs" name="Average response (ms)" stroke="#4f86c6" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} /></AreaChart></ResponsiveContainer></div> : <AnalyticsChartEmpty title="No monitoring samples in this range" copy="Checks appear here as the 10-minute monitor collects them." />}</section>
+        <section className="content-card analytics-chart-card"><div className="analytics-card-heading"><div><small>LIVE FLEET</small><h2>Current status</h2><p>{analytics.summary.runningSites} of {analytics.summary.siteCount} sites running.</p></div></div>{analytics.statusBreakdown.length ? <><div className="analytics-donut"><ResponsiveContainer width="100%" height="100%"><PieChart><Tooltip contentStyle={{ border: '1px solid #dfe7e2', borderRadius: 9, fontSize: 12 }} /><Pie data={analytics.statusBreakdown} dataKey="count" nameKey="status" innerRadius={58} outerRadius={82} paddingAngle={3} strokeWidth={0} isAnimationActive={false}>{analytics.statusBreakdown.map((item) => <Cell key={item.status} fill={analyticsStatusColors[item.status] || analyticsStatusColors.Unknown} />)}</Pie></PieChart></ResponsiveContainer><strong>{analytics.summary.siteCount}<small>sites</small></strong></div><div className="analytics-status-legend">{analytics.statusBreakdown.map((item) => <span key={item.status}><i style={{ background: analyticsStatusColors[item.status] || analyticsStatusColors.Unknown }} /><strong>{item.status}</strong><em>{item.count}</em></span>)}</div></> : <AnalyticsChartEmpty title="No sites match" copy="Adjust the site or workload filters." />}</section>
+        <section className="content-card analytics-chart-card analytics-chart-wide"><div className="analytics-card-heading"><div><small>CONTROL-PLANE EVENTS</small><h2>Operations and backups</h2><p>Completed actions, failures and recovery points by {analytics.range.bucket}.</p></div></div>{chartHasOperations ? <div className="analytics-chart analytics-bar-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={analytics.series} margin={{ top: 12, right: 6, left: -18, bottom: 2 }}><CartesianGrid stroke="#e8eeea" strokeDasharray="3 4" vertical={false} /><XAxis dataKey="bucketStart" tickFormatter={(value) => analyticsAxisLabel(String(value), rangeDays)} tick={{ fill: '#748078', fontSize: 11 }} axisLine={false} tickLine={false} minTickGap={24} /><YAxis allowDecimals={false} tick={{ fill: '#748078', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip labelFormatter={(value) => new Date(String(value)).toLocaleString()} contentStyle={{ border: '1px solid #dfe7e2', borderRadius: 9, boxShadow: '0 10px 30px rgba(22,42,31,.12)', fontSize: 12 }} /><Bar dataKey="operations" name="Operations" fill="#5c8ec8" radius={[4, 4, 0, 0]} isAnimationActive={false} /><Bar dataKey="backups" name="Backups" fill="#8a69be" radius={[4, 4, 0, 0]} isAnimationActive={false} /><Bar dataKey="failedOperations" name="Failed operations" fill="#d96b5c" radius={[4, 4, 0, 0]} isAnimationActive={false} /></BarChart></ResponsiveContainer></div> : <AnalyticsChartEmpty title="No operations in this range" copy="Lifecycle actions and recovery points will appear as they occur." />}</section>
+        <section className="content-card analytics-chart-card"><div className="analytics-card-heading"><div><small>OPERATION MIX</small><h2>Most-used tools</h2><p>Actual control-plane actions in this range.</p></div></div><div className="analytics-operation-list">{analytics.operationTypes.slice(0, 7).map((item) => <span key={item.type}><i><ChartNoAxesCombined aria-hidden="true" /></i><strong>{humanizeOperation(item.type)}</strong><small>{item.failures ? `${item.failures} failed` : 'No failures'}</small><em>{item.count}</em></span>)}{!analytics.operationTypes.length && <AnalyticsChartEmpty title="No operation data" copy="Run a site action to begin the breakdown." />}</div></section>
+      </div>
+      <section className="fleet-panel analytics-table-panel"><div className="analytics-table-title"><div><small>SITE BREAKDOWN</small><h2>Performance by site</h2></div><span>Sorted by lowest availability</span></div><div className="analytics-site-row analytics-table-header"><span>Site</span><span>Availability</span><span>Response</span><span>Checks</span><span>Operations</span><span>Backups</span><span>Status</span><span /></div>{analytics.siteMetrics.map((site) => <button className="analytics-site-row" key={site.id} onClick={() => onOpen(site.id)}><span className="analytics-site-name"><i>{initials(site.name)}</i><span><strong>{site.name}</strong><small>{site.domain} · {site.environment}</small></span></span><span><strong>{formatAnalyticsPercent(site.uptimePercent)}</strong><small>{site.failedChecks} failed</small></span><span><strong>{site.averageLatencyMs === null ? '—' : `${site.averageLatencyMs} ms`}</strong><small>P95 {site.p95LatencyMs === null ? '—' : `${site.p95LatencyMs} ms`}</small></span><span><strong>{site.checkCount}</strong><small>{site.lastCheckAt ? relativeTime(site.lastCheckAt) : 'No samples'}</small></span><span><strong>{site.operationCount}</strong><small>{site.failedOperations} failed</small></span><span><strong>{site.backupCount}</strong><small>{site.lastBackupAt ? relativeTime(site.lastBackupAt) : 'None yet'}</small></span><span className={`analytics-health ${site.status.toLowerCase().replace(/[^a-z]+/g, '-')}`}><i />{site.status}</span><ChevronRight aria-hidden="true" /></button>)}{!analytics.siteMetrics.length && <Empty title="No sites match these filters" copy="Choose a different site, environment or workload." />}</section>
+      <section className="fleet-panel analytics-measurements"><div className="analytics-table-title"><div><small>GRANULAR DATA</small><h2>Recent measurements</h2></div><span>Latest {recentChecks.length} of {analytics.recentChecks.length} samples</span></div><div className="analytics-check-row analytics-table-header"><span>Timestamp</span><span>Site</span><span>Result</span><span>HTTP</span><span>Response</span><span>Details</span></div>{recentChecks.map((check) => <div className="analytics-check-row" key={`${check.siteId}:${check.checkedAt}`}><time>{new Date(check.checkedAt).toLocaleString()}</time><span><strong>{check.siteName}</strong><small>{check.environment} · {check.kind}</small></span><span className={`analytics-result ${check.ok ? 'success' : 'failed'}`}><i />{check.ok ? 'Available' : 'Failed'}</span><strong>{check.statusCode || '—'}</strong><strong>{check.latencyMs === null ? '—' : `${check.latencyMs} ms`}</strong><small>{check.error || 'Request completed normally'}</small></div>)}{!recentChecks.length && <Empty title="No measurements in this range" copy="Monitoring runs every 10 minutes while managed sites are online." />}</section>
+    </>}
+  </>;
+}
+
+function AnalyticsChartEmpty({ title, copy }: { title: string; copy: string }) { return <div className="analytics-chart-empty"><ChartNoAxesCombined aria-hidden="true" /><strong>{title}</strong><small>{copy}</small></div>; }
+
 function ActivityView({ entries }: { entries: ActivityEntry[] }) { return <><PageHeading eyebrow="AUDIT LOG" title="Activity" description="Completed and failed operations reported by the local Docker agent." /><section className="content-card"><ActivityList entries={entries} /></section></>; }
 function ActivityList({ entries }: { entries: ActivityEntry[] }) { if (!entries.length) return <Empty title="No operations recorded" copy="Container launches and lifecycle actions will appear here." />; return <div className="timeline live-timeline">{entries.map((entry) => <div key={entry.id}><span className={`activity-dot ${entry.state === 'failed' ? 'red' : 'green'}`} /><span><strong>{entry.message}</strong><small>{entry.siteName} · {entry.type}</small></span><time>{relativeTime(entry.createdAt)}</time></div>)}</div>; }
 
@@ -1024,6 +1130,10 @@ function fileToBase64(file: File) { return new Promise<string>((resolve, reject)
 function downloadBlueprintSettingsExample() { const example = { options: { blogdescription: 'A concise site tagline', timezone_string: 'America/Los_Angeles', default_comment_status: 'closed' }, plugins: [{ slug: 'wordpress-seo', activate: true }], themes: [{ slug: 'astra', activate: true }], pages: [{ title: 'Home', slug: 'home', status: 'publish', content: '<h1>Welcome</h1>' }] }; const url = URL.createObjectURL(new Blob([`${JSON.stringify(example, null, 2)}\n`], { type: 'application/json' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'geekheros-blueprint-settings.json'; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 0); }
 function shortRevision(value: string | null) { return value ? value.slice(0, 8) : 'Not deployed'; }
 function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
+function analyticsRangeLabel(days: AnalyticsRangeDays) { return days === 1 ? 'Last 24 hours' : `Last ${days} days`; }
+function formatAnalyticsPercent(value: number | null) { if (value === null) return '—'; return `${value.toFixed(Number.isInteger(value) ? 0 : 2)}%`; }
+function analyticsAxisLabel(value: string, days: AnalyticsRangeDays) { const date = new Date(value); return days === 1 ? date.toLocaleTimeString([], { hour: 'numeric' }) : date.toLocaleDateString([], { month: 'short', day: 'numeric' }); }
+function humanizeOperation(value: string) { return value.split(/[._-]+/).filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join(' '); }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000)); if (seconds < 60) return 'just now'; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`; return `${Math.floor(seconds / 86400)}d ago`; }
 function relativeTimeFuture(value: string) { const seconds = Math.max(0, Math.ceil((new Date(value).getTime() - Date.now()) / 1000)); if (seconds < 60) return 'in less than a minute'; if (seconds < 3600) return `in ${Math.ceil(seconds / 60)} minutes`; if (seconds < 86400) return `in ${Math.ceil(seconds / 3600)} hours`; return `in ${Math.ceil(seconds / 86400)} days`; }
 function backupIntervalLabel(hours: number) { return backupIntervalOptions.find((option) => option.hours === hours)?.label || `Every ${hours} hours`; }

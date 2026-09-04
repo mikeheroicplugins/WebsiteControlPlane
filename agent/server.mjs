@@ -41,6 +41,8 @@ const lovableOAuthStateMaxAge = 10 * 60 * 1000;
 const screenshotRefreshMs = 60 * 60 * 1000;
 const uptimeCheckIntervalMs = 10 * 60 * 1000;
 const backupScheduleCheckIntervalMs = 60 * 1000;
+const monitoringRetentionChecks = 90 * 24 * 6;
+const activityRetentionEntries = 5_000;
 const allowedBackupIntervals = new Set([6, 12, 24, 72, 168, 720]);
 const screenshotCaptures = new Map();
 const scheduledBackupRuns = new Set();
@@ -1044,7 +1046,7 @@ function limitsForPod(pod) {
 async function recordActivity(entry) {
   await updateState((state) => {
     state.activity.unshift({ id: randomUUID(), createdAt: new Date().toISOString(), state: 'completed', ...entry });
-    state.activity = state.activity.slice(0, 100);
+    state.activity = state.activity.slice(0, activityRetentionEntries);
   });
 }
 
@@ -2247,7 +2249,7 @@ async function checkSiteUptime(siteId) {
     const current = state.sites[siteId];
     if (!current) return;
     current.monitoring ||= { checks: [] };
-    current.monitoring.checks = [check, ...(Array.isArray(current.monitoring.checks) ? current.monitoring.checks : [])].slice(0, 1008);
+    current.monitoring.checks = [check, ...(Array.isArray(current.monitoring.checks) ? current.monitoring.checks : [])].slice(0, monitoringRetentionChecks);
   });
   return check;
 }
@@ -2257,6 +2259,173 @@ async function getSiteMonitoring(siteId, options = {}) {
   const site = await requireSite(siteId);
   const checks = Array.isArray(site.monitoring?.checks) ? site.monitoring.checks : [];
   return { ...monitoringSummary(site), checks };
+}
+
+function analyticsPercentile(values, percentile) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((percentile / 100) * sorted.length) - 1));
+  return sorted[index];
+}
+
+function analyticsAverage(values) {
+  return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
+}
+
+async function getAnalytics(input = {}) {
+  const rangeDays = Number(input.rangeDays || 7);
+  if (![1, 7, 30, 90].includes(rangeDays)) throw Object.assign(new Error('Choose an analytics range of 1, 7, 30 or 90 days.'), { status: 400 });
+  const siteId = String(input.siteId || '').trim();
+  const environment = String(input.environment || 'all');
+  const kind = String(input.kind || 'all');
+  if (!['all', 'production', 'staging'].includes(environment)) throw Object.assign(new Error('Choose all, production or staging environments.'), { status: 400 });
+  if (!['all', 'wordpress', 'lovable'].includes(kind)) throw Object.assign(new Error('Choose all, WordPress or Lovable workloads.'), { status: 400 });
+
+  const state = await readState();
+  if (siteId && !state.sites[siteId]) throw Object.assign(new Error('Site not found.'), { status: 404 });
+  const storedSites = Object.values(state.sites).filter((site) => (
+    (!siteId || site.id === siteId)
+    && (environment === 'all' || (site.environment === 'staging' ? 'staging' : 'production') === environment)
+    && (kind === 'all' || (site.kind === 'lovable' ? 'lovable' : 'wordpress') === kind)
+  ));
+  const liveSites = await Promise.all(storedSites.map(async (site) => publicSite(site, await inspectContainer(site.wpContainer).catch(() => null))));
+  const selectedIds = new Set(storedSites.map((site) => site.id));
+  const endMs = Date.now();
+  const bucketMs = rangeDays === 1 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  const bucketCount = rangeDays === 1 ? 24 : rangeDays;
+  const startMs = endMs - bucketCount * bucketMs;
+  const buckets = Array.from({ length: bucketCount }, (_, index) => ({
+    bucketStart: new Date(startMs + index * bucketMs).toISOString(),
+    bucketEnd: new Date(startMs + (index + 1) * bucketMs).toISOString(),
+    checks: [], operations: 0, failedOperations: 0, backups: 0,
+  }));
+  const checksBySite = new Map();
+  const backupsBySite = new Map();
+  const operationsBySite = new Map();
+  const operationTypes = new Map();
+  const recentChecks = [];
+
+  function bucketFor(timestamp) {
+    const time = Date.parse(timestamp);
+    if (!Number.isFinite(time) || time < startMs || time > endMs) return null;
+    return buckets[Math.min(bucketCount - 1, Math.floor((time - startMs) / bucketMs))];
+  }
+
+  for (const site of storedSites) {
+    const siteChecks = (Array.isArray(site.monitoring?.checks) ? site.monitoring.checks : []).filter((check) => bucketFor(check.checkedAt));
+    checksBySite.set(site.id, siteChecks);
+    for (const check of siteChecks) {
+      bucketFor(check.checkedAt).checks.push(check);
+      recentChecks.push({
+        siteId: site.id,
+        siteName: site.name,
+        domain: site.domain,
+        environment: site.environment === 'staging' ? 'staging' : 'production',
+        kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
+        ...check,
+      });
+    }
+    const siteBackups = (Array.isArray(site.backups) ? site.backups : []).filter((backup) => bucketFor(backup.createdAt));
+    backupsBySite.set(site.id, siteBackups);
+    for (const backup of siteBackups) bucketFor(backup.createdAt).backups += 1;
+  }
+
+  const activities = (Array.isArray(state.activity) ? state.activity : []).filter((entry) => selectedIds.has(entry.siteId) && bucketFor(entry.createdAt));
+  for (const entry of activities) {
+    const bucket = bucketFor(entry.createdAt);
+    bucket.operations += 1;
+    if (entry.state === 'failed') bucket.failedOperations += 1;
+    const siteOperations = operationsBySite.get(entry.siteId) || [];
+    siteOperations.push(entry);
+    operationsBySite.set(entry.siteId, siteOperations);
+    const currentType = operationTypes.get(entry.type) || { type: entry.type, count: 0, failures: 0 };
+    currentType.count += 1;
+    if (entry.state === 'failed') currentType.failures += 1;
+    operationTypes.set(entry.type, currentType);
+  }
+
+  const allChecks = [...checksBySite.values()].flat();
+  const successfulChecks = allChecks.filter((check) => check.ok);
+  const latencyValues = successfulChecks.map((check) => Number(check.latencyMs)).filter(Number.isFinite);
+  const backupsInWindow = [...backupsBySite.values()].flat();
+  const failedOperations = activities.filter((entry) => entry.state === 'failed').length;
+  const availabilityPercent = allChecks.length ? Number(((successfulChecks.length / allChecks.length) * 100).toFixed(2)) : null;
+  const operationSuccessPercent = activities.length ? Number((((activities.length - failedOperations) / activities.length) * 100).toFixed(2)) : null;
+  const series = buckets.map((bucket) => {
+    const successful = bucket.checks.filter((check) => check.ok);
+    const latencies = successful.map((check) => Number(check.latencyMs)).filter(Number.isFinite);
+    return {
+      bucketStart: bucket.bucketStart,
+      bucketEnd: bucket.bucketEnd,
+      checkCount: bucket.checks.length,
+      uptimePercent: bucket.checks.length ? Number(((successful.length / bucket.checks.length) * 100).toFixed(2)) : null,
+      averageLatencyMs: analyticsAverage(latencies),
+      p95LatencyMs: analyticsPercentile(latencies, 95),
+      failedChecks: bucket.checks.length - successful.length,
+      operations: bucket.operations,
+      failedOperations: bucket.failedOperations,
+      backups: bucket.backups,
+    };
+  });
+  const statusCounts = new Map();
+  for (const site of liveSites) statusCounts.set(site.status, (statusCounts.get(site.status) || 0) + 1);
+  const statusBreakdown = [...statusCounts.entries()].map(([status, count]) => ({ status, count }));
+  const siteMetrics = storedSites.map((site) => {
+    const live = liveSites.find((entry) => entry.id === site.id);
+    const checks = checksBySite.get(site.id) || [];
+    const successful = checks.filter((check) => check.ok);
+    const latencies = successful.map((check) => Number(check.latencyMs)).filter(Number.isFinite);
+    const operations = operationsBySite.get(site.id) || [];
+    return {
+      id: site.id,
+      name: site.name,
+      domain: site.domain,
+      kind: site.kind === 'lovable' ? 'lovable' : 'wordpress',
+      environment: site.environment === 'staging' ? 'staging' : 'production',
+      status: live?.status || site.status || 'Unknown',
+      uptimePercent: checks.length ? Number(((successful.length / checks.length) * 100).toFixed(2)) : null,
+      averageLatencyMs: analyticsAverage(latencies),
+      p95LatencyMs: analyticsPercentile(latencies, 95),
+      checkCount: checks.length,
+      failedChecks: checks.length - successful.length,
+      operationCount: operations.length,
+      failedOperations: operations.filter((entry) => entry.state === 'failed').length,
+      backupCount: (backupsBySite.get(site.id) || []).length,
+      updates: Number(site.updates || 0),
+      lastCheckAt: checks[0]?.checkedAt || null,
+      lastBackupAt: site.backups?.[0]?.createdAt || null,
+    };
+  }).sort((a, b) => {
+    if (a.uptimePercent === null && b.uptimePercent !== null) return 1;
+    if (a.uptimePercent !== null && b.uptimePercent === null) return -1;
+    return (a.uptimePercent ?? 100) - (b.uptimePercent ?? 100) || a.name.localeCompare(b.name);
+  });
+
+  return {
+    generatedAt: new Date(endMs).toISOString(),
+    range: { days: rangeDays, startAt: new Date(startMs).toISOString(), endAt: new Date(endMs).toISOString(), bucket: rangeDays === 1 ? 'hour' : 'day' },
+    filters: { siteId: siteId || null, environment, kind },
+    summary: {
+      siteCount: storedSites.length,
+      runningSites: liveSites.filter((site) => site.status === 'Running').length,
+      attentionSites: liveSites.filter((site) => !['Running', 'Stopped'].includes(site.status)).length,
+      availabilityPercent,
+      averageLatencyMs: analyticsAverage(latencyValues),
+      p95LatencyMs: analyticsPercentile(latencyValues, 95),
+      checkCount: allChecks.length,
+      failedChecks: allChecks.length - successfulChecks.length,
+      operationCount: activities.length,
+      failedOperations,
+      operationSuccessPercent,
+      backupCount: backupsInWindow.length,
+      availableUpdates: storedSites.reduce((sum, site) => sum + Number(site.updates || 0), 0),
+    },
+    series,
+    statusBreakdown,
+    siteMetrics,
+    recentChecks: recentChecks.sort((a, b) => String(b.checkedAt).localeCompare(String(a.checkedAt))).slice(0, 250),
+    operationTypes: [...operationTypes.values()].sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
+  };
 }
 
 async function refreshSiteCare() {
@@ -3295,6 +3464,7 @@ async function readJson(request, maximumBytes = 1_000_000) {
 const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   getSystemInfo: () => systemInfo(false),
   listActivity: async ({ limit, siteId }) => (await readState()).activity.filter((entry) => !siteId || entry.siteId === siteId).slice(0, limit),
+  getAnalytics,
   listSites,
   listStagingSites,
   launchSite: createSite,
@@ -3403,6 +3573,12 @@ const server = createServer(async (request, response) => {
       const state = await readState();
       return send(response, 200, { activity: state.activity });
     }
+    if (request.method === 'GET' && url.pathname === '/analytics') return send(response, 200, { analytics: await getAnalytics({
+      rangeDays: url.searchParams.get('rangeDays'),
+      siteId: url.searchParams.get('siteId'),
+      environment: url.searchParams.get('environment'),
+      kind: url.searchParams.get('kind'),
+    }) });
     const clientMatch = url.pathname.match(/^\/clients\/([^/]+)$/);
     if (clientMatch && request.method === 'PATCH') return send(response, 200, { client: await updateClient(decodeURIComponent(clientMatch[1]), await readJson(request)) });
     if (clientMatch && request.method === 'DELETE') return send(response, 200, await deleteClient(decodeURIComponent(clientMatch[1])));
