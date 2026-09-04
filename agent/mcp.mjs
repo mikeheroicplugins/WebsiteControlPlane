@@ -44,7 +44,7 @@ function createControlPlaneMcpServer(api) {
 
   register(server, 'get_analytics', {
     title: 'Get control-plane analytics',
-    description: 'Read fleet-wide or site-specific uptime, latency, operations, backups, health distribution and granular monitoring measurements for a selected time range.',
+    description: 'Read fleet-wide or site-specific uptime, latency, operations, backups, health distribution and granular monitoring measurements for a selected time range. Every value is derived from observed local records; the response never contains simulated or sample data.',
     inputSchema: z.object({
       rangeDays: z.union([z.literal(1), z.literal(7), z.literal(30), z.literal(90)]).default(7),
       siteId: siteIdSchema.optional(),

@@ -2366,7 +2366,7 @@ async function getAnalytics(input = {}) {
       failedOperations: bucket.failedOperations,
       backups: bucket.backups,
     };
-  });
+  }).filter((bucket) => bucket.checkCount > 0 || bucket.operations > 0 || bucket.backups > 0);
   const statusCounts = new Map();
   for (const site of liveSites) statusCounts.set(site.status, (statusCounts.get(site.status) || 0) + 1);
   const statusBreakdown = [...statusCounts.entries()].map(([status, count]) => ({ status, count }));
@@ -2393,7 +2393,7 @@ async function getAnalytics(input = {}) {
       backupCount: (backupsBySite.get(site.id) || []).length,
       updates: Number(site.updates || 0),
       lastCheckAt: checks[0]?.checkedAt || null,
-      lastBackupAt: site.backups?.[0]?.createdAt || null,
+      lastBackupAt: (backupsBySite.get(site.id) || [])[0]?.createdAt || null,
     };
   }).sort((a, b) => {
     if (a.uptimePercent === null && b.uptimePercent !== null) return 1;
@@ -2405,6 +2405,14 @@ async function getAnalytics(input = {}) {
     generatedAt: new Date(endMs).toISOString(),
     range: { days: rangeDays, startAt: new Date(startMs).toISOString(), endAt: new Date(endMs).toISOString(), bucket: rangeDays === 1 ? 'hour' : 'day' },
     filters: { siteId: siteId || null, environment, kind },
+    provenance: {
+      mode: 'observed-only',
+      simulatedRecords: 0,
+      monitoringChecks: allChecks.length,
+      activityEntries: activities.length,
+      backups: backupsInWindow.length,
+      currentContainerInspections: liveSites.length,
+    },
     summary: {
       siteCount: storedSites.length,
       runningSites: liveSites.filter((site) => site.status === 'Running').length,
