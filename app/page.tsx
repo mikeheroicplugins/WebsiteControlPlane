@@ -1151,8 +1151,19 @@ function WordPressPluginRepositoryModal({ blueprints, pluginLibrary, initialBlue
     <section className="modal plugin-repository-modal" role="dialog" aria-modal="true" aria-labelledby="plugin-repository-title">
       <div className="modal-head"><div><p className="eyebrow">OFFICIAL WORDPRESS.ORG REPOSITORY</p><h2 id="plugin-repository-title">Build your plugin library</h2><p>Select several plugins at once. Keep them reusable in the library, or add the same mix to a blueprint.</p></div><button onClick={onClose} disabled={busy} aria-label="Close"><X aria-hidden="true" /></button></div>
       <div className="plugin-repository-controls">
-        <form className="plugin-search-form" onSubmit={submit}><label>Search plugins<input value={query} onChange={(event) => setQuery(event.target.value)} minLength={2} maxLength={100} placeholder="SEO, forms, security…" autoFocus /></label><button className="primary-button" disabled={loading || busy || query.trim().length < 2}><Search aria-hidden="true" />{loading ? 'Searching…' : 'Search'}</button></form>
-        <label>Also add to blueprint<select value={blueprintId} onChange={(event) => setBlueprintId(event.target.value)} disabled={busy}><option value="">No blueprint — library only</option>{blueprints.map((blueprint) => <option key={blueprint.id} value={blueprint.id}>{blueprint.name}</option>)}</select><small>{target ? `Selected plugins will also be added to ${target.name}.` : 'Plugins stay reusable and can be mixed into blueprints later.'}</small></label>
+        <form className="plugin-search-form" onSubmit={submit}>
+          <label htmlFor="plugin-repository-search">Search plugins</label>
+          <div className="plugin-search-row">
+            <input id="plugin-repository-search" value={query} onChange={(event) => setQuery(event.target.value)} minLength={2} maxLength={100} placeholder="SEO, forms, security…" autoFocus />
+            <button className="primary-button" disabled={loading || busy || query.trim().length < 2}><Search aria-hidden="true" />{loading ? 'Searching…' : 'Search'}</button>
+          </div>
+          <small>Find official plugins by name, purpose, or keyword.</small>
+        </form>
+        <div className="plugin-target-field">
+          <label htmlFor="plugin-repository-blueprint">Also add to blueprint</label>
+          <select id="plugin-repository-blueprint" value={blueprintId} onChange={(event) => setBlueprintId(event.target.value)} disabled={busy}><option value="">No blueprint — library only</option>{blueprints.map((blueprint) => <option key={blueprint.id} value={blueprint.id}>{blueprint.name}</option>)}</select>
+          <small>{target ? `Selected plugins will also be added to ${target.name}.` : 'Plugins stay reusable and can be mixed into blueprints later.'}</small>
+        </div>
       </div>
       {error && <p className="plugin-repository-error" role="alert"><CircleAlert aria-hidden="true" />{error}</p>}
       {!repository && !error && <div className="plugin-repository-intro"><span><Download aria-hidden="true" /></span><strong>Search the live WordPress.org catalog</strong><p>Select any combination of plugins and download their official ZIPs together. Your library remains available when you edit another blueprint.</p></div>}

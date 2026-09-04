@@ -280,6 +280,10 @@ button:disabled { cursor:not-allowed; opacity:.5; }
 
 .plugin-library-strip article{grid-template-columns:32px minmax(0,1fr) auto 24px}.plugin-library-strip article>button{width:24px;height:24px;display:grid;place-items:center;border:0;border-radius:6px;color:#9a5b50;background:#fff3f1}.plugin-library-strip article>button svg{width:11px;height:11px}.plugin-library-strip article>button:disabled{opacity:.45;cursor:not-allowed}
 
+/* Keep plugin search and blueprint target controls on the same rhythm. */
+.plugin-repository-controls{align-items:start}.plugin-repository-controls>.plugin-search-form,.plugin-repository-controls>.plugin-target-field{min-width:0;display:grid;grid-template-columns:1fr;grid-template-rows:auto 42px minmax(16px,auto);align-self:start;gap:6px}.plugin-repository-controls>.plugin-search-form>label,.plugin-repository-controls>.plugin-target-field>label{display:block;color:#4f5f56;font-size:13px;font-weight:750;line-height:1.25}.plugin-search-row{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.plugin-search-row>input,.plugin-search-row>.primary-button,.plugin-target-field>select{height:42px}.plugin-repository-controls>.plugin-search-form>small,.plugin-repository-controls>.plugin-target-field>small{display:block;min-height:16px;color:#849088;font-size:11px;font-weight:500;line-height:1.45}
+@media(max-width:500px){.plugin-search-row{grid-template-columns:1fr}.plugin-search-row>.primary-button{width:100%}.plugin-repository-controls>.plugin-search-form{grid-template-rows:auto auto minmax(16px,auto)}}
+
 /* Consistent iconography */
 .compact-site em,.client-sites>button em{display:grid;place-items:center}.compact-site em svg,.client-sites>button em svg{width:13px;height:13px;stroke-width:1.8}
 .gateway-status>span svg{width:21px;height:21px;stroke-width:1.7}
