@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 36;
+export const controlPlaneMcpToolCount = 38;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -128,6 +128,24 @@ function createControlPlaneMcpServer(api) {
     inputSchema: z.object({ siteId: siteIdSchema }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, ({ siteId }) => api.getSiteInventory(siteId));
+
+  register(server, 'get_backup_schedule', {
+    title: 'Get WordPress backup schedule',
+    description: 'Read the manual or automatic backup policy, frequency, next run and last automatic result for a production or staging WordPress site.',
+    inputSchema: z.object({ siteId: siteIdSchema }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, ({ siteId }) => api.getBackupSchedule(siteId));
+
+  register(server, 'set_backup_schedule', {
+    title: 'Set WordPress backup schedule',
+    description: 'Choose manual-only backups or schedule recurring automatic backups for a production or staging WordPress site. A backup can still be run immediately with run_site_operation and operation=backup.',
+    inputSchema: z.object({
+      siteId: siteIdSchema,
+      mode: z.enum(['manual', 'automatic']),
+      intervalHours: z.union([z.literal(6), z.literal(12), z.literal(24), z.literal(72), z.literal(168), z.literal(720)]).default(24),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, ({ siteId, ...input }) => api.updateBackupSchedule(siteId, input));
 
   registerRaw(server, 'get_site_screenshot', {
     title: 'Get site screenshot',

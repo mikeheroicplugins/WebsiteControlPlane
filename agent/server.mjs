@@ -40,7 +40,10 @@ const lovableOAuthCallbackUrl = `http://127.0.0.1:${port}/lovable/oauth/callback
 const lovableOAuthStateMaxAge = 10 * 60 * 1000;
 const screenshotRefreshMs = 60 * 60 * 1000;
 const uptimeCheckIntervalMs = 10 * 60 * 1000;
+const backupScheduleCheckIntervalMs = 60 * 1000;
+const allowedBackupIntervals = new Set([6, 12, 24, 72, 168, 720]);
 const screenshotCaptures = new Map();
+const scheduledBackupRuns = new Set();
 const localPreviewConfig = String.raw`/* ${localPreviewConfigMarker} */
 if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/', $_SERVER['HTTP_HOST'])) {
   define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
@@ -118,7 +121,26 @@ let stateQueue = Promise.resolve();
 const stateReplaceRetryCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
 function emptyState() {
-  return { version: 9, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+  return { version: 10, sites: {}, clients: {}, blueprints: {}, agents: {}, activity: [], integrations: { lovable: {}, mcp: {} } };
+}
+
+function validIsoTimestamp(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function normalizeBackupPolicy(policy) {
+  const mode = policy?.mode === 'automatic' ? 'automatic' : 'manual';
+  const requestedInterval = Number(policy?.intervalHours);
+  const intervalHours = allowedBackupIntervals.has(requestedInterval) ? requestedInterval : 24;
+  return {
+    mode,
+    intervalHours,
+    lastAutomaticBackupAt: validIsoTimestamp(policy?.lastAutomaticBackupAt),
+    nextBackupAt: mode === 'automatic' ? validIsoTimestamp(policy?.nextBackupAt) : null,
+    lastAttemptAt: validIsoTimestamp(policy?.lastAttemptAt),
+    lastError: typeof policy?.lastError === 'string' && policy.lastError.trim() ? policy.lastError.trim().slice(0, 1000) : null,
+    updatedAt: validIsoTimestamp(policy?.updatedAt),
+  };
 }
 
 async function readState() {
@@ -132,12 +154,13 @@ async function readState() {
       productionSiteId: site.environment === 'staging' ? site.productionSiteId || null : null,
       clientId: site.clientId || null,
       tags: Array.isArray(site.tags) ? site.tags : [],
+      backupPolicy: site.kind === 'lovable' ? null : normalizeBackupPolicy(site.backupPolicy),
     }]));
     const base = emptyState();
     return {
       ...base,
       ...parsed,
-      version: 9,
+      version: 10,
       sites,
       clients: parsed.clients || {},
       blueprints: parsed.blueprints || {},
@@ -1833,6 +1856,7 @@ async function createSite(input) {
     image: isLovable ? `geekheros/lovable-${id.slice(-12)}:latest` : wordpressImage,
     status: 'Provisioning', phase: 'Queued', error: null,
     wpVersion: isLovable ? 'Lovable' : '—', phpVersion: isLovable ? 'Node 22' : '—', updates: 0, backups: [],
+    backupPolicy: isLovable ? null : normalizeBackupPolicy(null),
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     secrets: isLovable
       ? { repositoryToken }
@@ -1880,6 +1904,7 @@ async function createStagingSite(input) {
     dbVolume: `${namespace}-db`, wpVolume: `${namespace}-wp`, image: wordpressImage,
     status: 'Provisioning', phase: 'Queued', error: null, wpVersion: production.wpVersion || '—',
     phpVersion: production.phpVersion || '—', updates: 0, backups: [], lastSyncedAt: null, lastPromotedAt: null,
+    backupPolicy: normalizeBackupPolicy(null),
     createdAt: now, updatedAt: now,
     secrets: { dbPassword: production.secrets.dbPassword, dbRootPassword: randomBytes(32).toString('base64url') },
   };
@@ -1912,7 +1937,7 @@ async function copyWordPressSite(source, target, options = {}) {
     const targetInspect = await inspectContainer(target.wpContainer);
     if (!targetInspect) throw new Error(`${target.name}'s WordPress container is unavailable.`);
     targetWasRunning = targetInspect.State?.Running === true;
-    if (safetyBackup) recoveryPoint = await createBackup(target);
+    if (safetyBackup) recoveryPoint = await createBackup(target, { trigger: 'system' });
     if (targetWasRunning) await docker(['stop', '-t', '20', target.wpContainer]);
 
     if (scope === 'all' || scope === 'files') {
@@ -2070,6 +2095,7 @@ function publicSite(site, inspect) {
     directUrl: directPort ? `http://127.0.0.1:${directPort}` : null,
     siteUrl: `http://${site.domain}`, adminUrl: site.kind === 'lovable' ? null : `http://${site.domain}/wp-admin/`,
     backupCount: site.backups?.length || 0, backups: Array.isArray(site.backups) ? site.backups : [],
+    backupPolicy: site.kind === 'lovable' ? null : normalizeBackupPolicy(site.backupPolicy),
     lastBackupAt: site.backups?.[0]?.createdAt || null,
     lastScannedAt: site.lastScannedAt || null, updateCounts: site.updateCounts || { core: 0, plugins: 0, themes: 0 },
     repositoryUrl: site.kind === 'lovable' ? site.repositoryUrl : null,
@@ -2406,6 +2432,52 @@ async function updateSiteMetadata(siteId, input) {
   return publicSite(current, await inspectContainer(current.wpContainer));
 }
 
+function backupScheduleSummary(site) {
+  return {
+    siteId: site.id,
+    siteName: site.name,
+    environment: site.environment === 'staging' ? 'staging' : 'production',
+    ...normalizeBackupPolicy(site.backupPolicy),
+  };
+}
+
+async function getBackupSchedule(siteId) {
+  const site = await requireSite(siteId);
+  if (site.kind === 'lovable') throw Object.assign(new Error('Backup scheduling is available only for WordPress sites.'), { status: 409 });
+  return backupScheduleSummary(site);
+}
+
+async function updateBackupSchedule(siteId, input) {
+  const site = await requireSite(siteId);
+  if (site.kind === 'lovable') throw Object.assign(new Error('Backup scheduling is available only for WordPress sites.'), { status: 409 });
+  const mode = String(input.mode || '');
+  if (!['manual', 'automatic'].includes(mode)) throw Object.assign(new Error('Choose manual or automatic backups.'), { status: 400 });
+  const current = normalizeBackupPolicy(site.backupPolicy);
+  const requestedInterval = input.intervalHours == null ? current.intervalHours : Number(input.intervalHours);
+  if (!allowedBackupIntervals.has(requestedInterval)) {
+    throw Object.assign(new Error('Choose a backup frequency of 6, 12, 24, 72, 168 or 720 hours.'), { status: 400 });
+  }
+  const now = new Date();
+  const backupPolicy = {
+    ...current,
+    mode,
+    intervalHours: requestedInterval,
+    nextBackupAt: mode === 'automatic' ? new Date(now.getTime() + requestedInterval * 60 * 60 * 1000).toISOString() : null,
+    lastError: null,
+    updatedAt: now.toISOString(),
+  };
+  await setSiteState(site.id, { backupPolicy });
+  await recordActivity({
+    siteId: site.id,
+    siteName: site.name,
+    type: 'backup.schedule',
+    message: mode === 'automatic'
+      ? `${site.name}: automatic backups scheduled every ${requestedInterval} hours.`
+      : `${site.name}: backups changed to manual only.`,
+  });
+  return backupScheduleSummary({ ...site, backupPolicy });
+}
+
 function publicClient(client, sites) {
   const assignedSites = sites.filter((site) => site.clientId === client.id);
   return {
@@ -2503,7 +2575,8 @@ async function issueOneClickLogin(siteId) {
   };
 }
 
-async function createBackup(site) {
+async function createBackup(site, options = {}) {
+  const trigger = ['manual', 'automatic', 'system'].includes(options.trigger) ? options.trigger : 'system';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const siteBackupDir = path.join(backupRoot, site.id);
   await mkdir(siteBackupDir, { recursive: true });
@@ -2512,7 +2585,7 @@ async function createBackup(site) {
     const sourceDirectory = lovableSourceDirectory(site);
     try { await readFile(path.join(sourceDirectory, 'package.json')); } catch { throw new Error('The Lovable source checkout is unavailable. Redeploy the site before creating a backup.'); }
     await docker(['run', '--rm', '-v', `${sourceDirectory}:/source:ro`, '-v', `${siteBackupDir}:/backups`, 'alpine:latest', 'tar', '-czf', `/backups/${filesName}`, '-C', '/source', '.'], { timeout: 600_000 });
-    const backup = { id: randomUUID(), createdAt: new Date().toISOString(), files: [filesName] };
+    const backup = { id: randomUUID(), createdAt: new Date().toISOString(), trigger, files: [filesName] };
     await updateState((state) => { state.sites[site.id].backups.unshift(backup); });
     return backup;
   }
@@ -2520,8 +2593,23 @@ async function createBackup(site) {
   const filesName = `${stamp}-wordpress.tar.gz`;
   await dockerToFile(['exec', '-e', `MYSQL_PWD=${site.secrets.dbRootPassword}`, site.dbContainer, 'mariadb-dump', '-uroot', 'wordpress'], databaseFile);
   await docker(['run', '--rm', '-v', `${site.wpVolume}:/source:ro`, '-v', `${siteBackupDir}:/backups`, 'alpine:latest', 'tar', '-czf', `/backups/${filesName}`, '-C', '/source', '.'], { timeout: 600_000 });
-  const backup = { id: randomUUID(), createdAt: new Date().toISOString(), files: [path.basename(databaseFile), filesName] };
-  await updateState((state) => { state.sites[site.id].backups.unshift(backup); });
+  const backup = { id: randomUUID(), createdAt: new Date().toISOString(), trigger, files: [path.basename(databaseFile), filesName] };
+  await updateState((state) => {
+    const current = state.sites[site.id];
+    current.backups.unshift(backup);
+    if (trigger === 'automatic') {
+      const policy = normalizeBackupPolicy(current.backupPolicy);
+      current.backupPolicy = {
+        ...policy,
+        lastAutomaticBackupAt: backup.createdAt,
+        lastAttemptAt: backup.createdAt,
+        nextBackupAt: policy.mode === 'automatic'
+          ? new Date(Date.parse(backup.createdAt) + policy.intervalHours * 60 * 60 * 1000).toISOString()
+          : null,
+        lastError: null,
+      };
+    }
+  });
   return backup;
 }
 
@@ -2536,7 +2624,7 @@ async function restoreBackup(site, backupId, scope = 'all') {
   if (backup.files.some((file) => path.basename(file) !== file)) throw new Error('The backup contains an invalid file reference.');
   if ((scope === 'all' || scope === 'database') && !databaseName) throw new Error('This recovery point does not contain a database export.');
   if ((scope === 'all' || scope === 'files') && !filesName) throw new Error('This recovery point does not contain a WordPress file archive.');
-  await createBackup(site);
+  await createBackup(site, { trigger: 'system' });
   await docker(['stop', '-t', '20', site.wpContainer]).catch((error) => { if (!/is not running/i.test(error.message)) throw error; });
   try {
     await docker(['start', site.dbContainer]).catch((error) => { if (!/is already running/i.test(error.message)) throw error; });
@@ -2606,9 +2694,9 @@ async function runOperation(siteId, type, input = {}) {
       } else if (operation === 'refresh') {
         await refreshLovableSourceStatus(site);
       } else if (operation === 'backup') {
-        await createBackup(site);
+        await createBackup(site, { trigger: 'manual' });
       } else if (operation === 'update' || operation === 'redeploy') {
-        if (site.sourceRevision) await createBackup(site);
+        if (site.sourceRevision) await createBackup(site, { trigger: 'system' });
         await deployLovableSite(site, true);
       } else if (operation === 'scan') {
         await refreshLovableSourceStatus(site);
@@ -2634,29 +2722,29 @@ async function runOperation(siteId, type, input = {}) {
     } else if (operation === 'refresh') {
       await refreshVersions(site);
     } else if (operation === 'backup') {
-      await createBackup(site);
+      await createBackup(site, { trigger: input.backupTrigger === 'automatic' ? 'automatic' : 'manual' });
     } else if (operation === 'restore-backup') {
       await restoreBackup(site, input.backupId, String(input.restoreScope || 'all'));
     } else if (operation === 'update') {
-      await createBackup(site);
+      await createBackup(site, { trigger: 'system' });
       await runWp(site, ['core', 'update'], { timeout: 600_000 });
       await runWp(site, ['core', 'update-db'], { timeout: 300_000 });
       await runWp(site, ['plugin', 'update', '--all'], { timeout: 600_000 });
       await runWp(site, ['theme', 'update', '--all'], { timeout: 600_000 });
       await refreshVersions(site);
     } else if (operation === 'update-core') {
-      await createBackup(site);
+      await createBackup(site, { trigger: 'system' });
       await runWp(site, ['core', 'update'], { timeout: 600_000 });
       await runWp(site, ['core', 'update-db'], { timeout: 300_000 });
       await refreshVersions(site);
     } else if (operation === 'update-plugins') {
       const packages = validatePackageNames(input.packages);
-      await createBackup(site);
+      await createBackup(site, { trigger: 'system' });
       await runWp(site, ['plugin', 'update', ...(packages.length ? packages : ['--all'])], { timeout: 600_000 });
       await refreshVersions(site);
     } else if (operation === 'update-themes') {
       const packages = validatePackageNames(input.packages);
-      await createBackup(site);
+      await createBackup(site, { trigger: 'system' });
       await runWp(site, ['theme', 'update', ...(packages.length ? packages : ['--all'])], { timeout: 600_000 });
       await refreshVersions(site);
     } else if (operation === 'activate-plugin' || operation === 'deactivate-plugin') {
@@ -2679,14 +2767,58 @@ async function runOperation(siteId, type, input = {}) {
     }
     const nextStatus = operation === 'stop' ? 'Stopped' : 'Running';
     await setSiteState(site.id, { phase: null, status: nextStatus, error: null });
-    await recordActivity({ siteId, siteName: site.name, type: operation, message: `${site.name}: ${operation} completed.` });
+    const automaticBackup = operation === 'backup' && input.backupTrigger === 'automatic';
+    await recordActivity({ siteId, siteName: site.name, type: automaticBackup ? 'backup.automatic' : operation, message: `${site.name}: ${automaticBackup ? 'automatic backup' : operation} completed.` });
     const current = await requireSite(site.id);
     return { site: publicSite(current, await inspectContainer(current.wpContainer)) };
   } catch (error) {
     const container = await inspectContainer(site.wpContainer).catch(() => null);
     await setSiteState(site.id, { phase: null, status: container?.State?.Running ? 'Running' : 'Stopped', error: error.message || `${operation} failed.` });
-    await recordActivity({ siteId, siteName: site.name, type: operation, state: 'failed', message: error.message || `${operation} failed.` });
+    const automaticBackup = operation === 'backup' && input.backupTrigger === 'automatic';
+    await recordActivity({ siteId, siteName: site.name, type: automaticBackup ? 'backup.automatic' : operation, state: 'failed', message: error.message || `${automaticBackup ? 'Automatic backup' : operation} failed.` });
     throw error;
+  }
+}
+
+async function refreshBackupSchedules() {
+  const state = await readState();
+  const now = Date.now();
+  const dueSites = Object.values(state.sites).filter((site) => {
+    if (site.kind === 'lovable' || site.phase || site.status !== 'Running' || scheduledBackupRuns.has(site.id)) return false;
+    const policy = normalizeBackupPolicy(site.backupPolicy);
+    return policy.mode === 'automatic' && (!policy.nextBackupAt || Date.parse(policy.nextBackupAt) <= now);
+  });
+  for (const site of dueSites) {
+    scheduledBackupRuns.add(site.id);
+    const attemptedAt = new Date().toISOString();
+    try {
+      await updateState((next) => {
+        const current = next.sites[site.id];
+        if (!current) return;
+        const policy = normalizeBackupPolicy(current.backupPolicy);
+        current.backupPolicy = {
+          ...policy,
+          lastAttemptAt: attemptedAt,
+          nextBackupAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        };
+      });
+      await runOperation(site.id, 'backup', { backupTrigger: 'automatic' });
+    } catch (error) {
+      await updateState((next) => {
+        const current = next.sites[site.id];
+        if (!current) return;
+        const policy = normalizeBackupPolicy(current.backupPolicy);
+        current.backupPolicy = {
+          ...policy,
+          lastAttemptAt: attemptedAt,
+          nextBackupAt: policy.mode === 'automatic' ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null,
+          lastError: String(error?.message || 'Automatic backup failed.').slice(0, 1000),
+        };
+      }).catch(() => undefined);
+      console.error(`Automatic backup failed for ${site.name}:`, error.message);
+    } finally {
+      scheduledBackupRuns.delete(site.id);
+    }
   }
 }
 
@@ -3066,6 +3198,8 @@ const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   manageStagingSite,
   updateSiteMetadata,
   getSiteInventory,
+  getBackupSchedule,
+  updateBackupSchedule,
   getSiteScreenshot,
   getSiteMonitoring,
   getSiteLogs,
@@ -3187,6 +3321,9 @@ const server = createServer(async (request, response) => {
     }
     const monitoringMatch = url.pathname.match(/^\/sites\/([^/]+)\/monitoring$/);
     if (monitoringMatch && request.method === 'GET') return send(response, 200, { monitoring: await getSiteMonitoring(decodeURIComponent(monitoringMatch[1]), { refresh: url.searchParams.get('refresh') === '1' }) });
+    const backupScheduleMatch = url.pathname.match(/^\/sites\/([^/]+)\/backup-schedule$/);
+    if (backupScheduleMatch && request.method === 'GET') return send(response, 200, { backupSchedule: await getBackupSchedule(decodeURIComponent(backupScheduleMatch[1])) });
+    if (backupScheduleMatch && request.method === 'PATCH') return send(response, 200, { backupSchedule: await updateBackupSchedule(decodeURIComponent(backupScheduleMatch[1]), await readJson(request)) });
     const developerMatch = url.pathname.match(/^\/sites\/([^/]+)\/developer$/);
     if (developerMatch && request.method === 'GET') {
       const siteId = decodeURIComponent(developerMatch[1]);
@@ -3248,8 +3385,10 @@ server.listen(port, host, async () => {
   }
   setTimeout(() => void refreshSiteCare(), 5_000).unref();
   setTimeout(() => void refreshSiteScreenshots(), 15_000).unref();
+  setTimeout(() => void refreshBackupSchedules(), 20_000).unref();
   setInterval(() => void refreshSiteCare(), uptimeCheckIntervalMs).unref();
   setInterval(() => void refreshSiteScreenshots(), screenshotRefreshMs).unref();
+  setInterval(() => void refreshBackupSchedules(), backupScheduleCheckIntervalMs).unref();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
