@@ -25,11 +25,12 @@ function stop(code = 0) {
 
 for (const child of children) {
   child.on('exit', (code, signal) => {
-    if (!stopping && code !== 0) {
+    if (!stopping) {
       console.error(`A local service stopped unexpectedly (${signal || code}).`);
       stop(code || 1);
     }
   });
+  child.on('error', () => { console.error('A GeekHeros development service could not start.'); stop(1); });
 }
 
 process.on('SIGINT', () => stop(0));

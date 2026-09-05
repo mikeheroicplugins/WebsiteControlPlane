@@ -11,6 +11,9 @@
     "agent": "node agent/server.mjs",
     "build": "vinext build",
     "start": "vinext start",
+    "build:vps": "vite build --config vite.vps.config.ts",
+    "start:vps": "node scripts/start-vps.mjs",
+    "test:runtime": "node --test tests/runtime.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {

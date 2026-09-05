@@ -1,0 +1,38 @@
+# Caddy 2.8+; environment comes from the systemd drop-in below.
+{$GEEKHEROS_MANAGEMENT_HOST} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		-Server
+	}
+	request_body {
+		max_size 105MB
+	}
+	# These use their own bearer token / OAuth state validation.
+	@agentEndpoints path /mcp /lovable/oauth/callback
+	handle @agentEndpoints {
+		reverse_proxy 127.0.0.1:3080 {
+			header_up X-Geekheros-Web-Token {env.GEEKHEROS_WEB_TOKEN}
+			header_up X-Geekheros-Client-IP {http.request.remote.host}
+			flush_interval -1
+		}
+	}
+	handle {
+		basic_auth {
+			{$GEEKHEROS_ADMIN_USER} {$GEEKHEROS_ADMIN_PASSWORD_HASH}
+		}
+		reverse_proxy 127.0.0.1:3080 {
+			header_up X-Geekheros-Web-Token {env.GEEKHEROS_WEB_TOKEN}
+			header_up X-Geekheros-Client-IP {http.request.remote.host}
+			header_up -Authorization
+		}
+	}
+}
+
+# Add one explicit block per production OR staging domain after pointing its
+# DNS to this node. Never use an unrestricted on-demand certificate policy.
+# client.example.com {
+#     reverse_proxy 127.0.0.1:8080
+# }

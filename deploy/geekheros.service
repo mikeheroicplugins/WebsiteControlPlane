@@ -1,0 +1,28 @@
+[Unit]
+Description=geekheros.com control plane
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=geekheros
+Group=geekheros
+SupplementaryGroups=docker
+WorkingDirectory=/opt/geekheros/control-plane
+EnvironmentFile=/etc/geekheros/control-plane.env
+ExecStart=/usr/bin/node /opt/geekheros/control-plane/scripts/start-vps.mjs
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

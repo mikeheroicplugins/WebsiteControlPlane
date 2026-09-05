@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { cp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,18 +11,20 @@ import { toNodeHandler } from '@modelcontextprotocol/node';
 import { parseRemoteReferences, selectRemoteBranch } from './git-remote.mjs';
 import { controlPlaneMcpToolCount, createControlPlaneMcpHandler } from './mcp.mjs';
 import { porkbunOperations, porkbunOperationsById } from './porkbun-operations.mjs';
+import { runtimeConfig } from './runtime-config.mjs';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const stateDir = path.join(projectRoot, '.geekheros');
+const runtime = runtimeConfig(process.env, projectRoot);
+const stateDir = runtime.dataDir;
 const stateFile = path.join(stateDir, 'state.json');
 const backupRoot = path.join(stateDir, 'backups');
 const sourceRoot = path.join(stateDir, 'sources');
 const blueprintRoot = path.join(stateDir, 'blueprints');
 const pluginLibraryRoot = path.join(stateDir, 'plugin-library');
 const screenshotRoot = path.join(stateDir, 'screenshots');
-const host = process.env.GEEKHEROS_AGENT_HOST || '127.0.0.1';
-const port = Number(process.env.GEEKHEROS_AGENT_PORT || 8788);
+const host = runtime.host;
+const port = runtime.port;
 const authToken = process.env.GEEKHEROS_AGENT_TOKEN;
 const hostedDashboardOrigins = new Set([
   'https://geekheros-control-plane.heroiccrm.chatgpt.site',
@@ -36,9 +38,9 @@ const wordpressImage = process.env.GEEKHEROS_WORDPRESS_IMAGE || 'wordpress:lates
 const cliImage = process.env.GEEKHEROS_WPCLI_IMAGE || 'wordpress:cli';
 const databaseImage = process.env.GEEKHEROS_DATABASE_IMAGE || 'mariadb:lts';
 const edgeImage = process.env.GEEKHEROS_EDGE_IMAGE || 'traefik:v3';
-const localPreviewConfigMarker = 'GeekHeros local port preview';
+const localPreviewConfigMarker = runtime.isVps ? 'GeekHeros VPS HTTPS and local preview v1' : 'GeekHeros local port preview';
 const lovableMcpUrl = new URL('https://mcp.lovable.dev');
-const lovableOAuthCallbackUrl = `http://127.0.0.1:${port}/lovable/oauth/callback`;
+const lovableOAuthCallbackUrl = `${runtime.publicUrl || `http://127.0.0.1:${port}`}/lovable/oauth/callback`;
 const lovableOAuthStateMaxAge = 10 * 60 * 1000;
 const screenshotRefreshMs = 60 * 60 * 1000;
 const uptimeCheckIntervalMs = 10 * 60 * 1000;
@@ -55,7 +57,8 @@ const localPreviewConfig = String.raw`/* ${localPreviewConfigMarker} */
 if (isset($_SERVER['HTTP_HOST']) && preg_match('/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/', $_SERVER['HTTP_HOST'])) {
   define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
   define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
-}`;
+}
+${runtime.isVps && runtime.scheme === 'https' ? "if (!empty($_SERVER['HTTP_HOST']) && !preg_match('/^(?:127\\.0\\.0\\.1|localhost)(?::[0-9]+)?$/', $_SERVER['HTTP_HOST'])) { $_SERVER['HTTPS'] = 'on'; $_SERVER['SERVER_PORT'] = 443; }" : ''}`;
 const controlPlaneMuPlugin = String.raw`<?php
 /**
  * Plugin Name: GeekHeros Control Plane
@@ -151,7 +154,7 @@ function normalizeBackupPolicy(policy) {
 }
 
 async function readState() {
-  await mkdir(stateDir, { recursive: true });
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
   try {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8'));
     const sites = Object.fromEntries(Object.entries(parsed.sites || {}).map(([id, site]) => [id, {
@@ -193,10 +196,10 @@ async function readState() {
 }
 
 async function writeState(state) {
-  await mkdir(stateDir, { recursive: true });
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const contents = `${JSON.stringify(state, null, 2)}\n`;
   const temporary = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, contents, 'utf8');
+  await writeFile(temporary, contents, { encoding: 'utf8', mode: 0o600 });
   try {
     let lastError;
     for (let attempt = 0; attempt < 7; attempt += 1) {
@@ -362,6 +365,8 @@ async function callPorkbunApi(input) {
   }
   const request = {
     method: operation.method,
+    // Provider credentials must never follow a redirect to another host.
+    redirect: 'error',
     headers: {
       accept: 'application/json',
       'X-API-Key': credential.apiKey,
@@ -690,11 +695,11 @@ async function docker(args, options = {}) {
     });
     return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
   } catch (error) {
-    const rawDetail = String(error?.stderr || error?.stdout || error?.message || 'Docker command failed')
+    const rawDetail = String(error?.stderr || error?.stdout || error?.message || 'Hosting service command failed')
       .replace(/password[^\s]*/gi, 'password=[redacted]')
       .trim();
     const detail = rawDetail.length > 2_400 ? `…${rawDetail.slice(-2_400)}` : rawDetail;
-    const wrapped = new Error(detail || 'Docker command failed');
+    const wrapped = new Error(detail || 'Hosting service command failed');
     wrapped.code = error?.code;
     throw wrapped;
   }
@@ -728,7 +733,7 @@ async function dockerToFile(args, destination) {
     child.on('close', (code) => {
       output.end();
       if (code === 0) resolve();
-      else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
+      else reject(new Error(stderr.trim().slice(0, 800) || `Hosting service exited with code ${code}`));
     });
   });
 }
@@ -743,7 +748,7 @@ async function dockerFromBuffer(args, contents, timeout = 120_000) {
       child.kill();
       if (!settled) {
         settled = true;
-        reject(new Error('Docker input operation timed out.'));
+        reject(new Error('Hosting input operation timed out.'));
       }
     }, timeout);
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
@@ -758,7 +763,7 @@ async function dockerFromBuffer(args, contents, timeout = 120_000) {
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
-      else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
+      else reject(new Error(stderr.trim().slice(0, 800) || `Hosting service exited with code ${code}`));
     });
     child.stdin.end(contents);
   });
@@ -774,7 +779,7 @@ async function dockerFromFile(args, source, timeout = 600_000) {
       child.kill();
       if (!settled) {
         settled = true;
-        reject(new Error('Docker file import timed out.'));
+        reject(new Error('Site file import timed out.'));
       }
     }, timeout);
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
@@ -798,7 +803,7 @@ async function dockerFromFile(args, source, timeout = 600_000) {
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(stderr.trim().slice(0, 800) || `Docker exited with code ${code}`));
+      else reject(new Error(stderr.trim().slice(0, 800) || `Hosting service exited with code ${code}`));
     });
     input.pipe(child.stdin);
   });
@@ -844,6 +849,14 @@ async function ensureEdge() {
     if (existing.Config?.Labels?.['com.geekheros.managed'] !== 'true') {
       throw new Error(`A container named ${edgeContainer} already exists and is not managed by GeekHeros.`);
     }
+    if (runtime.isVps) {
+      for (const [key, expected] of [['80/tcp', runtime.edgeHttpPort], ['443/tcp', runtime.edgeHttpsPort]]) {
+        const bindings = existing.HostConfig?.PortBindings?.[key];
+        if (!bindings?.length || bindings.some((binding) => binding.HostIp !== '127.0.0.1' || Number(binding.HostPort) !== expected)) {
+          throw new Error('The existing site gateway uses different port bindings. Plan its migration to the configured private ports before launching sites; it has not been replaced.');
+        }
+      }
+    }
     if (!existing.State?.Running) await docker(['start', edgeContainer]);
     return;
   }
@@ -853,7 +866,7 @@ async function ensureEdge() {
     '--network', edgeNetwork,
     '--label', managedLabel,
     '--label', 'com.geekheros.role=edge',
-    '-p', '80:80', '-p', '443:443',
+    '-p', `${runtime.isVps ? '127.0.0.1:' : ''}${runtime.edgeHttpPort}:80`, '-p', `${runtime.isVps ? '127.0.0.1:' : ''}${runtime.edgeHttpsPort}:443`,
     '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
     edgeImage,
     '--providers.docker=true',
@@ -967,7 +980,7 @@ function validateSiteInput(input) {
     if (lovableWorkspaceId.length > 200) throw new Error('The Lovable workspace ID is invalid.');
     const lovableProjectUrl = validateLovableProjectUrl(input.lovableProjectUrl);
     return {
-      name, domain, kind, pod, region: 'Local Docker', sourceProvider, repositoryUrl, repositoryBranch: branch || null,
+      name, domain, kind, pod, region: runtime.nodeName, sourceProvider, repositoryUrl, repositoryBranch: branch || null,
       repositoryToken, lovablePrompt: prompt, lovableProjectId, lovableWorkspaceId,
       lovableBuildUrl: lovableProjectUrl || buildLovableUrl(prompt, images, html),
       lovableReferences: { images, html }, buildEnvironment: validateBuildEnvironment(input.buildEnvironment),
@@ -981,7 +994,7 @@ function validateSiteInput(input) {
   if (adminPassword.length < 12) throw new Error('Use an administrator password with at least 12 characters.');
   const blueprintId = String(input.blueprintId || '').trim();
   if (blueprintId && !/^blueprint_[a-f0-9]{12}$/.test(blueprintId)) throw new Error('Choose a valid WordPress blueprint.');
-  return { name, domain, kind, adminUser, adminEmail, adminPassword, blueprintId: blueprintId || null, pod, region: 'Local Docker' };
+  return { name, domain, kind, adminUser, adminEmail, adminPassword, blueprintId: blueprintId || null, pod, region: runtime.nodeName };
 }
 
 function validateTags(value) {
@@ -1756,10 +1769,16 @@ async function applyWordPressBlueprint(site) {
         const destination = `/var/www/html/${relative}`;
         await docker(['exec', site.wpContainer, 'mkdir', '-p', path.posix.dirname(destination)], { timeout: 30_000 });
         await docker(['cp', source, `${site.wpContainer}:${destination}`], { timeout: 120_000 });
+        await docker(['exec', site.wpContainer, 'chown', '33:33', destination], { timeout: 30_000 });
+        await docker(['exec', site.wpContainer, 'chmod', '0640', destination], { timeout: 30_000 });
         return;
       }
       const stagedFile = `${staging}/${file.id}${path.extname(file.name).toLowerCase()}`;
       await docker(['cp', source, `${site.wpContainer}:${stagedFile}`], { timeout: 120_000 });
+      // Host uploads are private (0600 under the VPS service umask). Give only
+      // the WordPress identity read access after copying, not all host users.
+      await docker(['exec', site.wpContainer, 'chown', '33:33', stagedFile], { timeout: 30_000 });
+      await docker(['exec', site.wpContainer, 'chmod', '0640', stagedFile], { timeout: 30_000 });
       if (file.kind === 'plugin') await installBlueprintArchive(site, 'plugin', stagedFile, file.name);
       else if (file.kind === 'theme') await installBlueprintArchive(site, 'theme', stagedFile, file.name);
       else if (file.kind === 'content') {
@@ -2335,7 +2354,7 @@ async function provisionSite(siteId) {
       await ensureEdge();
       await ensureNetwork(site.network, [managedLabel, `com.geekheros.site.id=${site.id}`]);
       await deployLovableSite(site);
-      await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched from Lovable source in Docker Desktop.` });
+      await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched from Lovable source on geekheros.com.` });
       return;
     }
     await setSiteState(siteId, { phase: 'Pulling images', error: null });
@@ -2357,7 +2376,7 @@ async function provisionSite(siteId) {
     try { await runWp(site, ['core', 'is-installed'], { timeout: 60_000 }); installed = true; } catch {}
     if (!installed) {
       await runWp(site, [
-        'core', 'install', `--url=http://${site.domain}`, `--title=${site.name}`,
+        'core', 'install', `--url=${runtime.scheme}://${site.domain}`, `--title=${site.name}`,
         `--admin_user=${site.adminUser}`, `--admin_password=${site.adminPassword}`,
         `--admin_email=${site.adminEmail}`, '--skip-email',
       ], { timeout: 300_000 });
@@ -2368,7 +2387,7 @@ async function provisionSite(siteId) {
 
     await setSiteState(siteId, { phase: null, status: 'Running', error: null, directPort, adminPassword: undefined });
     await refreshVersions({ ...site, directPort });
-    await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched in Docker Desktop.` });
+    await recordActivity({ siteId, siteName: site.name, type: 'provision', message: `${site.name} launched on geekheros.com.` });
   } catch (error) {
     await setSiteState(siteId, { phase: null, status: 'Error', error: error.message || 'Provisioning failed.' });
     await recordActivity({ siteId, siteName: site.name, type: 'provision', state: 'failed', message: error.message || 'Provisioning failed.' });
@@ -2453,7 +2472,7 @@ async function createStagingSite(input) {
   const namespace = `gh-${slugify(domain)}-${id.slice(-4)}`;
   const now = new Date().toISOString();
   const site = {
-    id, name, domain, kind: 'wordpress', environment: 'staging', productionSiteId, pod, region: 'Local Docker',
+    id, name, domain, kind: 'wordpress', environment: 'staging', productionSiteId, pod, region: runtime.nodeName,
     namespace, clientId: production.clientId || null, tags: [...new Set(['staging', ...(production.tags || [])])].slice(0, 20),
     adminUser: production.adminUser, adminEmail: production.adminEmail,
     network: `${namespace}-net`, dbContainer: `${namespace}-db`, wpContainer: `${namespace}-wp`,
@@ -2520,7 +2539,7 @@ async function copyWordPressSite(source, target, options = {}) {
     await ensureControlPlaneMuPlugin(target);
     await ensureStagingGuard(target);
     if (scope === 'all' || scope === 'database') {
-      const targetUrl = `http://${target.domain}`;
+      const targetUrl = `${runtime.scheme}://${target.domain}`;
       for (const sourceUrl of [`http://${source.domain}`, `https://${source.domain}`]) {
         await runWp(target, ['search-replace', sourceUrl, targetUrl, '--all-tables', '--precise', '--recurse-objects', '--skip-columns=guid'], { timeout: 600_000 });
       }
@@ -2644,12 +2663,12 @@ function publicSite(site, inspect) {
     blueprintId: site.kind === 'wordpress' ? site.blueprintId || null : null,
     blueprintName: site.kind === 'wordpress' ? site.blueprintName || null : null,
     blueprintAppliedAt: site.kind === 'wordpress' ? site.blueprintAppliedAt || null : null,
-    region: 'Local Docker', pod: site.pod, wp: site.wpVersion || '—', php: site.phpVersion || '—',
+    region: runtime.nodeName, pod: site.pod, wp: site.wpVersion || '—', php: site.phpVersion || '—',
     updates: Number(site.updates || 0), uptime: status === 'Running' ? durationSince(inspect?.State?.StartedAt || site.createdAt) : '—',
     createdAt: site.createdAt, updatedAt: site.updatedAt, containerId: inspect?.Id?.slice(0, 12) || null,
     containerName: site.wpContainer, databaseContainer: site.dbContainer || 'Not required', image: site.image,
-    directUrl: directPort ? `http://127.0.0.1:${directPort}` : null,
-    siteUrl: `http://${site.domain}`, adminUrl: site.kind === 'lovable' ? null : `http://${site.domain}/wp-admin/`,
+    directUrl: !runtime.isVps && directPort ? `http://127.0.0.1:${directPort}` : null,
+    siteUrl: `${runtime.scheme}://${site.domain}`, adminUrl: site.kind === 'lovable' ? null : `${runtime.scheme}://${site.domain}/wp-admin/`,
     backupCount: site.backups?.length || 0, backups: Array.isArray(site.backups) ? site.backups : [],
     backupPolicy: site.kind === 'lovable' ? null : normalizeBackupPolicy(site.backupPolicy),
     lastBackupAt: site.backups?.[0]?.createdAt || null,
@@ -2724,11 +2743,12 @@ async function findBrowserExecutable() {
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
     ] : ['/usr/bin/google-chrome', '/usr/bin/microsoft-edge', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+    if (process.env.GEEKHEROS_BROWSER_PATH) candidates.unshift(process.env.GEEKHEROS_BROWSER_PATH);
     for (const candidate of candidates) {
       if (!candidate) continue;
       try { if ((await stat(candidate)).isFile()) return candidate; } catch {}
     }
-    throw Object.assign(new Error('Install Microsoft Edge or Google Chrome to capture site previews.'), { status: 503 });
+    throw Object.assign(new Error('Install Chromium, Chrome or Edge on the hosting node to capture site previews. A custom path can be set with GEEKHEROS_BROWSER_PATH.'), { status: 503 });
   })();
   return browserExecutablePromise;
 }
@@ -3296,7 +3316,7 @@ async function issueOneClickLogin(siteId) {
   const transient = `geekheros_login_${tokenHash}`;
   await runWp(site, ['transient', 'set', transient, JSON.stringify({ user_id: userId }), '60'], { timeout: 60_000 });
   const directPort = await getDirectPort(site.wpContainer);
-  const baseUrl = directPort ? `http://127.0.0.1:${directPort}` : `http://${site.domain}`;
+  const baseUrl = !runtime.isVps && directPort ? `http://127.0.0.1:${directPort}` : `${runtime.scheme}://${site.domain}`;
   await recordActivity({ siteId, siteName: site.name, type: 'one-click-login', message: `A one-time WP Admin session was issued for ${site.name}.` });
   return {
     actionUrl: `${baseUrl}/wp-admin/admin-post.php`,
@@ -3418,7 +3438,7 @@ async function restoreBackup(sourceSite, backupId, scope = 'all', targetSite = s
   await ensureControlPlaneMuPlugin(targetSite);
   await ensureStagingGuard(targetSite);
   if ((scope === 'all' || scope === 'database') && sourceSite.id !== targetSite.id) {
-    const targetUrl = `http://${targetSite.domain}`;
+    const targetUrl = `${runtime.scheme}://${targetSite.domain}`;
     for (const sourceUrl of [`http://${sourceSite.domain}`, `https://${sourceSite.domain}`]) {
       await runWp(targetSite, ['search-replace', sourceUrl, targetUrl, '--all-tables', '--precise', '--recurse-objects', '--skip-columns=guid'], { timeout: 600_000 });
     }
@@ -3665,7 +3685,8 @@ function cleanMcpTelemetryText(value, maximum = 240) {
 }
 
 function mcpAgentIdentity(request) {
-  const ip = cleanMcpTelemetryText(request.socket?.remoteAddress || 'unknown', 80).replace(/^::ffff:/, '');
+  const trustedGateway = runtime.isVps && tokenMatches(request.headers['x-geekheros-token']) && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket?.remoteAddress);
+  const ip = cleanMcpTelemetryText((trustedGateway && request.headers['x-geekheros-client-ip']) || request.socket?.remoteAddress || 'unknown', 80).replace(/^::ffff:/, '');
   const userAgent = cleanMcpTelemetryText(request.headers['user-agent'] || 'Unknown MCP client');
   const fingerprint = createHash('sha256').update(`${ip}\0${userAgent}`).digest('hex').slice(0, 12);
   const sessionHeader = cleanMcpTelemetryText(request.headers['mcp-session-id'] || '', 500);
@@ -3683,7 +3704,7 @@ function mcpAgentIdentity(request) {
     platform,
     userAgent,
     origin: cleanMcpTelemetryText(request.headers.origin || '', 240) || null,
-    remotePort: Number(request.socket?.remotePort || 0) || null,
+    remotePort: trustedGateway ? null : Number(request.socket?.remotePort || 0) || null,
     sessionIdHash,
     transport: 'Streamable HTTP',
   };
@@ -3890,7 +3911,7 @@ function observeMcpRequest(request, response, identity) {
 
 function mcpConnectionConfiguration(token) {
   const connectionHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-  const url = `http://${connectionHost}:${port}/mcp`;
+  const url = `${runtime.publicUrl || `http://${connectionHost === '::1' ? '[::1]' : connectionHost}:${port}`}/mcp`;
   return {
     enabled: true,
     url,
@@ -3907,17 +3928,42 @@ function mcpConnectionConfiguration(token) {
   };
 }
 
+async function getRuntimeDiagnostics() {
+  let storage = { available: false, freeBytes: null, totalBytes: null };
+  try {
+    const disk = await statfs(stateDir);
+    storage = { available: true, freeBytes: disk.bavail * disk.bsize, totalBytes: disk.blocks * disk.bsize };
+  } catch { /* Report unknown storage instead of inventing a measurement. */ }
+  return {
+    brand: 'geekheros.com', deploymentMode: runtime.mode, nodeName: runtime.nodeName,
+    platform: process.platform, nodeVersion: process.version, uptimeSeconds: Math.floor(process.uptime()),
+    publicUrl: runtime.publicUrl, dataDirectory: stateDir, storage,
+    desktopRequired: false, managementAccess: runtime.isVps ? 'Authenticated HTTPS gateway' : 'Local development',
+    siteScheme: runtime.scheme, edgeHttpPort: runtime.edgeHttpPort, edgeHttpsPort: runtime.edgeHttpsPort,
+    mcpToolCount: controlPlaneMcpToolCount,
+  };
+}
+
 async function systemInfo(includeMcpConnection = false) {
-  const { stdout } = await docker(['info', '--format', '{{json .}}'], { timeout: 30_000 });
-  const info = JSON.parse(stdout);
+  let info;
+  try {
+    const { stdout } = await docker(['info', '--format', '{{json .}}'], { timeout: 15_000 });
+    info = JSON.parse(stdout);
+  } catch {
+    const result = { connected: false, error: 'The hosting service is unavailable. Check this node’s service; domains, settings and AI access remain available.', runtime: await getRuntimeDiagnostics() };
+    if (includeMcpConnection) result.mcp = mcpConnectionConfiguration(await ensureMcpToken());
+    return result;
+  }
   const edge = await inspectContainer(edgeContainer);
   const sites = await listSites();
   const stagingSites = await listStagingSites();
   const allSites = [...sites, ...stagingSites];
   const result = {
     connected: true,
+    runtimeVersion: info.ServerVersion,
+    runtime: await getRuntimeDiagnostics(),
     dockerVersion: info.ServerVersion,
-    operatingSystem: info.OperatingSystem,
+    operatingSystem: String(info.OperatingSystem || process.platform).replace(/Docker Desktop/gi, 'Development host'),
     cpuCount: info.NCPU,
     memoryBytes: info.MemTotal,
     totalContainers: info.Containers,
@@ -3928,7 +3974,7 @@ async function systemInfo(includeMcpConnection = false) {
     runningSites: allSites.filter((site) => site.status === 'Running').length,
     provisioningSites: allSites.filter((site) => site.status === 'Provisioning').length,
     attentionSites: allSites.filter((site) => ['Error', 'Attention'].includes(site.status)).length,
-    edge: { installed: Boolean(edge), running: Boolean(edge?.State?.Running), container: edgeContainer, httpPort: 80, httpsPort: 443 },
+    edge: { installed: Boolean(edge), running: Boolean(edge?.State?.Running), container: edgeContainer, httpPort: runtime.edgeHttpPort, httpsPort: runtime.edgeHttpsPort },
     agent: { host, port },
   };
   if (includeMcpConnection) result.mcp = mcpConnectionConfiguration(await ensureMcpToken());
@@ -4025,6 +4071,7 @@ async function readJson(request, maximumBytes = 1_000_000) {
 
 const controlPlaneMcpHandler = createControlPlaneMcpHandler({
   getSystemInfo: () => systemInfo(false),
+  getRuntimeDiagnostics,
   listActivity: async ({ limit, siteId }) => (await readState()).activity.filter((entry) => !siteId || entry.siteId === siteId).slice(0, limit),
   getAnalytics,
   listSites,
@@ -4092,7 +4139,7 @@ const server = createServer(async (request, response) => {
   }
   const origin = request.headers.origin;
   const localDashboardOrigin = Boolean(origin && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin));
-  const hostedDashboardOrigin = Boolean(origin && hostedDashboardOrigins.has(origin));
+  const hostedDashboardOrigin = !runtime.isVps && Boolean(origin && hostedDashboardOrigins.has(origin));
   if (origin && !localDashboardOrigin && !hostedDashboardOrigin) return send(response, 403, { error: 'Origin not allowed.' });
   if (origin) response.geekherosCorsOrigin = origin;
   if (request.method === 'OPTIONS') {
@@ -4130,6 +4177,7 @@ const server = createServer(async (request, response) => {
   if (!hostedDashboardOrigin && !tokenMatches(request.headers['x-geekheros-token'])) return send(response, 401, { error: 'Agent authentication failed.' });
   try {
     if (request.method === 'GET' && url.pathname === '/health') return send(response, 200, await systemInfo(true));
+    if (request.method === 'GET' && url.pathname === '/runtime') return send(response, 200, await getRuntimeDiagnostics());
     if (request.method === 'GET' && url.pathname === '/lovable') return send(response, 200, await getLovableConnection());
     if (request.method === 'POST' && url.pathname === '/lovable/connect') return send(response, 200, await startLovableConnection());
     if (request.method === 'DELETE' && url.pathname === '/lovable') return send(response, 200, await disconnectLovable());
@@ -4243,7 +4291,7 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, host, async () => {
-  console.log(`GeekHeros Docker agent listening on http://${host}:${port}`);
+  console.log(`geekheros.com management service listening on http://${host}:${port}`);
   try {
     const state = await readState();
     for (const site of Object.values(state.sites)) {
@@ -4273,5 +4321,5 @@ server.listen(port, host, async () => {
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => server.close(async () => { await stateQueue; process.exit(0); }));
 }

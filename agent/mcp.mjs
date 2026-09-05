@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-export const controlPlaneMcpToolCount = 57;
+export const controlPlaneMcpToolCount = 58;
 
 const siteIdSchema = z.string().min(1).describe('Managed site ID returned by list_sites or list_staging_sites.');
 const clientIdSchema = z.string().min(1).describe('Client ID returned by list_clients.');
@@ -30,14 +30,20 @@ function registerRaw(server, name, config, handler) {
 
 function createControlPlaneMcpServer(api) {
   const server = new McpServer({ name: 'GeekHeros Control Plane', version: '0.1.0' }, {
-    instructions: 'Manage the local GeekHeros Docker control plane. Read current state before changing it, and confirm intent before destructive operations.',
+    instructions: 'Manage the geekheros.com control plane. Read current state before changing it, and confirm intent before destructive operations.',
   });
 
   register(server, 'get_system_info', {
     title: 'Get system information',
-    description: 'Read Docker engine, edge gateway, agent and managed-site health.',
+    description: 'Read hosting node, gateway, agent and managed-site health.',
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }, () => api.getSystemInfo());
+
+  register(server, 'get_runtime_diagnostics', {
+    title: 'Get hosting readiness',
+    description: 'Read deployment mode, persistent storage availability and free space, management URL, runtime version and service uptime. Does not return credentials or change services.',
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => api.getRuntimeDiagnostics());
 
   register(server, 'list_activity', {
     title: 'List activity',

@@ -1,10 +1,14 @@
-# GeekHeros control plane
+# geekheros.com control plane
 
-GeekHeros is a local WordPress and Lovable application control plane backed by Docker Desktop. The dashboard reads real container state and sends lifecycle operations through a loopback-only agent.
+GeekHeros manages WordPress and Lovable sites on a development workstation or a standalone Linux VPS. Standard Docker Engine provides site isolation; Docker Desktop is optional for local Windows/macOS development and is not required in production.
+
+## VPS deployment
+
+See [the deployment and migration guide](docs/VPS.md). `npm run build:vps` builds the standalone dashboard; `npm run start:vps` runs the supervised management agent and same-origin gateway. The supplied systemd and Caddy configuration adds boot-time startup, HTTPS administrator sign-in, private management ports and remote MCP access. Persistent state lives outside the source checkout. The existing Sites build remains available through `npm run build`.
 
 ## Start it
 
-Requirements: Node.js 22.13 or newer and Docker Desktop using Linux containers.
+Requirements: Node.js 22.13 or newer and a reachable Linux Docker Engine (Desktop is optional on Windows/macOS).
 
 ```powershell
 npm install
@@ -13,7 +17,7 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-`npm run dev` starts both the web interface and Docker agent. They share a random one-time token; the agent listens only on `127.0.0.1:8788`.
+`npm run dev` starts the web interface and local management agent. They share a random one-time token; the agent listens only on `127.0.0.1:8788`. Use the VPS service instead for unattended production hosting.
 
 ## WordPress launches
 

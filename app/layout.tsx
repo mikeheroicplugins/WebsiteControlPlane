@@ -18,18 +18,18 @@ const metadataBase = new URL(
 
 export const metadata: Metadata = {
   metadataBase,
-  title: 'GeekHeros Control Plane',
+  title: 'geekheros.com | Control Plane',
   description:
     'Deploy, monitor, update and protect every WordPress site from one secure control plane.',
   openGraph: {
-    title: 'GeekHeros Control Plane',
+    title: 'geekheros.com | Control Plane',
     description: 'WordPress infrastructure, under control.',
     type: 'website',
     images: [{ url: '/og.png', width: 1729, height: 910, alt: 'GeekHeros WordPress control plane' }],
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'GeekHeros Control Plane',
+    title: 'geekheros.com | Control Plane',
     description: 'WordPress infrastructure, under control.',
     images: ['/og.png'],
   },
